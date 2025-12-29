@@ -28,9 +28,6 @@ unsafe extern "C" {
 
 pub fn kstart(mmap: &[pmm::PMMapElement]) {
 
-    // Initialize the console
-    arch::kearly_console::init();
-
     // Print the E820 memory map
     klog!("BlightOS - A practice OS for me to learn Rust!\n");
     klog!("Physical Memory Map:\n");

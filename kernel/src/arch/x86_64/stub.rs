@@ -6,6 +6,7 @@ use crate::pmm::PMMapElement;
 use crate::sched;
 use crate::{dump_memory, kstart};
 
+
 //---------------------------------------------------------------------------//
 // Private Data Types                                                        //
 //---------------------------------------------------------------------------//
@@ -82,6 +83,11 @@ extern "C" fn rust_entry_x86_64(mbi: &MultibootInfo) {
     // Todo - fetch kernel's boot command-line/parameters
     // Todo - fetch VBE's information for a potential graphics driver
     // Todo - Pass a list kernel modules (e.g., ramdisk) Grub loaded for us
+
+    
+    kearly_console::init();
+    // SMP, LAPIC, IOAPIC, HiRes Event Timer, etc. are found in ACPI tables
+    x86_acpi_parse();
 
     // Start the kernel. 
     kstart(&mem_map[0..e820_mmap_count]);
@@ -410,21 +416,230 @@ pub fn isr_register(irq: u16, handler_fn: IsrHandlerFn) {
 //
 // Temporary debugging macros
 //
-// use core::fmt::Write;
-// struct ArchDebugConsole;
-// impl Write for ArchDebugConsole {
-//     fn write_str(&mut self, _s: &str) -> core::fmt::Result {
-//         kearly_console::print_str(_s.as_bytes());
-//         Ok(())
+use core::fmt::Write;
+struct ArchDebugConsole;
+impl Write for ArchDebugConsole {
+    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
+        kearly_console::print_str(_s.as_bytes());
+        Ok(())
+    }
+}
+macro_rules! archlog {
+    ($($arg:tt)*) => {
+        let mut kern_console = ArchDebugConsole{};
+        let _ = write!(&mut kern_console, $($arg)*);
+    };
+}
+
+fn x86_acpi_parse() {
+    // 1) Find "RSD PTR " in low memory - on a 16-byte boundary
+    let mut ptr: *mut u64 = 400 as *mut u64;
+    let mut valid_rsdp = false;
+
+    for _i in 0..0x20000 {
+        unsafe {
+            if *ptr == 0x2052545020445352 { 
+                valid_rsdp = true;
+                break;
+            }
+            ptr = ptr.wrapping_add(1);
+        }
+    }
+    if valid_rsdp == false { return; }
+    // 2) Find RSDT (RSD[16] as u32)
+    // FORMAT OF THE ROOT RSDT
+    // OFF TYPE&NAME
+    // 0   char Signature[4]; <-- "RSDT"
+    // 4   uint32_t Length;   <-- Total size of the table including this header
+    // 8   uint8_t Revision;
+    // 9   uint8_t Checksum;
+    // 10  char OEMID[6];
+    // 16  char OEMTableID[8];
+    // 24  uint32_t OEMRevision;
+    // 28  uint32_t CreatorID;
+    // 32  uint32_t CreatorRevision;
+    // 36  u32 address of the next SDT <-- Starting at offset:
+    // 40  u32 address of the another SDT
+    // ....
+    // u32 address of the last SDT
+    unsafe {
+
+        let mut rsdt: *mut u32 = *(ptr.wrapping_add(2)) as *mut u32;
+        let num_tables : u32 = (*rsdt.wrapping_add(1) - 36) / 4;
+        let acpi_ver: u8 = *(rsdt.wrapping_add(2) as *mut u8);
+        archlog!("ACPI v{} (RSDT) @{:p}. SIG: {:X}, LEN:{} #TBLS: {}\n", 
+                    acpi_ver, rsdt, *rsdt, *(rsdt.wrapping_add(1)), num_tables);
+        rsdt = rsdt.wrapping_add(9);
+        for _ in 0..num_tables {
+            let sdt: *mut u32 = *rsdt as *mut u32;
+            match *sdt {
+                0x43495041 => x86_acpi_parse_madt(sdt as u32), // "APIC" MADT
+                0x50434146 => x86_acpi_parse_facp(sdt as u32), // "FACP" FADT
+                0x54455048 => x86_acpi_parse_hpet(sdt as u32), // "HPET" HiRes Timer
+                _ => ()
+            };
+            rsdt = rsdt.wrapping_add(1);
+
+        }
+    }
+}
+
+fn x86_acpi_parse_madt(addr: u32){
+    unsafe {
+        let madt: *mut u32 = addr as *mut u32;
+        let madt_len = *(madt.wrapping_add(1));
+
+        // LocalAPIC
+        let lapic_addr: u32 = *(madt.wrapping_add(9));
+        let lapic_flag: u32 = *(madt.wrapping_add(10));
+        archlog!("LocalAPIC: addr: {:X}, flags: {:X}\n",
+                    lapic_addr, lapic_flag);
+        // The rest of the entries
+        let mut entry_addr = madt.wrapping_add(11) as u32;
+        while entry_addr < addr + madt_len {
+            let entry: *mut u8 = entry_addr as *mut u8;
+            let entry_type: u8 = *entry;
+            let entry_len:  u8 = *(entry.wrapping_add(1));
+            match entry_type {
+                0 => {
+                    archlog!("CPU[{}]: LAPIC ID: {}, Enabled: {:X}\n",
+                        *(entry.wrapping_add(2)),
+                        *(entry.wrapping_add(3)),
+                        *(entry.wrapping_add(4))
+                    );
+                },
+                1 => {
+                    archlog!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
+                        *(entry.wrapping_add(2)),
+                        *(entry.wrapping_add(4) as *mut u32),
+                        *(entry.wrapping_add(8) as *mut u32)
+                    );
+                },
+                2 => {
+                    archlog!("<BUS[{}]IRQ[{}] -> GSI[{}]>",
+                        *(entry.wrapping_add(2)),
+                        *(entry.wrapping_add(3)),
+                        *(entry.wrapping_add(4) as *mut u32)
+                    );
+                },
+                4 => {
+                    archlog!("<LAPIC-NMI: CPU[{}] -> LINT[{}]>",
+                        *(entry.wrapping_add(2)),
+                        *(entry.wrapping_add(5))
+                    );
+                }
+                _ => {
+                    archlog!("MADT Entry T[{}]\n ",entry_type);
+                }
+            };
+            entry_addr += entry_len as u32;
+        }
+    }
+    archlog!("\n");
+}
+
+fn x86_acpi_parse_facp(_addr: u32) {
+
+}
+
+fn x86_acpi_parse_hpet(_addr: u32) {
+
+}
+
+// Doesn't seem to be supported any more - at least on QEMU it only shows 1 cpu
+// fn x86_parse_mp_config() {
+//     // 1) Finding the MP Floating Pointer Structure left for us by BIOS
+//     //    Look for the signature  "_MP_" or 0x5F504D5F in the first MB of
+//     //    the memory. TODO add support for ACPI and find it via ACPI!
+//     // MPFP FORMAT:
+//     // signature:  u32,
+//     // config_tlb: u32,
+//     // length:     u8, // multiplied by 16 bytes
+//     // mp_rev:     u8, // MP Spec Revision
+//     // checksum:   u8, // added to sum of all other bytes of this struct -> 0
+//     // def_config: u8, // must be zero otherwise find the default cfg
+//     // features:   u32 // Bit 7 set: IMCR + and PIC mode, virt. wire mode otherwise
+//     //
+//     // For now I assume that features=0 and there is no default config.
+//     let mut ptr: *mut u32 = 0x400 as *mut u32;
+//     let mut valid_mpfp = false;
+
+//     for _i in 0..0x40000 {
+//         unsafe {
+//             if *ptr == 0x5F504D5F {
+//                 // check the sum
+//                 let mut sump: *mut u8 = ptr as *mut u8;
+//                 let mut sum: u8 = 0;
+                
+//                 for _j in 0..16 {
+//                     sum += *sump;
+//                     sump = sump.wrapping_add(1);
+//                 }
+//                 if sum == 0 {
+//                     // Valid MPFP!
+//                     valid_mpfp = true;
+//                     break;
+//                 }
+//             }
+//             ptr = ptr.wrapping_add(1);
+//         }
+//     }
+//     // 2) Read the MP Config Table MPFP points to
+//     // MPCT FORMAT:
+//     // signature: u32 // "PCMP" = 0x504D4350
+//     // len: u16
+//     // mp_rev: u8
+//     // checksum: u8
+//     // oem_id: u64;
+//     // prod_id: [u8; 12];
+//     // oem_table: u32
+//     // oem_table_size: u16
+//     // entry_count: u16; // #of CPU/IOAPIC entries after this struct (offset 34)
+//     // lapic_address: u32// MMIO base of the local APICs (offset 36): FEE00000
+//     // extended_table_length: u16
+//     // extended_table_checksum: u8;
+//     // rsvd: u8;
+//     if !valid_mpfp {
+//         archlog!("No SMP support.\n");
+//         return;
+//     }
+//     unsafe {
+//         archlog!("MPFP @{:p}, ConfTlb:{:x}, lrcd:{:X}, feat:{:X}\n",
+//             ptr, *(ptr.wrapping_add(1)), 
+//             *(ptr.wrapping_add(2)), *(ptr.wrapping_add(3))
+//         );
+//         // Make ptr point to MPConfig
+//         let ptr: *mut u32 = *(ptr.wrapping_add(1)) as *mut u32;
+//         if (*ptr) !=  0x504D4350 {
+//             archlog!("No valid MP Configuration was found\n");
+//             return;
+//         }
+//         let entry_cnt: u16 = *((ptr as *mut u8).wrapping_add(34) as *mut u16);
+//         let lapic_adr: u32 = *((ptr as *mut u8).wrapping_add(36) as *mut u32);
+//         archlog!("#entries: {}, LAPIC_BASE: {:X}\n", entry_cnt, lapic_adr);
+//         // 3) Iterate over entries and find CPUs and IOAPICs
+//         let mut entry: *mut u32 = ptr.wrapping_add(11);
+//         for _ in 0..entry_cnt {
+//             let ent_type : u8 = ((*entry) & 0xFF) as u8;
+//             let id  = ((*entry) & 0xFF00) >> 8 as u8;
+//             let ver = ((*entry) & 0xFF0000) >> 16 as u8;
+//             let flg = ((*entry) & 0xFF000000) >> 24 as u8;
+//             if ent_type == 0 {
+//                 archlog!("CPU[{}]: LAPIC Version: {}, Flags: {:X}\n",
+//                         id, ver, flg);
+//                 entry = entry.wrapping_add(5); // CPU entries are 20 bytes
+//             } else if ent_type == 2 {
+//                 let ioapic_adr : u32 = *(entry.wrapping_add(1));
+//                 archlog!("IOAPIC[{}]: Version: {}, Flags: {:X}, Addr: {:X}\n",
+//                         id, ver, flg, ioapic_adr);
+//                 entry = entry.wrapping_add(2); // IOAPIC entries are 8 bytes
+//             } else {
+//                 //archlog!("-- ENT TYPE: {} -- ", ent_type);
+//                 entry = entry.wrapping_add(2); // Other entries are 8 bytes
+//             }
+//         }
 //     }
 // }
-// macro_rules! archlog {
-//     ($($arg:tt)*) => {
-//         let mut kern_console = ArchDebugConsole{};
-//         let _ = write!(&mut kern_console, $($arg)*);
-//     };
-// }
-
 
 //
 // Task Management

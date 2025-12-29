@@ -29,7 +29,7 @@ clean:
 	rm -f $(BOOT_IMG)
 
 run: $(BOOT_IMG)
-	@qemu-system-x86_64 -drive file=$<,format=raw,media=disk
+	@qemu-system-x86_64 -smp 4 -drive file=$<,format=raw,media=disk
 
 force: ;
 

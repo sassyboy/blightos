@@ -21,7 +21,7 @@ CFLAGS += -DINIT_STACK_SIZE=4096
 # init-ramdisk module which is loaded right after kernel by the bootloader.
 # Each page table covers 2 MB (Max # Tables: 512).
 # From 0x0 to INIT_NUM_PAGE_TABLES*2MB is identity-mapped by boot.S
-CFLAGS += -DINIT_NUM_PAGE_TABLES=4
+CFLAGS += -DINIT_NUM_PAGE_TABLES=256
 
 # SELECT ONE OF THE SCHEDULERS BELOW ###########################################
 
