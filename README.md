@@ -16,4 +16,4 @@ Install rust and the nightly `x86_64-unknown-none` toolchain, `gcc`,
 - Symmetric Multiprocessing (In progress...)
 ---
 ## Screenshot
-![Screenshot](https://github.com/sassyboy/blightos/screenshot.png)
+![Screenshot](https://github.com/sassyboy/blightos/blob/main/screenshot.png)
