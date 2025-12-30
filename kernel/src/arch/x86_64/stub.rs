@@ -6,6 +6,32 @@ use crate::pmm::PMMapElement;
 use crate::sched;
 use crate::{dump_memory, kstart};
 
+//
+// Debugging macros
+//
+#[cfg(feature="debug_arch")]
+use core::fmt::Write;
+#[cfg(feature="debug_arch")]
+struct ArchDebugConsole;
+#[cfg(feature="debug_arch")]
+impl Write for ArchDebugConsole {
+    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
+        kearly_console::print_str(_s.as_bytes());
+        Ok(())
+    }
+}
+#[cfg(feature="debug_arch")]
+macro_rules! dbg {
+    ($($arg:tt)*) => {
+        let mut kern_console = ArchDebugConsole{};
+        let _ = write!(&mut kern_console, $($arg)*);
+    };
+}
+
+#[cfg(not(feature="debug_arch"))]
+macro_rules! dbg {
+    ($($arg:tt)*) => { };
+}
 
 //---------------------------------------------------------------------------//
 // Private Data Types                                                        //
@@ -87,7 +113,14 @@ extern "C" fn rust_entry_x86_64(mbi: &MultibootInfo) {
     
     kearly_console::init();
     // SMP, LAPIC, IOAPIC, HiRes Event Timer, etc. are found in ACPI tables
-    x86_acpi_parse();
+    match x86_acpi_parse() {
+        Some(acpi) => {
+            start_smp(&acpi);
+        },
+        None => {
+            dbg!("No ACPI information found. Multiprocessing disabled.\n");
+        }
+    };
 
     // Start the kernel. 
     kstart(&mem_map[0..e820_mmap_count]);
@@ -118,9 +151,12 @@ extern "C" fn kexcep_overflow() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn kexcep_invalid_opcode(rsp: usize) {
-    dump_memory(rsp, 8);
-    panic!("kexcep_invalid_opcode");
+extern "C" fn kexcep_invalid_opcode(exframe: usize) {
+    let info = x86_decode_exception_frame(exframe, false);
+    dump_memory(info.rsp, 8);
+    panic!("#UD RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
+        info.rflg, info.cs, info.rip, info.ss, info.rsp
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -144,8 +180,13 @@ extern "C" fn kexcep_gp_fault() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn kexcep_page_fault() {
-    panic!("kexcep_page_fault");
+extern "C" fn kexcep_page_fault(exframe: usize) {
+    let info = x86_decode_exception_frame(exframe, true);
+    dump_memory(info.rsp, 8);
+    panic!("#PF CR2={:X} ERR={:X} RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
+        info.cr2, info.err, info.rflg, info.cs, info.rip, info.ss, info.rsp
+    );
+
 }
 
 #[unsafe(no_mangle)]
@@ -184,6 +225,50 @@ extern "C" fn kstack_error(rsp: usize) {
 
 #[unsafe(no_mangle)]
 extern "C" fn ksyscall_handler() {}
+
+#[derive(Default)]
+struct X86ExceptionInfo {
+    err:    usize,
+    cs:     usize,
+    rip:    usize,
+    rflg:   usize,
+    rsp:    usize,
+    ss:     usize,
+    cr2:    usize,
+    cr4:    usize
+}
+
+fn x86_decode_exception_frame(exframe: usize, error_code: bool) -> 
+X86ExceptionInfo {
+    unsafe {
+        let (cr2, cr4): (usize, usize);
+        asm!("mov rax, cr2", out("rax")cr2);
+        asm!("mov rax, cr4", out("rax")cr4);
+        if error_code {
+            X86ExceptionInfo {
+                err : *((exframe + 8 * 0) as *const usize),
+                rip : *((exframe + 8 * 1) as *const usize),
+                cs  : *((exframe + 8 * 2) as *const usize),
+                rflg: *((exframe + 8 * 3) as *const usize),
+                rsp : *((exframe + 8 * 4) as *const usize),
+                ss  : *((exframe + 8 * 5) as *const usize),
+                cr2 : cr2,
+                cr4 : cr4
+            }
+        } else {
+            X86ExceptionInfo {
+                err : 0,
+                rip : *((exframe + 8 * 0) as *const usize),
+                cs  : *((exframe + 8 * 1) as *const usize),
+                rflg: *((exframe + 8 * 2) as *const usize),
+                rsp : *((exframe + 8 * 3) as *const usize),
+                ss  : *((exframe + 8 * 4) as *const usize),
+                cr2 : cr2,
+                cr4 : cr4
+            }
+        }
+    }
+}
 
 //----------------------------------------------------------------------------//
 // Internal interface                                                         //
@@ -292,6 +377,39 @@ mod x86_pit {
     }
 }
 
+struct X86IoApic;
+impl X86IoApic {
+    const IOAPIC_REG_ID:    u8 = 0x0;
+    const IOAPIC_REG_VER:   u8 = 0x1;
+
+    pub fn read_reg(ioapic: &AcpiIOApic, reg_index: u8) -> u32 {
+        let io_reg_sel : *mut u32 = ioapic.ioapic_mmio as *mut u32;
+        let io_reg_dat : *mut u32 = (ioapic.ioapic_mmio + 0x10) as *mut u32;
+        unsafe {
+            *io_reg_sel = reg_index as u32;
+            *io_reg_dat
+        }
+    }
+
+    pub fn write_reg(ioapic: &AcpiIOApic, reg_index: u8, value: u32) {
+        let io_reg_sel : *mut u32 = ioapic.ioapic_mmio as *mut u32;
+        let io_reg_dat : *mut u32 = (ioapic.ioapic_mmio + 0x10) as *mut u32;
+        unsafe {
+            *io_reg_sel = reg_index as u32;
+            *io_reg_dat = value;
+        }
+    }
+
+    pub fn init(ioapic: &AcpiIOApic) {
+        // Assuming that we're still using the inital kernel address-space...
+        dbg!("IOAPIC init => ID = {}\n", 
+            Self::read_reg(ioapic, Self::IOAPIC_REG_ID));
+    }
+}
+
+struct X86LocalApic {
+
+}
 //----------------------------------------------------------------------------//
 // External interface exposed to kernel's general code                        //
 //----------------------------------------------------------------------------//
@@ -412,27 +530,136 @@ pub fn isr_register(irq: u16, handler_fn: IsrHandlerFn) {
     }
 }
 
+//
+// Memory Management Unit (MMU) Primitives
+//
+pub fn mmu_page_size() -> usize {
+    0x1000
+}
+
+pub fn mmu_addr_to_page_index(addr: usize) -> usize {
+    addr >> 12
+}
+
+pub enum MmuCachingPolicy {
+    NonCaching,    // Slow Memory RW - Totally safe for MMIO/DMA
+    WriteThrough,  // Fast Memory R, Slow Memory/MMIO W - Not safe for MMIO Read
+    WriteBack      // Fast Memory-only R/W - Not for MMIO
+}
+// Maps a page (virtual address) to a frame (physical address) in the current
+// address-space (CR3)
+pub fn mmu_map_page(_virt_addr: usize, _phys_addr: usize, _privileged: bool,
+            _writeable: bool, _executable: bool, _caching: MmuCachingPolicy) {
+    // Todo - Should look at CR3, map the structs into a temporary scratchpad
+    //        space and then add the new map.
+    // Forgot how MTRR registers affect specific memory region caching...
+    // Look it up.
+    
+}
+
+pub fn mmu_unmap_page(_virt_addr: usize) {
+
+}
 
 //
-// Temporary debugging macros
+// Symmetric Multiprocessing Support
 //
-use core::fmt::Write;
-struct ArchDebugConsole;
-impl Write for ArchDebugConsole {
-    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
-        kearly_console::print_str(_s.as_bytes());
-        Ok(())
+fn start_smp(acpi: &AcpiInfo) {
+    // Print what we found on ACPI tables if compiled with debug_arch
+    // CPUs/LAPICS
+    dbg!("LAPIC MMIO @ {:X}\n", acpi.lapic_mmio);
+    for _i in 0..acpi.lapic_cnt as usize {
+        dbg!("CPU[{}]: LAPIC ID: {}, Enabled: {}\n",
+            acpi.lapic[_i].cpu_id,
+            acpi.lapic[_i].lapic_id,
+            acpi.lapic[_i].enabled
+        );
     }
-}
-macro_rules! archlog {
-    ($($arg:tt)*) => {
-        let mut kern_console = ArchDebugConsole{};
-        let _ = write!(&mut kern_console, $($arg)*);
-    };
+    // IOAPIC
+    dbg!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
+        acpi.ioapic.ioapic_id,
+        acpi.ioapic.ioapic_mmio,
+        acpi.ioapic.gsi_base
+    );
+    // IRQ->GSI mappings
+    for _i in 0..acpi.irq_map_cnt as usize {
+        dbg!("<IRQ#{}.{} -> GSI#{} ON {}{}> ",
+            acpi.irq_map[_i].src_bus,
+            acpi.irq_map[_i].src_irq,
+            acpi.irq_map[_i].dst_gsi,
+            if acpi.irq_map[_i].active_low {"Low"} else {"High"},
+            if acpi.irq_map[_i].lvl_trig {"Level"} else {"Edge"}
+        );
+    }
+    // NMI->LINT mappings
+    for _i in 0..acpi.nmi_map_cnt as usize {
+        dbg!("<NMI.CPUS[{:X}] -> LINT#{} ON {}{}> ",
+            acpi.nmi_map[_i].cpu_id_mask,
+            acpi.nmi_map[_i].lint_vector,
+            if acpi.nmi_map[_i].active_low {"Low"} else {"High"},
+            if acpi.nmi_map[_i].lvl_trig {"Level"} else {"Edge"}
+        );
+    }
+    dbg!("\n");
+    // Initialize IOAPIC: TODO MOVE TO GENERAL CODE SOMEHOW
+    X86IoApic::init(&acpi.ioapic);
+
 }
 
-fn x86_acpi_parse() {
-    // 1) Find "RSD PTR " in low memory - on a 16-byte boundary
+//
+// System Configuration (ACPI)
+//
+pub const MAX_CPU_COUNT: usize = 8;
+pub const MAX_IRQ_COUNT: usize = 16;
+
+#[derive(Default)]
+struct AcpiInfo {
+    madt_base:  u32,
+    fadt_base:  u32,
+    hpet_base:  u32,
+    lapic_cnt:  u32,
+    lapic_mmio: u32, // Usually 0xFEE00000
+    lapic:      [AcpiLocalApic; MAX_CPU_COUNT],
+    ioapic:     AcpiIOApic, // No support for multiple sockets/IOAPICs
+    irq_map_cnt:u32,
+    irq_map:    [AcpiIRQMapping; MAX_IRQ_COUNT],
+    nmi_map_cnt:u32,
+    nmi_map:    [AcpiNmiMapping; MAX_CPU_COUNT], // At most: 1 NMI-mapping/CPU
+}
+
+#[derive(Default)]
+struct AcpiLocalApic {
+    cpu_id:     u8,
+    lapic_id:   u8,
+    enabled:    bool
+}
+
+#[derive(Default)]
+struct AcpiIOApic {
+    ioapic_id:  u8,
+    ioapic_mmio:u32,
+    gsi_base:   u32 // must be 0 in a single IOAPIC config
+}
+
+#[derive(Default)]
+struct AcpiIRQMapping {
+    src_bus:    u8,
+    src_irq:    u8,
+    dst_gsi:    u32,
+    active_low: bool, // Active Low or Active High signal
+    lvl_trig:   bool, // Triggered on the Level or on the Edge of the signal
+}
+
+#[derive(Default)]
+struct AcpiNmiMapping {
+    cpu_id_mask:u8,
+    lint_vector:u8, // Entry# of the vector table of CPUs' LAPIC
+    active_low: bool,
+    lvl_trig:   bool
+}
+
+fn x86_acpi_parse() -> Option<AcpiInfo>{
+    // 1) Find "RSD PTR " in low memory - on a 
     let mut ptr: *mut u64 = 400 as *mut u64;
     let mut valid_rsdp = false;
 
@@ -442,10 +669,13 @@ fn x86_acpi_parse() {
                 valid_rsdp = true;
                 break;
             }
-            ptr = ptr.wrapping_add(1);
+            ptr = ptr.wrapping_add(2); // 16-byte boundary
         }
     }
-    if valid_rsdp == false { return; }
+    if valid_rsdp == false {
+        return None;
+    }
+    let mut ret = AcpiInfo::default();
     // 2) Find RSDT (RSD[16] as u32)
     // FORMAT OF THE ROOT RSDT
     // OFF TYPE&NAME
@@ -466,84 +696,109 @@ fn x86_acpi_parse() {
 
         let mut rsdt: *mut u32 = *(ptr.wrapping_add(2)) as *mut u32;
         let num_tables : u32 = (*rsdt.wrapping_add(1) - 36) / 4;
-        let acpi_ver: u8 = *(rsdt.wrapping_add(2) as *mut u8);
-        archlog!("ACPI v{} (RSDT) @{:p}. SIG: {:X}, LEN:{} #TBLS: {}\n", 
-                    acpi_ver, rsdt, *rsdt, *(rsdt.wrapping_add(1)), num_tables);
+        // let acpi_ver: u8 = *(rsdt.wrapping_add(2) as *mut u8);
+        // archlog!("ACPI v{} (RSDT) @{:p}. SIG: {:X}, LEN:{} #TBLS: {}\n", 
+        //             acpi_ver, rsdt, *rsdt, *(rsdt.wrapping_add(1)), num_tables);
         rsdt = rsdt.wrapping_add(9);
         for _ in 0..num_tables {
             let sdt: *mut u32 = *rsdt as *mut u32;
+            // System Description Table header signatures to look for:
+            // "APIC" = 0x43495041 => MADT (Multi-APIC Description Table)
+            // "FACP" = 0x50434146 => FADT (Fixed ACPI Description Table)
+            // "HPET" = 0x54455048 => HPET (High Resolution Event Timer)
             match *sdt {
-                0x43495041 => x86_acpi_parse_madt(sdt as u32), // "APIC" MADT
-                0x50434146 => x86_acpi_parse_facp(sdt as u32), // "FACP" FADT
-                0x54455048 => x86_acpi_parse_hpet(sdt as u32), // "HPET" HiRes Timer
+                0x43495041 => x86_acpi_parse_madt(&mut ret, sdt as u32), 
+                0x50434146 => x86_acpi_parse_facp(&mut ret, sdt as u32),
+                0x54455048 => x86_acpi_parse_hpet(&mut ret, sdt as u32),
                 _ => ()
             };
             rsdt = rsdt.wrapping_add(1);
 
         }
     }
+    Some(ret)
 }
 
-fn x86_acpi_parse_madt(addr: u32){
+fn x86_acpi_parse_madt(acpi: &mut AcpiInfo, madt_addr: u32) {
     unsafe {
-        let madt: *mut u32 = addr as *mut u32;
+        let madt: *mut u32 = madt_addr as *mut u32;
         let madt_len = *(madt.wrapping_add(1));
 
-        // LocalAPIC
-        let lapic_addr: u32 = *(madt.wrapping_add(9));
-        let lapic_flag: u32 = *(madt.wrapping_add(10));
-        archlog!("LocalAPIC: addr: {:X}, flags: {:X}\n",
-                    lapic_addr, lapic_flag);
-        // The rest of the entries
+        // Save the base address of MADT for future use?
+        acpi.madt_base = madt_addr;
+
+        // LocalAPIC base address (ignoring lapic flags)
+        acpi.lapic_mmio = *(madt.wrapping_add(9));
+
+        // The rest of the entries: CPU, IOAPIC, GSI Mapping, NMI Mapping
+        let mut lapic_cnt: usize = 0;
+        let mut irq_cnt: usize = 0;
+        let mut nmi_cnt: usize = 0;
         let mut entry_addr = madt.wrapping_add(11) as u32;
-        while entry_addr < addr + madt_len {
+        while entry_addr < madt_addr + madt_len {
             let entry: *mut u8 = entry_addr as *mut u8;
             let entry_type: u8 = *entry;
             let entry_len:  u8 = *(entry.wrapping_add(1));
             match entry_type {
                 0 => {
-                    archlog!("CPU[{}]: LAPIC ID: {}, Enabled: {:X}\n",
-                        *(entry.wrapping_add(2)),
-                        *(entry.wrapping_add(3)),
-                        *(entry.wrapping_add(4))
-                    );
+                    acpi.lapic[lapic_cnt].cpu_id    = *(entry.wrapping_add(2));
+                    acpi.lapic[lapic_cnt].lapic_id  = *(entry.wrapping_add(3));
+                    acpi.lapic[lapic_cnt].enabled   = 
+                                                 *(entry.wrapping_add(4)) == 1;
+                    lapic_cnt += 1;
                 },
                 1 => {
-                    archlog!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
-                        *(entry.wrapping_add(2)),
-                        *(entry.wrapping_add(4) as *mut u32),
-                        *(entry.wrapping_add(8) as *mut u32)
-                    );
+                    // Only record the first IOAPIC
+                    if acpi.ioapic.ioapic_mmio == 0 {
+                        acpi.ioapic.ioapic_id   = *(entry.wrapping_add(2));
+                        acpi.ioapic.ioapic_mmio = 
+                                        *(entry.wrapping_add(4) as *mut u32);
+                        acpi.ioapic.gsi_base = 
+                                        *(entry.wrapping_add(8) as *mut u32);
+                    }
                 },
                 2 => {
-                    archlog!("<BUS[{}]IRQ[{}] -> GSI[{}]>",
-                        *(entry.wrapping_add(2)),
-                        *(entry.wrapping_add(3)),
-                        *(entry.wrapping_add(4) as *mut u32)
-                    );
+                    acpi.irq_map[irq_cnt].src_bus = 
+                                        *(entry.wrapping_add(2));
+                    acpi.irq_map[irq_cnt].src_irq =
+                                        *(entry.wrapping_add(3));
+                    acpi.irq_map[irq_cnt].dst_gsi =
+                                        *(entry.wrapping_add(4) as *mut u32);
+                    acpi.irq_map[irq_cnt].active_low = 
+                        (*(entry.wrapping_add(8) as *mut u16) & 0x2) == 0x2;
+                    acpi.irq_map[irq_cnt].lvl_trig =
+                        (*(entry.wrapping_add(8) as *mut u16) & 0x8) == 0x8;
+                    irq_cnt += 1;
                 },
                 4 => {
-                    archlog!("<LAPIC-NMI: CPU[{}] -> LINT[{}]>",
-                        *(entry.wrapping_add(2)),
-                        *(entry.wrapping_add(5))
-                    );
+                    acpi.nmi_map[nmi_cnt].cpu_id_mask =*(entry.wrapping_add(2));
+                    acpi.nmi_map[nmi_cnt].lint_vector =*(entry.wrapping_add(5));
+                    acpi.nmi_map[nmi_cnt].active_low = 
+                        (*(entry.wrapping_add(3) as *mut u16) & 0x2) == 0x2;
+                    acpi.nmi_map[nmi_cnt].lvl_trig =
+                        (*(entry.wrapping_add(3) as *mut u16) & 0x8) == 0x8;
+                    nmi_cnt += 1;
                 }
                 _ => {
-                    archlog!("MADT Entry T[{}]\n ",entry_type);
+                    dbg!("MADT Entry T[{}] Ignored\n ",entry_type);
                 }
             };
             entry_addr += entry_len as u32;
         }
+        acpi.lapic_cnt      = lapic_cnt as u32;
+        acpi.irq_map_cnt    = irq_cnt as u32;
+        acpi.nmi_map_cnt    = nmi_cnt as u32;
     }
-    archlog!("\n");
 }
 
-fn x86_acpi_parse_facp(_addr: u32) {
-
+fn x86_acpi_parse_facp(acpi: &mut AcpiInfo, addr: u32) {
+    acpi.fadt_base = addr;
+    // Todo - Extract useful stuff such as reset vector, power ports, etc.
 }
 
-fn x86_acpi_parse_hpet(_addr: u32) {
-
+fn x86_acpi_parse_hpet(acpi: &mut AcpiInfo, addr: u32) {
+    acpi.hpet_base = addr;
+    // Todo - Extract HPET's info to use as the kernel's ticker instead of PIT
 }
 
 // Doesn't seem to be supported any more - at least on QEMU it only shows 1 cpu

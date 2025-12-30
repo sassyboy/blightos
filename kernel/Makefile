@@ -7,6 +7,8 @@ PLATDIR=x86_64
 # --target=x86_64-unknown-none: bare-metal x86_64 compiler target/internals
 #
 RC=cargo build
+#RCFEATS=
+RCFEATS=--features "debug_arch"
 CC=$(TOOLCHAIN_PREFIX)gcc
 LD=$(TOOLCHAIN_PREFIX)ld
 OBJCPY=$(TOOLCHAIN_PREFIX)objcopy
@@ -28,7 +30,7 @@ $(KERN_ELF): $(OBJFILES) $(KERN_RST)
 	$(LD) -T src/arch/$(PLATDIR)/link.ld -o $@ $^
 
 $(KERN_RST): src/kernel.rs
-	$(RC) --release --target="x86_64-unknown-none"
+	$(RC) --release --target="x86_64-unknown-none" $(RCFEATS)
 	mv ../target/x86_64-unknown-none/release/libkernel.a $(KERN_RST)
 	rm -rf ../target
 

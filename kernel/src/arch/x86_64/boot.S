@@ -75,123 +75,49 @@ real_start:
  * setup_initial_4lp
  *
  * Initializes the neceassary 4-level page tables for direct mapping of the
- * first INIT_NUM_PAGE_TABLES*2MB (up to 1GB) of the physical memory into the
- * kernel's initial virtual memory.
+ * first 4GBs of the physical memory into the kernel's initial virtual memory.
+ * Large/Huge Pages are enabled on x64 by default! So, no x86 PSE nonsense!
  */
 .code32
 setup_initial_4lp:
-.LFB0:
 	pushl	%ebp
-	movl	%esp, %ebp
-	pushl	%edi
-	pushl	%esi
-	pushl	%ebx
-	subl	$44, %esp
-	movl	$0, -20(%ebp)
-	movl	$0, -28(%ebp)
-	jmp	.L2
-.L3:
-/* Zero-out all the entries in page_dir, page_dir_pointer_table, pml4 */
-	movl	-28(%ebp), %eax
-	movl	$0, page_dir(,%eax,8)
-	movl	$0, page_dir+4(,%eax,8)
-	movl	-28(%ebp), %eax
-	movl	$0, page_dir_pointer_table(,%eax,8)
-	movl	$0, page_dir_pointer_table+4(,%eax,8)
-	movl	-28(%ebp), %eax
-	movl	$0, pml4_table(,%eax,8)
-	movl	$0, pml4_table+4(,%eax,8)
-	addl	$1, -28(%ebp)
-.L2:
-	cmpl	$511, -28(%ebp)
-	jle	.L3
-/* Level 3) Set pdpte[0] point to page directory[0] (first 1 GB) */
-	movl	$page_dir_pointer_table, %eax
-	movl	$0, %edx
-	movl	%eax, %ebx
-	andl	$-4096, %ebx
-	movl	%ebx, %esi
-	movl	%edx, %eax
-	andl	$1048575, %eax
-	movl	%eax, %edi
-	movl	%esi, %eax
-	orl	$7, %eax
-	movl	%eax, -48(%ebp)
-	movl	%edi, %eax
-	orb	$0, %ah
-	movl	%eax, -44(%ebp)
-	movl	-48(%ebp), %eax
-	movl	-44(%ebp), %edx
+	pushl %eax
+  pushl %ecx
+
+  xorl  %ecx, %ecx
+	jmp	.cleanup_loop_cond
+.cleanup_loop_body:
+/* Zero-out all the entries in page_dir_pointer_table, pml4 */
+	movl	$0, init_page_dir_pointer_table(,%ecx,4)
+	movl	$0, init_pml4_table(,%ecx,4)
+	incl  %ecx
+.cleanup_loop_cond:
+	cmpl	$1024, %ecx
+	jle	.cleanup_loop_body
+
 /* Level 4) Set pml4e[0] point to page directory pointer table (first 512 GB) */
-	movl	%eax, pml4_table
-	movl	%edx, pml4_table+4
-	movl	$page_dir, %eax
-	movl	$0, %edx
-	movl	%eax, %edi
-	andl	$-4096, %edi
-	movl	%edi, -40(%ebp)
-	movl	%edx, %eax
-	andl	$1048575, %eax
-	movl	%eax, -36(%ebp)
-	movl	-40(%ebp), %eax
-	orl	$7, %eax
-	movl	%eax, -56(%ebp)
-	movl	-36(%ebp), %eax
-	orb	$0, %ah
-	movl	%eax, -52(%ebp)
-	movl	-56(%ebp), %eax
-	movl	-52(%ebp), %edx
-	movl	%eax, page_dir_pointer_table
-	movl	%edx, page_dir_pointer_table+4
-	movl	$0, -28(%ebp)
-	jmp	.L4
-.L7:
-/* Level 2) Set page_dir to point to first num_initial_page_tables page_tables */
-	movl	-28(%ebp), %eax
-	sall	$12, %eax
-	addl	$page_table, %eax
-	andl	$-4096, %eax
-	orl	$7, %eax
-	movl	$0, %edx
-	movl	-28(%ebp), %ecx
-	movl	%eax, page_dir(,%ecx,8)
-	movl	%edx, page_dir+4(,%ecx,8)
-	movl	$0, -24(%ebp)
-	jmp	.L5
-.L6:
-  /* Level 1) Setup first num_initial_page_tables page tables (each will cover 2MB) */
-	movl	-20(%ebp), %eax
-	andl	$-4096, %eax
-	orl	$7, %eax
-	movl	$0, %edx
-	movl	-28(%ebp), %ecx
-	movl	%ecx, %ebx
-	sall	$9, %ebx
-	movl	-24(%ebp), %ecx
-	addl	%ebx, %ecx
-	movl	%eax, page_table(,%ecx,8)
-	movl	%edx, page_table+4(,%ecx,8)
-	movl	$4096, %eax
-	addl	%eax, -20(%ebp)
-	addl	$1, -24(%ebp)
-.L5:
-	cmpl	$511, -24(%ebp)
-	jle	.L6
-	addl	$1, -28(%ebp)
-.L4:
-	cmpl	$INIT_NUM_PAGE_TABLES-1, -28(%ebp)
-	jle	.L7
+  movl	$init_page_dir_pointer_table, %eax
+  orl   $0xB, %eax                    /* Present|Writable|Cache-Write-Through */
+  movl	%eax, init_pml4_table
+
+/* Level 3) Set pdpte[0] point to the 1st GB, pdpte[1] to the 2nd GB and ...  */
+  movl  $0x8B, %eax/* 0x8B: Present|Writable|Cache-Write-Through|HugePage */
+  movl  %eax, init_page_dir_pointer_table+0
+  movl  $0x4000008B, %eax
+  movl  %eax, init_page_dir_pointer_table+8
+  movl  $0x8000008B, %eax
+  movl  %eax, init_page_dir_pointer_table+16
+  movl  $0xC000008B, %eax
+  movl  %eax, init_page_dir_pointer_table+24
 
 /* Load base address of PML4 table into cr3 */
-	mov $pml4_table, %edx
-	mov %edx, %cr3
+	mov $init_pml4_table, %eax
+	mov %eax, %cr3
 
 /* Clean-up and return */
 	nop
-	addl	$44, %esp
-	popl	%ebx
-	popl	%esi
-	popl	%edi
+	popl  %ecx
+  popl  %eax
 	popl	%ebp
 	ret
 
@@ -279,8 +205,11 @@ excep_overflow:
 	iretq
 
 excep_invalid_opcode:
+  STORE_CALLER_SAVED
   movq %rsp, %rdi
+  addq $(9*8), %rdi /* STORE_CALLER_SAVED pushed 9 registers on the stack */
   call kexcep_invalid_opcode
+  RESTORE_CALLER_SAVED
 	iretq
 
 excep_invalid_tss:
@@ -309,6 +238,8 @@ excep_gp_fault:
 
 excep_page_fault:
   STORE_CALLER_SAVED
+  movq %rsp, %rdi
+  addq $(9*8), %rdi /* STORE_CALLER_SAVED pushed 9 registers on the stack */
   call kexcep_page_fault
   RESTORE_CALLER_SAVED
   iretq
@@ -586,12 +517,25 @@ switch_context:
 /* setup kernel's initial stack area in bss */
 .globl    _KINIT_STACK_START
 .comm     stack, INIT_STACK_SIZE
-/* Setup initial 4 level pagin structures (0 to 1GB direct mapping) */
-/* L1) 512 Page tables, each of 4KB */
-.comm	    page_table, 0x1000 * INIT_NUM_PAGE_TABLES
-/* L2) 1 Page Directory (512 PDE each of which points to a page table) */
-.comm	    page_dir, 0x1000
-/* L3) 1 Page Directory Pointer Table (512 PDPTE. Only the 1st one is used)*/
-.comm	    page_dir_pointer_table,0x1000
-/* L4) 1 PML4 Table (512 PML4E of which only the first one is used) */
-.comm	    pml4_table, 0x1000
+
+/*
+ * Initial 4-level paging structures direct-mapping the first 4GBs used for
+ * - Switching the CPUs to long-mode (64-bit)
+ * - Loading any ramdisk image or kernel modules
+ * - Enumeration of ACPI tables and configuring early drivers (APICs, etc.)
+ *
+ * Use 1 Page Directory Pointer Table with the first 4 entries directly
+ * mapping to corresponding 1GB (huge page) of virt. to phys. address space.
+ * Otherwise, there needs to be 2048 Page Tables (2048x4KB + 24KB).
+ *
+ * These structures (init_* below) can be reclaimed once the kernel starts
+ * handling process address spaces.
+ */
+/* L1) Allocate 2048 Page Tables. Each PT can map 2MB (512x4K)
+/* SKIPPED! */
+/* L2) Allocate 4 Page Directories. Each PD can map 1GB */
+/* SKIPPED! */
+/* L3) Allocate 1 Page Directory Pointer Table. Each PDPT can map 512 GB*/
+.comm	    init_page_dir_pointer_table, 0x1000 /* Only first 4 PDPTEs are used */
+/* L4) Allocate 1 PML4 Table. Each PML4 can map 256 TB */
+.comm	    init_pml4_table, 0x1000 /* Only the first PML4E is used */

@@ -8,3 +8,5 @@ crate-type = ["staticlib"]
 name = "kernel"
 path = "src/kernel.rs"
 
+[features]
+debug_arch = []

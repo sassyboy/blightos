@@ -29,8 +29,7 @@ unsafe extern "C" {
 pub fn kstart(mmap: &[pmm::PMMapElement]) {
 
     // Print the E820 memory map
-    klog!("BlightOS - A practice OS for me to learn Rust!\n");
-    klog!("Physical Memory Map:\n");
+    klog!("BlightOS - A practice OS for me to learn Rust! Phys. Mem. Map:\n");
     for item in mmap {
         klog!("{:016X} - {:016X}: {}\n",
             item.base, item.base + item.len - 1,
@@ -78,7 +77,7 @@ pub fn dump_memory(base: usize, qwords: usize) {
     unsafe {
         let mut datap: *mut usize = base as *mut usize;
         for _ in 0..qwords {
-            klog!("{:016X}\n", *datap);
+            klog!("{:X}: {:016X}\n", datap as usize, *datap);
             datap = datap.wrapping_add(1);
         }
     }
