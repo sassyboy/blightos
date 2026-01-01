@@ -14,7 +14,7 @@
 
 .globl boot_start
 boot_start:
-  jmp real_start
+  jmp bsp_start32
   /* Multiboot header -- Safe to place this header in 1st page of memory for GRUB */
   .align 4
   .long 0x1BADB002 /* Multiboot magic number */
@@ -30,10 +30,10 @@ boot_start:
 #endif
 
 .text
-real_start:
+bsp_start32:
   cli
   /* Setup kernel initialization stack */
-  movl $stack+INIT_STACK_SIZE, %esp
+  movl $_KINIT_STACK_START+PER_CPU_KERNEL_STACK_SIZE, %esp
   /* Initialize 64-BIT IDT */
   call setup_idt
   lidt idt_pointer
@@ -65,10 +65,12 @@ real_start:
   mov   %ax, %fs
   mov   %ax, %gs
   mov   %ax, %ss
-  xor   %rdi, %rdi
   lidt  idt_pointer
-  mov   %ebx, %edi /* Pass the multiboot structure as an argument */
-  callq  rust_entry_x86_64
+
+  xor   %rdi, %rdi
+  mov   %ebx, %edi              /* The multiboot structure address */
+  mov   $MAX_CPU_COUNT, %rsi
+  callq  rust_x864_entry_bsp
   hlt
 
 /**
@@ -101,7 +103,7 @@ setup_initial_4lp:
   movl	%eax, init_pml4_table
 
 /* Level 3) Set pdpte[0] point to the 1st GB, pdpte[1] to the 2nd GB and ...  */
-  movl  $0x8B, %eax/* 0x8B: Present|Writable|Cache-Write-Through|HugePage */
+  movl  $0x8B, %eax/* 0x9B: Present|Writable|Write-Through|No-Cache|HugePage */
   movl  %eax, init_page_dir_pointer_table+0
   movl  $0x4000008B, %eax
   movl  %eax, init_page_dir_pointer_table+8
@@ -232,6 +234,8 @@ excep_stack_fault:
 
 excep_gp_fault:
   STORE_CALLER_SAVED
+  movq %rsp, %rdi
+  addq $(9*8), %rdi /* STORE_CALLER_SAVED pushed 9 registers on the stack */
   call kexcep_gp_fault
   RESTORE_CALLER_SAVED
   iretq
@@ -349,16 +353,47 @@ sys_handler:
 .data
 .align 16
 gdt64_base:
-  /* Null descriptor */
+  /* 0x00: Null descriptor */
   .quad 0x0
-  /* 64-bit code descriptor (exec/read) */
+  /* 0x08: 64-bit code descriptor (exec/read) */
   .quad 0x00209A0000000000
-  /* 64-bit data descriptor (read/write) */
+  /* 0x10: 64-bit data descriptor (read/write) */
   .quad 0x0000920000000000
 
+  /*
+   * 64-bit 1 TSS per Processor is required for Long Mode.
+   * to keep track of Interrupt Stack Table (only storing rsp0 (ring0) for now)
+   * 
+   */
+gdt64_tssd_base:
+  /* 0x18: CPU 0 TSS */
+  .quad 0x20890000000068 
+  .quad tss64_base+(0x68 * 0)
+  /* 0x28: CPU 1 TSS */
+  .quad 0x20890000000068 
+  .quad tss64_base+(0x68 * 1)
+  /* 0x38: CPU 2 TSS */
+  .quad 0x20890000000068 
+  .quad tss64_base+(0x68 * 2)
+  /* 0x48: CPU 3 TSS */
+  .quad 0x20890000000068 
+  .quad tss64_base+(0x68 * 3)
+  /* 0x58: CPU 4 TSS */
+  .quad 0x20890000000068 
+  .quad tss64_base+(0x68 * 4)
+  /* 0x68: CPU 5 TSS */
+  .quad 0x20890000000068 
+  .quad tss64_base+(0x68 * 5)
+  /* 0x78: CPU 6 TSS */
+  .quad 0x20890000000068 
+  .quad tss64_base+(0x68 * 6)
+  /* 0x88: CPU 7 TSS */
+  .quad 0x20890000000068 
+  .quad tss64_base+(0x68 * 7)
+
 gdt64_pointer:
-    .short gdt64_pointer - gdt64_base - 1
-    .long gdt64_base
+  .short gdt64_pointer - gdt64_base - 1
+  .long gdt64_base
 
 /*******************************************************************************
  * Interrupt Descriptor Table
@@ -423,6 +458,13 @@ idt_vectors:
   .quad   irq_handler14
   .quad   irq_handler15
   .quad   sys_handler
+
+/******************************************************************************
+ * Task State Segment - One per CPU                                           *
+ * Todo - Use this buffer when adding the support for a dual-mode kernel      *
+ ******************************************************************************/
+tss64_base:
+.zero 104 * MAX_CPU_COUNT 
 
 /*******************************************************************************
  * Scheduling primitives
@@ -516,7 +558,7 @@ switch_context:
 .align    0x1000
 /* setup kernel's initial stack area in bss */
 .globl    _KINIT_STACK_START
-.comm     stack, INIT_STACK_SIZE
+.comm     _KINIT_STACK_START, PER_CPU_KERNEL_STACK_SIZE * MAX_CPU_COUNT
 
 /*
  * Initial 4-level paging structures direct-mapping the first 4GBs used for
@@ -539,3 +581,118 @@ switch_context:
 .comm	    init_page_dir_pointer_table, 0x1000 /* Only first 4 PDPTEs are used */
 /* L4) Allocate 1 PML4 Table. Each PML4 can map 256 TB */
 .comm	    init_pml4_table, 0x1000 /* Only the first PML4E is used */
+
+
+/******************************************************************************
+ * Application Processors Startup Entry Point                                 *
+ *                                                                            *
+ * The Real Mode (16 bit) part of the startup procedure is marked by          *
+ *_AP_STARTUP16_ENTRY and _AP_STARTUP16_END, which will be copied to 0x8000   *
+ * by the BSP before APs receive the SIPI(0x8000) interrupt and start up.     *
+ *                                                                            *
+ * Because of how our linker script sets up the addresses above the 1MB mark  *
+ * The addressing part of the instructions are manually calculated and        *
+ * and adjusted for proper run-time translation of the Real Mode part.        *
+ * .align is used to make the address calculation easier and less susceptible *
+ * to change if a few instructions are added or removed from each sub-section *
+ * of the AP startup code.                                                    *
+ * Once the AP is switched over to Protected Mode (32 bits), we can rely on   *
+ * the linker's address translation and the copy of the following code > 1MB  *
+ ******************************************************************************/
+.text
+.code16
+.align 64
+.globl    _AP_STARTUP16_ENTRY
+_AP_STARTUP16_ENTRY:                           /* <-- Runtime Address: 0x8000 */
+  cli
+  cld
+  ljmp    $0, $0x8080 /* CS=0; jump to ap_startup_switch_to_pm */
+
+.align 64
+gdt32_base:                                    /* <-- Runtime Address: 0x8040 */
+  /* Null descriptor */
+  .quad 0x0
+  /* 32-bit code descriptor (exec/read) */
+  .quad 0x00CF9A000000FFFF
+  /* 32-bit data descriptor (data/rw) */
+  .quad 0x00CF92000000FFFF
+gdt32_ptr:                                     /* <-- Runtime Address: 0x8058 */
+  .short gdt32_ptr - gdt32_base - 1
+  .long 0x8040
+
+.align 64                                      /* <-- Runtime Address: 0x8080 */
+ap_startup_switch_to_pm: 
+  xorw    %ax, %ax
+  movw    %ax, %ds
+  lgdt    0x8058
+  movl    %cr0, %eax
+  orl     $1, %eax
+  movl    %eax, %cr0  /* Set CR0.PE */
+  ljmp    $0x8, $0x80C0  /*Switch to 32-bits and do another jump (below) */
+
+.align 64
+.code32                                        /* <-- Runtime Address: 0x80C0 */ 
+  /* We are in 32-bits now but EIP is still < 1MB,
+   * Calling ap_startup_32bit here jumps to the copy of this code in the kernel
+   * image, i.e. > 1MB, which conforms to the linker produced addresses
+   */
+  jmp     ap_startup_32bit 
+
+ap_startup_32bit:
+  mov     $0x10, %ax
+  mov     %ax, %ds
+  mov     %ax, %es
+  mov     %ax, %fs
+  mov     %ax, %gs
+  mov     %ax, %ss
+  /* Fetch current CPU's LAPICID -> EBX[31..24] -> EDI */
+  mov     $1, %eax  /* CPUID_GETFEATURES */
+  cpuid
+  shrl    $24, %ebx
+  movl    %ebx, %edi /* <- CPU ID */
+  /* Set up the CPU's RSP = _KINIT_STACK_START + (CPUID+1) * STACK_SIZE */
+  inc     %edi
+  movl    $PER_CPU_KERNEL_STACK_SIZE, %eax
+  mul     %edi
+  leal    _KINIT_STACK_START(, %eax), %esp
+  /* Push the CPUID and the magic number */
+  dec     %edi
+  pushl   $0x5a55a400       /* Save a magic # for verification */
+  pushl   %edi              /* Save the CPU LAPIC ID */
+  /* Switch the AP to Long Mode using the same IDT, GDT and PML4 as BSP */
+  mov $init_pml4_table, %eax
+	mov %eax, %cr3
+  mov %cr4, %edx
+  or  $0x20,%edx
+  mov %edx, %cr4 /* Enable PAE */
+  mov $0xC0000080, %ecx
+  rdmsr
+  or $0x00000100, %eax
+  wrmsr           /* Enable Long Mode (Set IA32_EFER.LME) */
+  mov %cr0, %eax
+  or  $0x80000001, %eax
+  mov %eax, %cr0  /* Enable PE and PG */
+  lgdt gdt64_pointer
+  ljmp $0x8,$1f   /* Switch to the initial 64-bit 4GB flat GDT */
+
+.code64
+1:
+  /* Segment registers */
+  mov     $0x10, %ax
+  mov     %ax, %ds
+  mov     %ax, %es
+  mov     %ax, %fs
+  mov     %ax, %gs
+  mov     %ax, %ss
+  /* Load IDT */
+  lidt    idt_pointer
+  /* Call into Rust */
+  popq    %rdi /* Pass the CPU ID to Rust */
+  callq   rust_x864_entry_ap
+2:
+  cli
+  hlt
+  jmp 2b /* should be unreachable */
+.globl    _AP_STARTUP16_END
+_AP_STARTUP16_END:
+

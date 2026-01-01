@@ -13,7 +13,11 @@ pub mod arch;
 // Standard utilities
 #[macro_use]
 pub mod util;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use util::*;
+
+use crate::arch::{cpu_busywait, cpu_count};
 // Physical Memory Manager
 #[path = "mem/pmm.rs"]
 pub mod pmm;
@@ -26,45 +30,72 @@ unsafe extern "C" {
     static _KERNEL_END: usize;
 }
 
-pub fn kstart(mmap: &[pmm::PMMapElement]) {
+static BSP_INITIALIZED : AtomicBool = AtomicBool::new(false);
 
-    // Print the E820 memory map
-    klog!("BlightOS - A practice OS for me to learn Rust! Phys. Mem. Map:\n");
-    for item in mmap {
-        klog!("{:016X} - {:016X}: {}\n",
-            item.base, item.base + item.len - 1,
-            match item.avail {
-                true => "[USABLE]",
-                false=> "[RESERV]"
-            }
+// kstart : Kernel's Generic Entry Point
+// This function will be called by all onlined CPUs (BSP with cpuid=0) in any
+// order, albeit only after all onlined CPUs have reported to the arch-specific
+// stub code so that the generic code has the correct CPU count (e.g., for 
+// resource allocation purposes).
+pub fn kstart(cpuid: usize, mmap_opt: Option<&[pmm::PMMapElement]>) {
+    if cpuid == 0 {
+        let mmap : &[pmm::PMMapElement];
+        match mmap_opt {
+            Some(mmap_passed) => {mmap = mmap_passed;},
+            _ => {panic!("No memory map was sent to the BSP!")}
+        }
+        // BSP-only initialization
+        klog!("Number of CPUs online: {}\n", cpu_count());
+        // Print the E820 memory map
+        klog!("BlightOS - Physical Memory Map:\n");
+        for item in mmap {
+            klog!("{:016X} - {:016X}: {}\n",
+                item.base, item.base + item.len - 1,
+                match item.avail {
+                    true => "[USABLE]",
+                    false=> "[RESERV]"
+                }
+            );
+        }
+        // Print the kernel image range
+        let kernel_start: usize;
+        let kernel_end: usize;
+        unsafe{
+            kernel_start = &_KERNEL_START as *const usize as usize;
+            kernel_end = &_KERNEL_END as *const usize as usize;
+        }
+        klog!("Kernel Image [{:016X} - {:016X}], {:.2} MB\n",
+            kernel_start, kernel_end, 
+            ((kernel_end - kernel_start) as f64)/(1024 * 1024) as f64
         );
+
+        // Initialize the physical memory manager
+        pmm::pmm_init(); // Todo: simple bitmap of PAGE_SIZE should do
+
+        // Enable the interrupts and the system timer
+        arch::systimer_set_periodic(1000, ktick);
+        //arch::irq_controller_init();
+        arch::cpu_enable_ints();
+
+        BSP_INITIALIZED.store(true, Ordering::Relaxed);
+        // Todo Initialize the scheduler and spawn the init process
+        sched::new_task(0, idle_task);
+        sched::new_task(1, task1_exec);
+        sched::new_task(2, task2_exec);
+
+        // Jump to the first task and never come back ;)
+        sched::start_scheduling(1);
+
+    } else {
+        // AP initialization
+        while BSP_INITIALIZED.load(Ordering::Relaxed) == false {
+            // Wait until the BSP is done initializing
+        }
+        loop {
+            klog!("<CPU{}>", cpuid);
+            cpu_busywait(1_000_000_000 * cpuid as u64);
+        }
     }
-
-    // Print the kernel image range
-    let kernel_start: usize;
-    let kernel_end: usize;
-    unsafe{
-        kernel_start = &_KERNEL_START as *const usize as usize;
-        kernel_end = &_KERNEL_END as *const usize as usize;
-    }
-    klog!("Kernel Image [{:016X} - {:016X}], {:.2} MB\n",
-        kernel_start, kernel_end, 
-        ((kernel_end - kernel_start) as f64)/(1024 * 1024) as f64
-    );
-
-    // Initialize the physical memory manager
-    pmm::pmm_init(); // Todo: simple bitmap of PAGE_SIZE should do
-
-    // Enable the interrupts and the system timer
-    arch::systimer_set_periodic(1000, ktick);
-    arch::irq_controller_init();
-    arch::cpu_enable_ints();
-
-    // Todo Initialize the scheduler and spawn the init process
-    sched::new_task(0, idle_task);
-    sched::new_task(1, task1_exec);
-    sched::new_task(2, task2_exec);
-    sched::start_scheduling(1);    
     panic!("Reached the end of kstart!");
 }
 

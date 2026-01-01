@@ -12,8 +12,7 @@ CFLAGS += -DSTDOUT_EGA_TEXT
 # CFG += -DSTDOUT_UART
 
 # KERNEL STARTUP OPTIONS #######################################################
-
-# Kernel's Initial STACK size in bytes
+CFLAGS += -DMAX_CPU_COUNT=8
+# Kernel's Initial STACK size in bytes for each CPU: 8KB
 # Should be enough before the kernel starts multi-processing
-CFLAGS += -DINIT_STACK_SIZE=4096
-
+CFLAGS += -DPER_CPU_KERNEL_STACK_SIZE=8192

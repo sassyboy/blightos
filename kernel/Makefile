@@ -7,8 +7,14 @@ PLATDIR=x86_64
 # --target=x86_64-unknown-none: bare-metal x86_64 compiler target/internals
 #
 RC=cargo build
-#RCFEATS=
-RCFEATS=--features "debug_arch"
+
+
+#To generate Debug Info: Make FEATURE="debug_arch"
+ifdef FEATURES
+	RCFEATS=--features $(FEATURES)
+else
+	RCFEATS=
+endif
 CC=$(TOOLCHAIN_PREFIX)gcc
 LD=$(TOOLCHAIN_PREFIX)ld
 OBJCPY=$(TOOLCHAIN_PREFIX)objcopy

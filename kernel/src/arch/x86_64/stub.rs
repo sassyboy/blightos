@@ -1,5 +1,7 @@
+// 
 // Rust stub for the x86_64 architecture
-
+//
+#![allow(dead_code)]
 use core::mem::size_of;
 use core::arch::asm;
 use crate::pmm::PMMapElement;
@@ -77,18 +79,34 @@ struct MemoryEntry {
     mtype: u32,
 }
 
+// This struct keeps track of the architecture-dependent data (e.g., ACPI)
+// pertaining the current CPU, and it's be used by the rest of this module.
+// 
+//
+#[derive(Default)]
+struct PerCpuContext {
+    lapic:  X86LocalApic,
+    ioapic: X86IoApic
+}
+
+#[derive(Default)]
+pub struct MachineContext {
+    pub cpu_count:  usize,
+    acpi_info:  AcpiInfo
+}
+
 //----------------------------------------------------------------------------//
 // Private interface between the Assembly stub (boot.S) and the Rust stub     //
 //----------------------------------------------------------------------------//
 
 //
-// Kernel's entry-point in Rust
+// Kernel's entry-point for BSP (CPU0)
 // boot.S must have switched to 64-bit (Long Mode) with the first
 // INIT_NUM_PAGE_TABLES*2MB (up to 1GB) of the physical memory directly mapped
 // to kernel's initial virtual address space
 //
 #[unsafe(no_mangle)]
-extern "C" fn rust_entry_x86_64(mbi: &MultibootInfo) {
+extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
     // Create the memory map
     let mut mem_map: [PMMapElement; 32] = [
         PMMapElement {base: 0, len: 0, avail: false}; 32];
@@ -113,18 +131,43 @@ extern "C" fn rust_entry_x86_64(mbi: &MultibootInfo) {
     
     kearly_console::init();
     // SMP, LAPIC, IOAPIC, HiRes Event Timer, etc. are found in ACPI tables
+    let cpu_context : PerCpuContext;
+    let mut smp_context : MachineContext = MachineContext::default();
+    smp_context.cpu_count = 1;
     match x86_acpi_parse() {
         Some(acpi) => {
-            start_smp(&acpi);
+            smp_context.acpi_info = acpi;
+            set_machine_context(&smp_context);
+            cpu_context = start_smp(&smp_context.acpi_info, max_cpus);
+            set_percpu_context(&cpu_context);
         },
         None => {
             dbg!("No ACPI information found. Multiprocessing disabled.\n");
         }
     };
 
-    // Start the kernel. 
-    kstart(&mem_map[0..e820_mmap_count]);
+    // Start the kernel.
+    kstart(0, Some(&mem_map[0..e820_mmap_count]) );
     panic!(); // kstart shouldn't really return but if does, we should panic
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn rust_x864_entry_ap(_arg: usize) {
+    let cpuid = cpu_id();
+    // let sig = cpuid | (0x5a55a400 as usize) << 32;
+    // if arg != sig {
+    //     panic!("Corrupted CPU[{}] state: {:X}, expected: {:X}",
+    //         cpuid, arg, sig);
+    // }
+    // Let the BSP continue to the next APs
+    unsafe {
+        (*(this_machine())).cpu_count += 1;
+    }
+    dbg!("<HELLO FROM CPU {}>\n", cpuid);
+    // Initialize the LAPIC for the current CPU
+
+    // Start the kernel for this AP
+    kstart(cpuid as usize, None);
 }
 
 //
@@ -154,8 +197,8 @@ extern "C" fn kexcep_overflow() {
 extern "C" fn kexcep_invalid_opcode(exframe: usize) {
     let info = x86_decode_exception_frame(exframe, false);
     dump_memory(info.rsp, 8);
-    panic!("#UD RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
-        info.rflg, info.cs, info.rip, info.ss, info.rsp
+    panic!("#UD CPU={} RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
+        info.cpu, info.rflg, info.cs, info.rip, info.ss, info.rsp
     );
 }
 
@@ -175,16 +218,21 @@ extern "C" fn kexcep_stack_fault() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn kexcep_gp_fault() {
-    panic!("kexcep_gp_fault");
+extern "C" fn kexcep_gp_fault(exframe: usize) {
+    let info = x86_decode_exception_frame(exframe, true);
+    dump_memory(info.rsp, 8);
+    panic!("#GP CPU={} ERR={:X} RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
+            info.cpu, info.err, info.rflg, info.cs, info.rip, info.ss, info.rsp
+    );
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn kexcep_page_fault(exframe: usize) {
     let info = x86_decode_exception_frame(exframe, true);
     dump_memory(info.rsp, 8);
-    panic!("#PF CR2={:X} ERR={:X} RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
-        info.cr2, info.err, info.rflg, info.cs, info.rip, info.ss, info.rsp
+    panic!("#PF CPU={} CR2={:X} ERR={:X} RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
+        info.cpu, info.cr2, info.err, info.rflg, info.cs, info.rip,
+        info.ss, info.rsp
     );
 
 }
@@ -213,7 +261,9 @@ extern "C" fn kexcep_simd_fp() {
 extern "C" fn kirq_handler(irq: u8) {
     // For simplicity: EOI immediately not to lose IRQs in case the top-half
     // handler ends up doing a context switch or takes too long.
-    x86_pic::send_eoi(irq); 
+    unsafe {
+        (*(this_cpu())).lapic.send_eoi();
+    }
     unsafe {X86_ISR_HANDLER[irq as usize](irq as u16);}
 }
 
@@ -228,6 +278,7 @@ extern "C" fn ksyscall_handler() {}
 
 #[derive(Default)]
 struct X86ExceptionInfo {
+    cpu:    usize,
     err:    usize,
     cs:     usize,
     rip:    usize,
@@ -241,11 +292,13 @@ struct X86ExceptionInfo {
 fn x86_decode_exception_frame(exframe: usize, error_code: bool) -> 
 X86ExceptionInfo {
     unsafe {
-        let (cr2, cr4): (usize, usize);
+        let (cpu, cr2, cr4): (usize, usize, usize);
+        cpu = cpu_id();
         asm!("mov rax, cr2", out("rax")cr2);
         asm!("mov rax, cr4", out("rax")cr4);
         if error_code {
             X86ExceptionInfo {
+                cpu : cpu,
                 err : *((exframe + 8 * 0) as *const usize),
                 rip : *((exframe + 8 * 1) as *const usize),
                 cs  : *((exframe + 8 * 2) as *const usize),
@@ -257,6 +310,7 @@ X86ExceptionInfo {
             }
         } else {
             X86ExceptionInfo {
+                cpu : cpu,
                 err : 0,
                 rip : *((exframe + 8 * 0) as *const usize),
                 cs  : *((exframe + 8 * 1) as *const usize),
@@ -273,6 +327,33 @@ X86ExceptionInfo {
 //----------------------------------------------------------------------------//
 // Internal interface                                                         //
 //----------------------------------------------------------------------------//
+static mut THIS_CPU:    usize = 0; 
+static mut THIS_MACHINE:usize = 0;
+
+fn set_percpu_context(ctx: &PerCpuContext) {
+    unsafe {
+        THIS_CPU = ctx as *const PerCpuContext as usize;
+    }
+}
+
+fn this_cpu() -> *mut PerCpuContext {
+    unsafe {
+        THIS_CPU as *mut PerCpuContext
+    }
+}
+
+fn set_machine_context(ctx: &MachineContext) {
+    unsafe {
+        THIS_MACHINE = ctx as *const MachineContext as usize;
+    }
+}
+
+fn this_machine() -> *mut MachineContext {
+    unsafe {
+        THIS_MACHINE as *mut MachineContext
+    }
+}
+
 //
 // Base x86 Drivers
 // + Programmable Interrupt Controller (PIC)
@@ -334,6 +415,11 @@ mod x86_pic {
         }
     }
 
+    pub fn mask_all() {
+        x86_ioport_write(PIC1_PORT_DAT, 0xFF);
+        x86_ioport_write(PIC2_PORT_DAT, 0xFF);
+    }
+
     pub fn unmask_irq(irq: u8) {
         if irq < 8 {
             x86_ioport_write(PIC1_PORT_DAT, 
@@ -377,39 +463,204 @@ mod x86_pit {
     }
 }
 
-struct X86IoApic;
+
+#[derive(Default)]
+struct X86IoApic{
+    acpi_id:        u8,
+    version:        u8,
+    max_irqs:       u8,
+    initialized:    bool,
+    mmio_base:      u32,
+    gsi_base:       u32
+}
+
 impl X86IoApic {
-    const IOAPIC_REG_ID:    u8 = 0x0;
-    const IOAPIC_REG_VER:   u8 = 0x1;
+    const REG_ID:    u8 = 0x0;
+    const REG_VER:   u8 = 0x1;
 
-    pub fn read_reg(ioapic: &AcpiIOApic, reg_index: u8) -> u32 {
-        let io_reg_sel : *mut u32 = ioapic.ioapic_mmio as *mut u32;
-        let io_reg_dat : *mut u32 = (ioapic.ioapic_mmio + 0x10) as *mut u32;
+    // IRQ Delivery Priority Values
+    pub const PRIORITY_FIXED:   u32 = 0x0;
+    pub const PRIORITY_LOWEST:  u32 = 0x100;
+    pub const PRIORITY_SMI:     u32 = 0x200;
+    pub const PRIORITY_NMI:     u32 = 0x400;
+    pub const PRIORITY_INIT:    u32 = 0x500;
+    pub const PRIORITY_EXTINT:  u32 = 0x700;
+    // IRQ Pin Polarity 
+    pub const POLARITY_HIGH:    u32 = 0x0;
+    pub const POLARITY_LOW:     u32 = 0x2000;
+    // IRQ Pin Trigger Mode
+    pub const TRIGGER_EDGE:     u32 = 0x0;
+    pub const TRIGGER_LEVEL:    u32 = 0x8000;
+
+    fn read_reg(&self, reg_index: u8) -> u32 {
+        if self.initialized == false { return 0; }
+        let io_reg_sel : *mut u32 = self.mmio_base as *mut u32;
+        let io_reg_dat : *mut u32 = (self.mmio_base + 0x10) as *mut u32;
         unsafe {
-            *io_reg_sel = reg_index as u32;
-            *io_reg_dat
+            io_reg_sel.write_volatile(reg_index as u32);
+            io_reg_dat.read_volatile()
         }
     }
 
-    pub fn write_reg(ioapic: &AcpiIOApic, reg_index: u8, value: u32) {
-        let io_reg_sel : *mut u32 = ioapic.ioapic_mmio as *mut u32;
-        let io_reg_dat : *mut u32 = (ioapic.ioapic_mmio + 0x10) as *mut u32;
+    fn write_reg(&self, reg_index: u8, value: u32) {
+        if !self.initialized { return; }
+        let io_reg_sel : *mut u32 = self.mmio_base as *mut u32;
+        let io_reg_dat : *mut u32 = (self.mmio_base + 0x10) as *mut u32;
         unsafe {
-            *io_reg_sel = reg_index as u32;
-            *io_reg_dat = value;
+            io_reg_sel.write_volatile(reg_index as u32);
+            io_reg_dat.write_volatile(value);
         }
     }
 
-    pub fn init(ioapic: &AcpiIOApic) {
-        // Assuming that we're still using the inital kernel address-space...
-        dbg!("IOAPIC init => ID = {}\n", 
-            Self::read_reg(ioapic, Self::IOAPIC_REG_ID));
+    pub fn init(&mut self, ioapic: &AcpiIOApic) {
+        // TODO identity-map mmio_base with caching disabled
+        // The MMIO is usually toward the end of the 4GB boundary. Don't accept
+        // an MMIO mapping under 1MB.
+        if ioapic.ioapic_mmio <= 0x100000 { return; }
+        self.initialized = true;
+        self.mmio_base = ioapic.ioapic_mmio;
+        self.gsi_base  = ioapic.gsi_base;
+        self.acpi_id = (self.read_reg(Self::REG_ID) >> 24) as u8;
+        let ver = self.read_reg(Self::REG_VER);
+        self.version = (ver & 0xFF) as u8;
+        self.max_irqs= ((ver >> 16) & 0xFF) as u8 + 1;
+
+        dbg!("IOAPIC init => ID:{} MMIO: {:X} Ver:{} Max IRQs:{}\n", 
+            self.acpi_id, self.mmio_base, self.version, self.max_irqs
+        );
+    }
+
+    pub fn register_isr(&mut self, gsi: u32, isr_vector: u8,
+                        priority: u32, pin_polarity: u32, pin_trigger: u32,
+                        masked: bool, dest_cpu_acpi_id_mask: u8)
+    {
+        let entry_index = gsi - self.gsi_base;
+        if gsi < self.max_irqs as u32 {
+            let (mut high, low) : (u32, u32);
+            low = (isr_vector as u32) | priority | pin_polarity | pin_trigger;
+            high = (dest_cpu_acpi_id_mask as u32) << 24;
+            if masked {high |= 1;}  
+            self.write_reg((entry_index * 2 + 0x10) as u8, low);
+            self.write_reg((entry_index * 2 + 0x11) as u8, high);
+        }
+
+    }
+
+    pub fn set_irq_mask(&mut self, gsi: u32, masked: bool) {
+        let entry_index = gsi - self.gsi_base;
+        if gsi < self.max_irqs as u32 {
+            let mut high = self.read_reg((entry_index * 2 + 0x11) as u8);
+            high = match masked {
+                true  => high | 0x1,
+                false => high & 0xFFFFFFFE
+            };
+            self.write_reg((entry_index * 2 + 0x11) as u8, high);
+        }
     }
 }
 
+#[derive(Default)]
 struct X86LocalApic {
-
+    lapic_id:   u8,
+    cpu_acpi_id:u8,
+    mmio_base:  u32,
+    initialized:bool,
 }
+
+impl X86LocalApic {
+
+    const REG_LAPIC_ID:         u16 = 0x20;
+    const REG_LAPIC_VERSION:    u16 = 0x30;
+    const REG_TASK_PRIORITY:    u16 = 0x80;
+    const REG_ARB_PRIORITY:     u16 = 0x90;
+    const REG_PROC_PRIORITY:    u16 = 0xA0;
+    const REG_EOI:              u16 = 0xB0;
+    const REG_SIV:              u16 = 0xF0; // Spurious Int Vector Reg
+    const REG_ERROR_STATUS:     u16 = 0x280;
+    const REG_INT_CMD1:         u16 = 0x300;
+    const REG_INT_CMD2:         u16 = 0x310;
+    const REG_LVT_TIMER:        u16 = 0x320;
+    const REG_LVT_LINT0:        u16 = 0x350;
+    const REG_LVT_LINT1:        u16 = 0x360;
+    const REG_LVT_ERROR:        u16 = 0x370;
+    const REG_TIMER_INIT_CNT:   u16 = 0x380;
+    const REG_TIMER_CUR_CNT:    u16 = 0x390;
+    const REG_TIMER_DIV:        u16 = 0x3E0;
+
+    fn read_reg(&mut self, reg: u16) -> u32 {
+        let regref : *mut u32 = (self.mmio_base + reg as u32) as *mut u32;
+        unsafe {
+            regref.read_volatile()
+        }
+    }
+
+    fn write_reg(&mut self, reg: u16, value: u32) {
+        let regref : *mut u32 = (self.mmio_base + reg as u32) as *mut u32;
+        unsafe {
+            regref.write_volatile(value);
+        }
+    }
+
+    fn send_ipi(&mut self, dest_lapic_id: u8, cmd1: u32) {
+        // Select the target LAPIC
+        let reg = self.read_reg(Self::REG_INT_CMD2) & 0x00FFFFFF;
+        self.write_reg(Self::REG_INT_CMD2, reg | (dest_lapic_id as u32)<<24);
+        // Send the command
+        let reg = self.read_reg(Self::REG_INT_CMD1) & 0xFFF00000;
+        self.write_reg(Self::REG_INT_CMD1, reg | cmd1);
+
+    }
+
+    fn wait_ipi_send(&mut self){
+        // Poll CMD1.bits[12], which clears when the IPI is accepted by the dest
+        // Todo - timeout here instead of an endless loop
+        while self.read_reg(Self::REG_INT_CMD1) & 0x1000 > 0 {
+            unsafe {asm!("pause");}
+        }
+    }
+
+    pub fn init(&mut self, lapic: &AcpiLocalApic, lapic_mmio: u32) {
+        // TODO identity-map mmio_base with caching disabled
+        // The MMIO is usually toward the end of the 4GB boundary. Don't accept
+        // an MMIO mapping under 1MB.
+        if lapic_mmio <= 0x100000 { return; }
+        self.lapic_id       = lapic.lapic_id;
+        self.cpu_acpi_id    = lapic.cpu_id;
+        self.mmio_base      = lapic_mmio;
+        self.initialized    = true;
+
+        // Setting bit 8 of the spurious interrupt vector enables the lapic
+        let siv = self.read_reg(Self::REG_SIV);
+        self.write_reg(Self::REG_SIV, siv | 0x100);
+        let _siv = self.read_reg(Self::REG_SIV);
+        dbg!("LAPIC[{}] SIV = {:X}\n", self.lapic_id, _siv);
+    }
+
+    pub fn send_eoi(&mut self) {
+        self.write_reg(Self::REG_EOI, 0);
+    }
+
+    pub fn send_init_ipi(&mut self, dest_lapic_id: u8) {
+        // clear errors
+        self.write_reg(Self::REG_ERROR_STATUS, 0);
+        // Assert the IPI signal (Delivery: INIT, Assert)
+        self.send_ipi(dest_lapic_id, 0xC500);
+        self.wait_ipi_send();
+        // De-assert the IPI signal
+        self.send_ipi(dest_lapic_id, 0x8500);
+        self.wait_ipi_send();
+    }
+
+    pub fn send_startup_ipi(&mut self, dest_lapic_id: u8, entry_point_pg: u8) {
+        // clear errors
+        self.write_reg(Self::REG_ERROR_STATUS, 0);
+        // Send SIPI
+        self.send_ipi(dest_lapic_id, 0x600 | entry_point_pg as u32);
+		cpu_busywait(2_000_000); // TODO: precise 200 uS
+		self.wait_ipi_send();
+    }
+}
+
 //----------------------------------------------------------------------------//
 // External interface exposed to kernel's general code                        //
 //----------------------------------------------------------------------------//
@@ -430,6 +681,26 @@ pub fn cpu_disable_ints() {
 pub fn cpu_halt() {
     unsafe {
         asm!("hlt");
+    }
+}
+
+pub fn cpu_count() -> usize {
+    unsafe {(*(this_machine())).cpu_count}
+}
+
+// Returns LAPIC CPU ID of the current CPU calling the routine using the
+// CPUID instruction with Extended Topology Leaf (0BH)
+pub fn cpu_id() -> usize {
+    unsafe {
+        let apic_id: u32;
+        asm!(
+            "mov    eax, 0xb",
+            "mov    ecx, 0x0",
+            "cpuid",
+            // EDX should hold the APIC ID
+            out("edx")apic_id
+        );
+        apic_id as usize
     }
 }
 pub fn cpu_read_timestamp() -> u64 {
@@ -564,15 +835,15 @@ pub fn mmu_unmap_page(_virt_addr: usize) {
 //
 // Symmetric Multiprocessing Support
 //
-fn start_smp(acpi: &AcpiInfo) {
+fn start_smp(acpi: &AcpiInfo, max_cpus: usize) -> PerCpuContext {
     // Print what we found on ACPI tables if compiled with debug_arch
     // CPUs/LAPICS
     dbg!("LAPIC MMIO @ {:X}\n", acpi.lapic_mmio);
-    for _i in 0..acpi.lapic_cnt as usize {
+    for _lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
         dbg!("CPU[{}]: LAPIC ID: {}, Enabled: {}\n",
-            acpi.lapic[_i].cpu_id,
-            acpi.lapic[_i].lapic_id,
-            acpi.lapic[_i].enabled
+            _lapic.cpu_id,
+            _lapic.lapic_id,
+            _lapic.enabled
         );
     }
     // IOAPIC
@@ -582,13 +853,11 @@ fn start_smp(acpi: &AcpiInfo) {
         acpi.ioapic.gsi_base
     );
     // IRQ->GSI mappings
-    for _i in 0..acpi.irq_map_cnt as usize {
+    for _irq in &acpi.irq_map[..acpi.irq_map_cnt as usize] {
         dbg!("<IRQ#{}.{} -> GSI#{} ON {}{}> ",
-            acpi.irq_map[_i].src_bus,
-            acpi.irq_map[_i].src_irq,
-            acpi.irq_map[_i].dst_gsi,
-            if acpi.irq_map[_i].active_low {"Low"} else {"High"},
-            if acpi.irq_map[_i].lvl_trig {"Level"} else {"Edge"}
+            _irq.src_bus, _irq.src_irq, _irq.dst_gsi,
+            if _irq.active_low {"Low"} else {"High"},
+            if _irq.lvl_trig {"Level"} else {"Edge"}
         );
     }
     // NMI->LINT mappings
@@ -601,9 +870,94 @@ fn start_smp(acpi: &AcpiInfo) {
         );
     }
     dbg!("\n");
-    // Initialize IOAPIC: TODO MOVE TO GENERAL CODE SOMEHOW
-    X86IoApic::init(&acpi.ioapic);
+    
+    let mut cpu_context: PerCpuContext = PerCpuContext::default();
+    
+    //// Initialize the LocaAPIC controller for BSP (CPU 0)
+    let mut lapic0 : X86LocalApic = X86LocalApic::default();
+    for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
+        if lapic.cpu_id == 0 {
+            lapic0.init(lapic, acpi.lapic_mmio);
+            break;
+        }
+    }
 
+    // Start the Application Processors 
+    //// 1) Copy the 16-bit trampoline code
+    unsafe extern "C" {
+        static _AP_STARTUP16_ENTRY: usize;
+        static _AP_STARTUP16_END:   usize;
+        static _KINIT_STACK_START:  usize;
+    }
+    unsafe {
+        let mut dest : *mut usize = 0x8000 as *mut usize;
+        let src_start: usize = &_AP_STARTUP16_ENTRY as *const usize as usize;
+        let src_end  : usize = &_AP_STARTUP16_END as *const usize as usize;
+        let nqwords = (src_end - src_start) / size_of::<usize>();
+        let mut src  : *mut usize = src_start as *mut usize;
+        for _i in 0..nqwords {
+            *dest = *src;
+            dest  = dest.wrapping_add(1);
+            src   = src.wrapping_add(1); 
+        }
+    }
+    //// 2) Send INIT-SIPI_SIPI for each AP and check the magic# on their stack
+    ////    That would indicate the completion of their trampoline code.
+    dbg!("MAX CPUs: {}\n", max_cpus);
+    for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
+        if lapic.lapic_id > 0 && lapic.lapic_id < max_cpus as u8 {
+            let current_cpu_cnt;
+            unsafe {
+                current_cpu_cnt = (*(this_machine())).cpu_count;
+            }
+            dbg!("Senging INIT-SIPI to CPU[{}]\n", lapic.cpu_id);
+            lapic0.send_init_ipi(lapic.cpu_id);
+            cpu_busywait(10_000_000); // Wait for the cpu to initialize (~10ms)
+            lapic0.send_startup_ipi(lapic.cpu_id, 0x8); 
+            cpu_busywait(10_000_000); // Wait for the AP to initialize
+            unsafe {
+                if (*(this_machine())).cpu_count == current_cpu_cnt {
+                    // Send another SIPI
+                    dbg!("Sending another SIPI to CPU[{}]\n", lapic.cpu_id);
+                    lapic0.send_startup_ipi(lapic.cpu_id, 0x8);
+                }
+            }
+           
+            loop {
+                unsafe {
+                    cpu_busywait(1_000_000);
+                    let new_cpu_count = (*(this_machine())).cpu_count;
+                    if new_cpu_count > current_cpu_cnt {break;}
+                }
+            }
+        }
+    }
+    // Initialize IOAPIC: 
+    //// Disable PIC
+    x86_pic::mask_all();
+    //// Set up IOAPIC[0] and IRQ->GSI redirection table
+    //// Fill in all available GSIs according to ACPI info, and then:
+    //// - map them to their corresponding IDT vector
+    //// - mask them. The generic code should enable each IRQ when the 
+    ////   corresponding driver is initialized!
+    //// - route them to CPU0 by default.
+    let mut ioapic0 : X86IoApic = X86IoApic::default();
+    let isr_vector_offset = 32; // See how IDT is set up in boot.S
+    ioapic0.init(&acpi.ioapic);
+    for irq in &acpi.irq_map[0..acpi.irq_map_cnt as usize] {
+        ioapic0.register_isr(
+            irq.dst_gsi, irq.src_irq + isr_vector_offset,
+            X86IoApic::PRIORITY_FIXED,
+            if irq.active_low {X86IoApic::POLARITY_LOW} else {X86IoApic::POLARITY_HIGH},
+            if irq.lvl_trig {X86IoApic::TRIGGER_LEVEL} else {X86IoApic::TRIGGER_EDGE},
+            false, 0
+        );
+    }
+    //// TODO Route NMIs
+
+    cpu_context.lapic   = lapic0;
+    cpu_context.ioapic  = ioapic0;
+    cpu_context
 }
 
 //
@@ -800,101 +1154,6 @@ fn x86_acpi_parse_hpet(acpi: &mut AcpiInfo, addr: u32) {
     acpi.hpet_base = addr;
     // Todo - Extract HPET's info to use as the kernel's ticker instead of PIT
 }
-
-// Doesn't seem to be supported any more - at least on QEMU it only shows 1 cpu
-// fn x86_parse_mp_config() {
-//     // 1) Finding the MP Floating Pointer Structure left for us by BIOS
-//     //    Look for the signature  "_MP_" or 0x5F504D5F in the first MB of
-//     //    the memory. TODO add support for ACPI and find it via ACPI!
-//     // MPFP FORMAT:
-//     // signature:  u32,
-//     // config_tlb: u32,
-//     // length:     u8, // multiplied by 16 bytes
-//     // mp_rev:     u8, // MP Spec Revision
-//     // checksum:   u8, // added to sum of all other bytes of this struct -> 0
-//     // def_config: u8, // must be zero otherwise find the default cfg
-//     // features:   u32 // Bit 7 set: IMCR + and PIC mode, virt. wire mode otherwise
-//     //
-//     // For now I assume that features=0 and there is no default config.
-//     let mut ptr: *mut u32 = 0x400 as *mut u32;
-//     let mut valid_mpfp = false;
-
-//     for _i in 0..0x40000 {
-//         unsafe {
-//             if *ptr == 0x5F504D5F {
-//                 // check the sum
-//                 let mut sump: *mut u8 = ptr as *mut u8;
-//                 let mut sum: u8 = 0;
-                
-//                 for _j in 0..16 {
-//                     sum += *sump;
-//                     sump = sump.wrapping_add(1);
-//                 }
-//                 if sum == 0 {
-//                     // Valid MPFP!
-//                     valid_mpfp = true;
-//                     break;
-//                 }
-//             }
-//             ptr = ptr.wrapping_add(1);
-//         }
-//     }
-//     // 2) Read the MP Config Table MPFP points to
-//     // MPCT FORMAT:
-//     // signature: u32 // "PCMP" = 0x504D4350
-//     // len: u16
-//     // mp_rev: u8
-//     // checksum: u8
-//     // oem_id: u64;
-//     // prod_id: [u8; 12];
-//     // oem_table: u32
-//     // oem_table_size: u16
-//     // entry_count: u16; // #of CPU/IOAPIC entries after this struct (offset 34)
-//     // lapic_address: u32// MMIO base of the local APICs (offset 36): FEE00000
-//     // extended_table_length: u16
-//     // extended_table_checksum: u8;
-//     // rsvd: u8;
-//     if !valid_mpfp {
-//         archlog!("No SMP support.\n");
-//         return;
-//     }
-//     unsafe {
-//         archlog!("MPFP @{:p}, ConfTlb:{:x}, lrcd:{:X}, feat:{:X}\n",
-//             ptr, *(ptr.wrapping_add(1)), 
-//             *(ptr.wrapping_add(2)), *(ptr.wrapping_add(3))
-//         );
-//         // Make ptr point to MPConfig
-//         let ptr: *mut u32 = *(ptr.wrapping_add(1)) as *mut u32;
-//         if (*ptr) !=  0x504D4350 {
-//             archlog!("No valid MP Configuration was found\n");
-//             return;
-//         }
-//         let entry_cnt: u16 = *((ptr as *mut u8).wrapping_add(34) as *mut u16);
-//         let lapic_adr: u32 = *((ptr as *mut u8).wrapping_add(36) as *mut u32);
-//         archlog!("#entries: {}, LAPIC_BASE: {:X}\n", entry_cnt, lapic_adr);
-//         // 3) Iterate over entries and find CPUs and IOAPICs
-//         let mut entry: *mut u32 = ptr.wrapping_add(11);
-//         for _ in 0..entry_cnt {
-//             let ent_type : u8 = ((*entry) & 0xFF) as u8;
-//             let id  = ((*entry) & 0xFF00) >> 8 as u8;
-//             let ver = ((*entry) & 0xFF0000) >> 16 as u8;
-//             let flg = ((*entry) & 0xFF000000) >> 24 as u8;
-//             if ent_type == 0 {
-//                 archlog!("CPU[{}]: LAPIC Version: {}, Flags: {:X}\n",
-//                         id, ver, flg);
-//                 entry = entry.wrapping_add(5); // CPU entries are 20 bytes
-//             } else if ent_type == 2 {
-//                 let ioapic_adr : u32 = *(entry.wrapping_add(1));
-//                 archlog!("IOAPIC[{}]: Version: {}, Flags: {:X}, Addr: {:X}\n",
-//                         id, ver, flg, ioapic_adr);
-//                 entry = entry.wrapping_add(2); // IOAPIC entries are 8 bytes
-//             } else {
-//                 //archlog!("-- ENT TYPE: {} -- ", ent_type);
-//                 entry = entry.wrapping_add(2); // Other entries are 8 bytes
-//             }
-//         }
-//     }
-// }
 
 //
 // Task Management
