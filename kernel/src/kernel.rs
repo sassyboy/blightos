@@ -91,7 +91,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[pmm::PMMapElement]>) {
         while BSP_INITIALIZED.load(Ordering::Relaxed) == false {
             core::hint::spin_loop();
         }
-        let cpuid = percpu_read(&THIS_CPU_ID);
+        let cpuid = *THIS_CPU_ID.borrow();
         loop {
             klog!("<CPU{}>", cpuid);
             cpu_busywait(1_000_000_000 * cpuid as u64);
@@ -166,10 +166,7 @@ fn task2_exec() {
 }
 
 fn task3_exec() {
-    if let Ok(_lock) = sched::Preemption::lock() {
-        // Preemption-free section
-        klog!("<THIS IS A LONG MESSAGE TO TEST THE PREEMPTION LOCK>");
-    } 
+    klog!("<THIS IS A LONG MESSAGE TO TEST THE CONSOLE PRINT_STR LOCK>");
 }
 
 fn idle_task() {

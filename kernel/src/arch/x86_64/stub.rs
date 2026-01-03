@@ -144,7 +144,7 @@ extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
     // Initialize the per-cpu sections
     percpu_init_sections();
     percpu_init_cpu(0);
-    percpu_write(&THIS_CPU_ID, 0x12090000);
+    THIS_CPU_ID.write(0);
     // SMP, LAPIC, IOAPIC, HiRes Event Timer, etc. are found in ACPI tables
     match x86_acpi_parse() {
         Some(acpi) => {
@@ -170,9 +170,8 @@ extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
 extern "C" fn rust_x864_entry_ap(_arg: usize) {
     let cpuid = cpu_id();
     percpu_init_cpu(cpuid);
-    percpu_write(&THIS_CPU_ID, cpuid);
-    let mylapic = percpu_borrow_mutable(&THIS_LAPIC);
-    dbg!("mylapic @ {:p}\n", mylapic);
+    THIS_CPU_ID.write(cpuid);
+    let mylapic = THIS_LAPIC.borrow_mut();
     {
         let mut this_machine = THIS_MACHINE.lock();
         let acpi = &((*this_machine).acpi_info);
@@ -184,7 +183,8 @@ extern "C" fn rust_x864_entry_ap(_arg: usize) {
         }
         (*this_machine).cpu_count += 1;
     }
-    dbg!("<HELLO FROM CPU {}>\n", percpu_read(&THIS_CPU_ID));
+    
+    dbg!("CPU[{}] calling kstart\n", THIS_CPU_ID.borrow());
     // Initialize the LAPIC for the current CPU
 
     // Start the kernel for this AP
@@ -283,8 +283,7 @@ extern "C" fn kirq_handler(irq: u8) {
     // For simplicity: EOI immediately not to lose IRQs in case the top-half
     // handler ends up doing a context switch or takes too long.
 
-    let lapic = percpu_borrow_mutable(&THIS_LAPIC);
-    lapic.send_eoi();
+    THIS_LAPIC.borrow_mut().send_eoi();
 
     unsafe {X86_ISR_HANDLER[irq as usize](irq as u16);}
 }
@@ -350,6 +349,14 @@ X86ExceptionInfo {
 // Internal interface                                                         //
 //----------------------------------------------------------------------------//
 
+
+//
+// PerCpu Storage Support - util::PerCpuGlobal<T> requires the following
+// architecture-dependent functions to be defined here:
+// percpu_borrow and percpu_borrow_mut
+// The rest of the kernel code should not use these interfaces as they are not
+// thread- or type-safe
+//
 const IA32_GS_BASE: u32 = 0xC0000101;
 fn percpu_init_sections() {
     // Copy the first percpu section into the subsequent N-1 sections
@@ -398,25 +405,6 @@ fn percpu_init_cpu(cpuid: usize) {
         );
     }
 }
-
-pub fn percpu_write<T: Copy>(var: &T, value: T) {
-    unsafe {
-        let mut addr : usize;
-        asm!("mov rax, gs:{base}", base = sym THIS_PERCPU_BASE, out("rax")addr);
-        addr = addr + var as *const T as usize;
-        *(addr as *mut T) = value;
-    }
-}
-
-pub fn percpu_read<T: Copy>(var: &T) -> T {
-    unsafe {
-        let mut addr : usize;
-        asm!("mov rax, gs:{base}", base = sym THIS_PERCPU_BASE, out("rax")addr);
-        addr = addr + var as *const T as usize;
-        *(addr as *mut T)
-    }
-}
-
 pub fn percpu_borrow<T>(var: &T) -> &T {
     unsafe {
         let mut addr : usize;
@@ -425,8 +413,7 @@ pub fn percpu_borrow<T>(var: &T) -> &T {
         &(*(addr as *mut T))
     }
 }
-
-pub fn percpu_borrow_mutable<T>(var: &T) -> &mut T {
+pub fn percpu_borrow_mut<T>(var: &T) -> &mut T {
     unsafe {
         let mut addr : usize;
         asm!("mov rax, gs:{base}", base = sym THIS_PERCPU_BASE, out("rax")addr);
@@ -962,7 +949,7 @@ pub fn mmu_unmap_page(_virt_addr: usize) {
 //
 fn start_smp(max_cpus: usize) {
     let lapic_count;
-    let lapic0 = percpu_borrow_mutable(&THIS_LAPIC);
+    let lapic0 =  THIS_LAPIC.borrow_mut();
     {
         let this_machine = THIS_MACHINE.lock();
         lapic_count = (*this_machine).acpi_info.lapic_cnt;
@@ -1060,7 +1047,7 @@ fn start_smp(max_cpus: usize) {
     //// - mask them. The generic code should enable each IRQ when the 
     ////   corresponding driver is initialized!
     //// - route them to CPU0 by default.
-    let ioapic0 = percpu_borrow_mutable(&THIS_IOAPIC);
+    let ioapic0 = THIS_IOAPIC.borrow_mut();
     let isr_vector_offset = 32; // See how IDT is set up in boot.S
     {
         let this_machine = THIS_MACHINE.lock();

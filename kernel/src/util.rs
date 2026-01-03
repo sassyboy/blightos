@@ -1,11 +1,11 @@
-//
-// BlightOS Kernel
-//
-// Utility Module
-//   Use this in the absence of the std library.
-// 
+///
+/// BlightOS Kernel
+///
+/// Utility Module
+///   Use this in the absence of the std library.
+///
 
-use crate::arch::kearly_console;
+use crate::{arch::{kearly_console, percpu_borrow, percpu_borrow_mut}, sched};
 pub use core::fmt::Write;
 
 pub struct ConsoleOut;
@@ -38,21 +38,110 @@ pub unsafe fn raw_memcpy(dst: usize, src: usize, n: usize) {
     }
 }
 
-
-//
-// Per-CPU
-//
+///
+/// Provides a convenient way of a defining `percpu` global variables, i.e.,
+/// variables of which there is one copy per CPU. Reading/Writing from/to a
+/// `percpu` variable accesses the instance of the variable belonging to the
+/// CPU currently performing the operation.
+/// 
+/// Example:
+/// ```
+/// percpu_global!{
+///     pub MY_PERCPU_COUNTER : usize = 0;
+///     MY_CUSTOM_VAR: some_struct = some_struct::new();
+/// }
+/// 
+/// ... 
+/// 
+/// // Copying a value into a percpu var:
+/// MY_PERCPU_COUNTER.write(x); 
+/// 
+/// // Accessing the percpu var via an immutable reference
+/// klog!("My counter is {}", MY_PERCPU_COUNTER.borrow());
+/// 
+/// // Accessing the percpu var via a mutable reference
+/// let my_custom_var = MY_CUSTOM_VAR.borrow_mut(); // Get a mutable reference
+/// my_custom_var.field_x = x;
+/// my_custom_var.func_x(arg1, etc);
+/// ```
+///
 macro_rules! percpu_global {
     ($($svis:vis $name:ident: $type:ty = $value:expr;)*) => {
         $(
             #[used]
             #[no_mangle]
             #[link_section = ".percpu_global"]
-            $svis static $name: $type = $value;
+            $svis static $name: PerCpuGlobal<$type> = PerCpuGlobal::new($value);
         )*
     };
 }
 pub(crate) use percpu_global;
+
+///
+/// Provides a type-safe/thread-safe encapsulation of `percpu` variables defined 
+/// using the `percpu_global!` macro.
+/// 
+/// Example:
+/// ```
+/// percpu_global!{
+///     pub MY_PERCPU_COUNTER : usize = 0;
+///     MY_CUSTOM_VAR: some_struct = some_struct::new();
+/// }
+/// 
+/// ... 
+/// 
+/// // Copying a value into a percpu var:
+/// MY_PERCPU_COUNTER.write(x); 
+/// 
+/// // Accessing the percpu var via an immutable reference
+/// klog!("My counter is {}", MY_PERCPU_COUNTER.borrow());
+/// 
+/// // Accessing the percpu var via a mutable reference
+/// let my_custom_var = MY_CUSTOM_VAR.borrow_mut(); // Get a mutable reference
+/// my_custom_var.field_x = x;
+/// my_custom_var.func_x(arg1, etc);
+/// ```
+///
+pub struct PerCpuGlobal<T>{
+    var: T
+}
+impl<T> PerCpuGlobal<T> {
+    pub const fn new(val: T) -> Self {
+        Self {
+            var: val
+        }
+    }
+
+    ///
+    /// Copies the value of `val` into the percpu variable while holding the
+    /// preemption lock to avoid data inconsistency due to the CPU switching
+    /// to another task that accesses the same percpu variable.
+    /// 
+    pub fn write(&self, val: T) {
+        // Scheduling a new task in the middle of accessing a percpu variable
+        // can lead to state inconsistencies and undefined behavior
+        let _lock = sched::Preemption::lock();
+        *(percpu_borrow_mut(&(self.var))) = val;
+    }
+
+    ///
+    /// Returns a <b>immutable</b> reference to the percpu variable.
+    /// The <b>caller must hold the preemption lock</b> to ensure data
+    /// consistency.
+    /// 
+    pub fn borrow(&self) -> &T {
+        percpu_borrow(&(self.var))
+    }
+
+    ///
+    /// Returns a <b>mutable</b> reference to the percpu variable.
+    /// The <b>caller must hold the preemption lock</b> to ensure data
+    /// consistency.
+    /// 
+    pub fn borrow_mut(&self) -> &mut T {
+        percpu_borrow_mut(&(self.var))
+    }
+}
 
 
 //
@@ -60,9 +149,7 @@ pub(crate) use percpu_global;
 //
 
 use core::{
-    cell::UnsafeCell,
-    ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, Ordering},
+ cell::UnsafeCell, ops::{Deref, DerefMut}, sync::atomic::{AtomicBool, Ordering}
 };
 
 pub struct Spinlock<T> {
