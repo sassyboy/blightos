@@ -30,8 +30,16 @@ SECTIONS {
   .bss : { *(.bss COMMON) }
   _KERNEL_BSS_END = .;
 
-  . = ALIGN(0x1000);
-  .eh_frame (NOLOAD) : { *(.eh_frame) } : NONE
+  . = ALIGN(8);
+  _KERNEL_PERCPU_START = .;
+  _KERNEL_PERCPU_END   = _KERNEL_PERCPU_START + SIZEOF(.percpu);
+  .percpu 0x0 : AT(_KERNEL_PERCPU_START) {
+    *(.percpu_global)
+    . = ALIGN(8);
+    _KERNEL_PERCPU_SIZE = .;
+    . = _KERNEL_PERCPU_SIZE * MAX_CPU_COUNT;
+  }
+  . = _KERNEL_PERCPU_END;
 
   _KERNEL_END = . ;
 }

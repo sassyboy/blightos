@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use util::*;
 
-use crate::arch::{cpu_busywait, cpu_count};
+use crate::arch::*;
 // Physical Memory Manager
 #[path = "mem/pmm.rs"]
 pub mod pmm;
@@ -89,8 +89,9 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[pmm::PMMapElement]>) {
     } else {
         // AP initialization
         while BSP_INITIALIZED.load(Ordering::Relaxed) == false {
-            // Wait until the BSP is done initializing
+            core::hint::spin_loop();
         }
+        let cpuid = percpu_read(&THIS_CPU_ID);
         loop {
             klog!("<CPU{}>", cpuid);
             cpu_busywait(1_000_000_000 * cpuid as u64);
@@ -135,27 +136,32 @@ pub fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+static SHARED_VAR : Spinlock<i32> = Spinlock::new(0);
 
 // TESTING...
 fn task1_exec() {
     for _ in 0..20 {
-        if let Ok(_lock) = sched::Preemption::lock() {
-            // Preemption-free section
-            klog!("<T1>");
-            
+        {
+            let mut shared_var = SHARED_VAR.lock();
+            *shared_var += 1;
+            arch::cpu_busywait(1_000_000);
+            klog!("<T1:{}>", *shared_var);
         }
-        arch::cpu_busywait(10_000_000);
+        arch::cpu_busywait(1_000_000);
+        
     }
 }
 
 fn task2_exec() {
     sched::new_task(3, task3_exec);
     for _ in 0..40 {
-        if let Ok(_lock) = sched::Preemption::lock() {
-            // Preemption-free section
-            klog!("<T2>");
+        {
+            let mut shared_var = SHARED_VAR.lock();
+            *shared_var += 1;
+            arch::cpu_busywait(500_000);
+            klog!("<T2:{}>", *shared_var);
         }
-        arch::cpu_busywait(10_000_000);
+        arch::cpu_busywait(500_000);
     }
 }
 

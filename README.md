@@ -4,7 +4,7 @@ A lifelong C developer trying out Rust!
 Install rust and the nightly `x86_64-unknown-none` toolchain, `gcc`,
 `qemu-system-x86_64`, and `grub-mkrescue` on your Linux dev machine, and run:
 - `make` or
-- `make FEATURES=debug_arch` to add debug output in the arch-dependent code.
+- `make DEBUG=yes` to add debug output in the arch-dependent code.
 
 
 ---

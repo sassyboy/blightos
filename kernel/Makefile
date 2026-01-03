@@ -9,7 +9,11 @@ PLATDIR=x86_64
 RC=cargo build
 
 
-#To generate Debug Info: Make FEATURE="debug_arch"
+ifdef DEBUG
+	FEATURES+="debug_arch"
+endif
+
+#To generate Debug info: make FEATURES="debug_arch"
 ifdef FEATURES
 	RCFEATS=--features $(FEATURES)
 else
@@ -33,7 +37,7 @@ KERN_ELF=$(BUILDDIR)kernel.elf
 all: $(KERN_ELF)
 
 $(KERN_ELF): $(OBJFILES) $(KERN_RST)
-	$(LD) -T src/arch/$(PLATDIR)/link.ld -o $@ $^
+	$(LD) -T src/arch/$(PLATDIR)/link.ld $(LFLAGS) -o $@ $^
 
 $(KERN_RST): src/kernel.rs
 	$(RC) --release --target="x86_64-unknown-none" $(RCFEATS)

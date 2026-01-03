@@ -6,6 +6,7 @@ use core::mem::size_of;
 use core::arch::asm;
 use crate::pmm::PMMapElement;
 use crate::sched;
+use crate::util::*;
 use crate::{dump_memory, kstart};
 
 //
@@ -36,7 +37,7 @@ macro_rules! dbg {
 }
 
 //---------------------------------------------------------------------------//
-// Private Data Types                                                        //
+// Private Data Types and Globals                                            //
 //---------------------------------------------------------------------------//
 // Multiboot 1 Information
 #[repr(C)]
@@ -79,20 +80,29 @@ struct MemoryEntry {
     mtype: u32,
 }
 
-// This struct keeps track of the architecture-dependent data (e.g., ACPI)
-// pertaining the current CPU, and it's be used by the rest of this module.
-// 
-//
-#[derive(Default)]
-struct PerCpuContext {
-    lapic:  X86LocalApic,
-    ioapic: X86IoApic
+pub struct MachineContext {
+    cpu_count:  usize,
+    acpi_info:  AcpiInfo,
+    ioapic:     X86IoApic
 }
 
-#[derive(Default)]
-pub struct MachineContext {
-    pub cpu_count:  usize,
-    acpi_info:  AcpiInfo
+impl MachineContext {
+    pub const fn new() -> Self {
+        Self {
+            cpu_count:  1, // There's at least one cpu (BSP), lol!
+            acpi_info:  AcpiInfo::new(),
+            ioapic:     X86IoApic::new()
+        }
+    }
+}
+
+static THIS_MACHINE: Spinlock<MachineContext> = 
+    Spinlock::new(MachineContext::new());
+
+percpu_global! {
+    THIS_PERCPU_BASE: usize = 0; // To avoid rdmsr(IA32_GS_BASE) every time
+    THIS_LAPIC:  X86LocalApic = X86LocalApic::new();
+    THIS_IOAPIC: X86IoApic    = X86IoApic::new();
 }
 
 //----------------------------------------------------------------------------//
@@ -130,22 +140,27 @@ extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
 
     
     kearly_console::init();
+
+    // Initialize the per-cpu sections
+    percpu_init_sections();
+    percpu_init_cpu(0);
+    percpu_write(&THIS_CPU_ID, 0x12090000);
     // SMP, LAPIC, IOAPIC, HiRes Event Timer, etc. are found in ACPI tables
-    let cpu_context : PerCpuContext;
-    let mut smp_context : MachineContext = MachineContext::default();
-    smp_context.cpu_count = 1;
     match x86_acpi_parse() {
         Some(acpi) => {
-            smp_context.acpi_info = acpi;
-            set_machine_context(&smp_context);
-            cpu_context = start_smp(&smp_context.acpi_info, max_cpus);
-            set_percpu_context(&cpu_context);
+            {
+                // No concurrency here, but Rust!
+                let mut this_machine = THIS_MACHINE.lock();
+                (*this_machine).acpi_info = acpi;
+            }
+            // Start the application processors
+            start_smp(max_cpus);
         },
         None => {
             dbg!("No ACPI information found. Multiprocessing disabled.\n");
         }
     };
-
+    
     // Start the kernel.
     kstart(0, Some(&mem_map[0..e820_mmap_count]) );
     panic!(); // kstart shouldn't really return but if does, we should panic
@@ -154,16 +169,22 @@ extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
 #[unsafe(no_mangle)]
 extern "C" fn rust_x864_entry_ap(_arg: usize) {
     let cpuid = cpu_id();
-    // let sig = cpuid | (0x5a55a400 as usize) << 32;
-    // if arg != sig {
-    //     panic!("Corrupted CPU[{}] state: {:X}, expected: {:X}",
-    //         cpuid, arg, sig);
-    // }
-    // Let the BSP continue to the next APs
-    unsafe {
-        (*(this_machine())).cpu_count += 1;
+    percpu_init_cpu(cpuid);
+    percpu_write(&THIS_CPU_ID, cpuid);
+    let mylapic = percpu_borrow_mutable(&THIS_LAPIC);
+    dbg!("mylapic @ {:p}\n", mylapic);
+    {
+        let mut this_machine = THIS_MACHINE.lock();
+        let acpi = &((*this_machine).acpi_info);
+        for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
+            if lapic.cpu_id == cpuid as u8 {
+                mylapic.init(lapic, acpi.lapic_mmio);
+                break;
+            }
+        }
+        (*this_machine).cpu_count += 1;
     }
-    dbg!("<HELLO FROM CPU {}>\n", cpuid);
+    dbg!("<HELLO FROM CPU {}>\n", percpu_read(&THIS_CPU_ID));
     // Initialize the LAPIC for the current CPU
 
     // Start the kernel for this AP
@@ -261,9 +282,10 @@ extern "C" fn kexcep_simd_fp() {
 extern "C" fn kirq_handler(irq: u8) {
     // For simplicity: EOI immediately not to lose IRQs in case the top-half
     // handler ends up doing a context switch or takes too long.
-    unsafe {
-        (*(this_cpu())).lapic.send_eoi();
-    }
+
+    let lapic = percpu_borrow_mutable(&THIS_LAPIC);
+    lapic.send_eoi();
+
     unsafe {X86_ISR_HANDLER[irq as usize](irq as u16);}
 }
 
@@ -327,30 +349,89 @@ X86ExceptionInfo {
 //----------------------------------------------------------------------------//
 // Internal interface                                                         //
 //----------------------------------------------------------------------------//
-static mut THIS_CPU:    usize = 0; 
-static mut THIS_MACHINE:usize = 0;
 
-fn set_percpu_context(ctx: &PerCpuContext) {
+const IA32_GS_BASE: u32 = 0xC0000101;
+fn percpu_init_sections() {
+    // Copy the first percpu section into the subsequent N-1 sections
+    // (see link.ld)
+    unsafe extern "C" {
+        static _KERNEL_PERCPU_START:usize; 
+        static _KERNEL_PERCPU_SIZE: usize;
+        static _KERNEL_PERCPU_END:  usize;
+    }
     unsafe {
-        THIS_CPU = ctx as *const PerCpuContext as usize;
+        let sect_size: usize = &_KERNEL_PERCPU_SIZE as *const usize as usize;
+        let pcpu_s:usize = &_KERNEL_PERCPU_START as *const usize as usize;
+        let pcpu_e:usize = &_KERNEL_PERCPU_END as *const usize as usize;
+        if sect_size < 1 {
+            dbg!("NO PERCPU VARIABLE!\n");
+            return;
+        }
+        let nsects  = (pcpu_e - pcpu_s) / sect_size;
+        dbg!("PERCPU: VMA {:X} bytes starting @ 0, LMA[{:X} - {:X}], #Copies: {}\n",
+            sect_size, pcpu_s, pcpu_e, nsects);
+        for s in 1..nsects {
+            raw_memcpy(pcpu_s + s * sect_size, pcpu_s, sect_size);
+        }
+        
     }
 }
 
-fn this_cpu() -> *mut PerCpuContext {
+fn percpu_init_cpu(cpuid: usize) {
+    // 1) Store the base address of the corresponding PerCPU section in %gs
+    // 2) Set the THIS_PERCPU_BASE variable to the absolute address of the
+    //    percpu segement for future use. Reading from %gs:off is faster than
+    //    reading the MSR itself.
+    unsafe extern "C" {
+        static _KERNEL_PERCPU_START:usize; 
+        static _KERNEL_PERCPU_SIZE: usize;
+    }
     unsafe {
-        THIS_CPU as *mut PerCpuContext
+        let pcpu_s:    usize = &_KERNEL_PERCPU_START as *const usize as usize;
+        let sect_size: usize = &_KERNEL_PERCPU_SIZE as *const usize as usize;
+        let base_addr = pcpu_s + cpuid * sect_size;
+        x86_msr_write(IA32_GS_BASE, base_addr as u64);
+        asm!(
+            "mov gs:{base}, rax",
+            base = sym THIS_PERCPU_BASE,
+            in("rax")base_addr
+        );
     }
 }
 
-fn set_machine_context(ctx: &MachineContext) {
+pub fn percpu_write<T: Copy>(var: &T, value: T) {
     unsafe {
-        THIS_MACHINE = ctx as *const MachineContext as usize;
+        let mut addr : usize;
+        asm!("mov rax, gs:{base}", base = sym THIS_PERCPU_BASE, out("rax")addr);
+        addr = addr + var as *const T as usize;
+        *(addr as *mut T) = value;
     }
 }
 
-fn this_machine() -> *mut MachineContext {
+pub fn percpu_read<T: Copy>(var: &T) -> T {
     unsafe {
-        THIS_MACHINE as *mut MachineContext
+        let mut addr : usize;
+        asm!("mov rax, gs:{base}", base = sym THIS_PERCPU_BASE, out("rax")addr);
+        addr = addr + var as *const T as usize;
+        *(addr as *mut T)
+    }
+}
+
+pub fn percpu_borrow<T>(var: &T) -> &T {
+    unsafe {
+        let mut addr : usize;
+        asm!("mov rax, gs:{base}", base = sym THIS_PERCPU_BASE, out("rax")addr);
+        addr = addr + var as *const T as usize;
+        &(*(addr as *mut T))
+    }
+}
+
+pub fn percpu_borrow_mutable<T>(var: &T) -> &mut T {
+    unsafe {
+        let mut addr : usize;
+        asm!("mov rax, gs:{base}", base = sym THIS_PERCPU_BASE, out("rax")addr);
+        addr = addr + var as *const T as usize;
+        &mut *(addr as *mut T)
     }
 }
 
@@ -463,8 +544,6 @@ mod x86_pit {
     }
 }
 
-
-#[derive(Default)]
 struct X86IoApic{
     acpi_id:        u8,
     version:        u8,
@@ -491,6 +570,17 @@ impl X86IoApic {
     // IRQ Pin Trigger Mode
     pub const TRIGGER_EDGE:     u32 = 0x0;
     pub const TRIGGER_LEVEL:    u32 = 0x8000;
+
+    pub const fn new() -> Self {
+        Self {
+            acpi_id:    0,
+            gsi_base:   0,
+            initialized:false,
+            max_irqs:   0,
+            mmio_base:  0,
+            version:    0
+        }
+    }
 
     fn read_reg(&self, reg_index: u8) -> u32 {
         if self.initialized == false { return 0; }
@@ -559,7 +649,6 @@ impl X86IoApic {
     }
 }
 
-#[derive(Default)]
 struct X86LocalApic {
     lapic_id:   u8,
     cpu_acpi_id:u8,
@@ -586,6 +675,15 @@ impl X86LocalApic {
     const REG_TIMER_INIT_CNT:   u16 = 0x380;
     const REG_TIMER_CUR_CNT:    u16 = 0x390;
     const REG_TIMER_DIV:        u16 = 0x3E0;
+
+    pub const fn new() -> Self {
+        Self {
+            cpu_acpi_id: 0,
+            initialized: false,
+            lapic_id:    0,
+            mmio_base:   0
+        }
+    }
 
     fn read_reg(&mut self, reg: u16) -> u32 {
         let regref : *mut u32 = (self.mmio_base + reg as u32) as *mut u32;
@@ -632,8 +730,6 @@ impl X86LocalApic {
         // Setting bit 8 of the spurious interrupt vector enables the lapic
         let siv = self.read_reg(Self::REG_SIV);
         self.write_reg(Self::REG_SIV, siv | 0x100);
-        let _siv = self.read_reg(Self::REG_SIV);
-        dbg!("LAPIC[{}] SIV = {:X}\n", self.lapic_id, _siv);
     }
 
     pub fn send_eoi(&mut self) {
@@ -664,6 +760,10 @@ impl X86LocalApic {
 //----------------------------------------------------------------------------//
 // External interface exposed to kernel's general code                        //
 //----------------------------------------------------------------------------//
+percpu_global!{
+    pub THIS_CPU_ID: usize = 0; // To avoid issuing cpuid every time
+}
+
 
 //
 // Assembly Wrapper functions
@@ -685,7 +785,7 @@ pub fn cpu_halt() {
 }
 
 pub fn cpu_count() -> usize {
-    unsafe {(*(this_machine())).cpu_count}
+    (*(THIS_MACHINE.lock())).cpu_count
 }
 
 // Returns LAPIC CPU ID of the current CPU calling the routine using the
@@ -712,7 +812,9 @@ pub fn cpu_read_timestamp() -> u64 {
 }
 pub fn cpu_busywait(delay_tsc: u64) {
     let target_tsc = cpu_read_timestamp() + delay_tsc;
-    while cpu_read_timestamp() < target_tsc {}
+    while cpu_read_timestamp() < target_tsc {
+        core::hint::spin_loop();
+    }
 }
 pub fn x86_ioport_read(port: u16) -> u8 {
     let data: u8;
@@ -727,15 +829,41 @@ pub fn x86_ioport_write(port: u16, data: u8) {
     }
 }
 
+pub fn x86_msr_write(msr: u32, val: u64) {
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("rcx") msr,
+            in("rdx") val >> 32,
+            in("rax") val & 0xFFFFFFFF,
+        );
+    }
+}
+
+pub fn x86_msr_read(msr: u32) -> u64 {
+    let (high, low) : (u32, u32);
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("rcx") msr,
+            out("rdx") high,
+            out("rax") low,
+        );
+    }
+    (high as u64) << 32 | low as u64
+}
+
 //
 // Initial/Boot-time Console
 // VGA/80x24TXT mode
+// Provides a print_str to klog! or similar debug/log printing routines.
+// print_str is implemented in a synchronizing manner
 //
 pub mod kearly_console {
-    use core::sync::atomic::*;
+    use crate::util::Spinlock;
 
     const VGA_BASE: u32 = 0xb8000;
-    static VGA_CUR : AtomicUsize = AtomicUsize::new(0);
+    static VGA_CUR : Spinlock<usize> = Spinlock::new(0);
 
     pub fn init() {
         let fill : u16 = 0x1f00 | b' ' as u16;
@@ -749,28 +877,25 @@ pub mod kearly_console {
     pub fn print_str(msg: &[u8]) {
         let color_byte: u16 = 0x1f00;
         let mut ptr: *mut u16 = VGA_BASE as *mut u16;
-        let mut cursor = VGA_CUR.load(Ordering::Relaxed);
-        ptr = ptr.wrapping_add(cursor);
+        let mut cursor = VGA_CUR.lock();
+        ptr = ptr.wrapping_add(*cursor);
         for &c in msg {
             if c == b'\n' {
-                if (cursor / 80) < 24 {
+                if (*cursor / 80) < 24 {
                     // Move the cursor to the next line
-                    cursor =(cursor / 80 + 1) *  80;
+                    *cursor =(*cursor / 80 + 1) *  80;
                 } else {
-                    cursor = 0; // wrap around
+                    *cursor = 0; // wrap around
                 }
-                ptr = (VGA_BASE as *mut u16).wrapping_add(cursor);
+                ptr = (VGA_BASE as *mut u16).wrapping_add(*cursor);
             } else {
                 unsafe {*ptr = c as u16 | color_byte;}
                 ptr = ptr.wrapping_add(1);
-                cursor = (cursor + 1) % (80 * 25);
+                *cursor = (*cursor + 1) % (80 * 25);
             }
         }
-        VGA_CUR.store(cursor, Ordering::Relaxed);
     }
 }
-
-
 
 //
 // System Timer(s)
@@ -835,100 +960,94 @@ pub fn mmu_unmap_page(_virt_addr: usize) {
 //
 // Symmetric Multiprocessing Support
 //
-fn start_smp(acpi: &AcpiInfo, max_cpus: usize) -> PerCpuContext {
-    // Print what we found on ACPI tables if compiled with debug_arch
-    // CPUs/LAPICS
-    dbg!("LAPIC MMIO @ {:X}\n", acpi.lapic_mmio);
-    for _lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
-        dbg!("CPU[{}]: LAPIC ID: {}, Enabled: {}\n",
-            _lapic.cpu_id,
-            _lapic.lapic_id,
-            _lapic.enabled
+fn start_smp(max_cpus: usize) {
+    let lapic_count;
+    let lapic0 = percpu_borrow_mutable(&THIS_LAPIC);
+    {
+        let this_machine = THIS_MACHINE.lock();
+        lapic_count = (*this_machine).acpi_info.lapic_cnt;
+
+        let acpi = &(*this_machine).acpi_info;
+        // Print what we found on ACPI tables if compiled with debug_arch
+        // CPUs/LAPICS
+        dbg!("LAPIC MMIO @ {:X}\n", acpi.lapic_mmio);
+        for _lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
+            dbg!("CPU[{}]: LAPIC ID: {}, Enabled: {}\n",
+                _lapic.cpu_id,
+                _lapic.lapic_id,
+                _lapic.enabled
+            );
+        }
+        // IOAPIC
+        dbg!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
+            acpi.ioapic.ioapic_id,
+            acpi.ioapic.ioapic_mmio,
+            acpi.ioapic.gsi_base
         );
-    }
-    // IOAPIC
-    dbg!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
-        acpi.ioapic.ioapic_id,
-        acpi.ioapic.ioapic_mmio,
-        acpi.ioapic.gsi_base
-    );
-    // IRQ->GSI mappings
-    for _irq in &acpi.irq_map[..acpi.irq_map_cnt as usize] {
-        dbg!("<IRQ#{}.{} -> GSI#{} ON {}{}> ",
-            _irq.src_bus, _irq.src_irq, _irq.dst_gsi,
-            if _irq.active_low {"Low"} else {"High"},
-            if _irq.lvl_trig {"Level"} else {"Edge"}
-        );
-    }
-    // NMI->LINT mappings
-    for _i in 0..acpi.nmi_map_cnt as usize {
-        dbg!("<NMI.CPUS[{:X}] -> LINT#{} ON {}{}> ",
-            acpi.nmi_map[_i].cpu_id_mask,
-            acpi.nmi_map[_i].lint_vector,
-            if acpi.nmi_map[_i].active_low {"Low"} else {"High"},
-            if acpi.nmi_map[_i].lvl_trig {"Level"} else {"Edge"}
-        );
-    }
-    dbg!("\n");
-    
-    let mut cpu_context: PerCpuContext = PerCpuContext::default();
-    
-    //// Initialize the LocaAPIC controller for BSP (CPU 0)
-    let mut lapic0 : X86LocalApic = X86LocalApic::default();
-    for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
-        if lapic.cpu_id == 0 {
-            lapic0.init(lapic, acpi.lapic_mmio);
-            break;
+        // IRQ->GSI mappings
+        for _irq in &acpi.irq_map[..acpi.irq_map_cnt as usize] {
+            dbg!("<IRQ#{}.{} -> GSI#{} ON {}{}> ",
+                _irq.src_bus, _irq.src_irq, _irq.dst_gsi,
+                if _irq.active_low {"Low"} else {"High"},
+                if _irq.lvl_trig {"Level"} else {"Edge"}
+            );
+        }
+        // NMI->LINT mappings
+        for _i in 0..acpi.nmi_map_cnt as usize {
+            dbg!("<NMI.CPUS[{:X}] -> LINT#{} ON {}{}> ",
+                acpi.nmi_map[_i].cpu_id_mask,
+                acpi.nmi_map[_i].lint_vector,
+                if acpi.nmi_map[_i].active_low {"Low"} else {"High"},
+                if acpi.nmi_map[_i].lvl_trig {"Level"} else {"Edge"}
+            );
+        }
+        dbg!("\n");
+        //// Initialize the LocaAPIC controller for BSP (CPU 0)
+        for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
+            if lapic.cpu_id == 0 {
+                lapic0.init(lapic, acpi.lapic_mmio);
+                break;
+            }
         }
     }
 
     // Start the Application Processors 
-    //// 1) Copy the 16-bit trampoline code
+    //// 1) Copy the trampoline code into 0x8000
     unsafe extern "C" {
         static _AP_STARTUP16_ENTRY: usize;
         static _AP_STARTUP16_END:   usize;
         static _KINIT_STACK_START:  usize;
     }
     unsafe {
-        let mut dest : *mut usize = 0x8000 as *mut usize;
         let src_start: usize = &_AP_STARTUP16_ENTRY as *const usize as usize;
         let src_end  : usize = &_AP_STARTUP16_END as *const usize as usize;
-        let nqwords = (src_end - src_start) / size_of::<usize>();
-        let mut src  : *mut usize = src_start as *mut usize;
-        for _i in 0..nqwords {
-            *dest = *src;
-            dest  = dest.wrapping_add(1);
-            src   = src.wrapping_add(1); 
-        }
+        raw_memcpy(0x8000, src_start, src_end - src_start);
     }
     //// 2) Send INIT-SIPI_SIPI for each AP and check the magic# on their stack
     ////    That would indicate the completion of their trampoline code.
     dbg!("MAX CPUs: {}\n", max_cpus);
-    for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
-        if lapic.lapic_id > 0 && lapic.lapic_id < max_cpus as u8 {
-            let current_cpu_cnt;
-            unsafe {
-                current_cpu_cnt = (*(this_machine())).cpu_count;
-            }
-            dbg!("Senging INIT-SIPI to CPU[{}]\n", lapic.cpu_id);
-            lapic0.send_init_ipi(lapic.cpu_id);
+    for i in 0..lapic_count as usize {
+        let lapic_id;
+        {
+            let this_machine = THIS_MACHINE.lock();
+            lapic_id = (*this_machine).acpi_info.lapic[i].cpu_id;
+        }
+        if lapic_id > 0 && lapic_id < max_cpus as u8 {
+            let current_cpu_cnt = cpu_count();
+            dbg!("Senging INIT-SIPI to CPU[{}]\n", lapic_id);
+            lapic0.send_init_ipi(lapic_id);
             cpu_busywait(10_000_000); // Wait for the cpu to initialize (~10ms)
-            lapic0.send_startup_ipi(lapic.cpu_id, 0x8); 
+            lapic0.send_startup_ipi(lapic_id, 0x8); 
             cpu_busywait(10_000_000); // Wait for the AP to initialize
-            unsafe {
-                if (*(this_machine())).cpu_count == current_cpu_cnt {
-                    // Send another SIPI
-                    dbg!("Sending another SIPI to CPU[{}]\n", lapic.cpu_id);
-                    lapic0.send_startup_ipi(lapic.cpu_id, 0x8);
-                }
+            if cpu_count() == current_cpu_cnt {
+                // Send another SIPI
+                dbg!("Sending another SIPI to CPU[{}]\n", lapic_id);
+                lapic0.send_startup_ipi(lapic_id, 0x8);
             }
            
             loop {
-                unsafe {
-                    cpu_busywait(1_000_000);
-                    let new_cpu_count = (*(this_machine())).cpu_count;
-                    if new_cpu_count > current_cpu_cnt {break;}
-                }
+                cpu_busywait(1_000_000);
+                if cpu_count() > current_cpu_cnt {break;}
             }
         }
     }
@@ -941,23 +1060,26 @@ fn start_smp(acpi: &AcpiInfo, max_cpus: usize) -> PerCpuContext {
     //// - mask them. The generic code should enable each IRQ when the 
     ////   corresponding driver is initialized!
     //// - route them to CPU0 by default.
-    let mut ioapic0 : X86IoApic = X86IoApic::default();
+    let ioapic0 = percpu_borrow_mutable(&THIS_IOAPIC);
     let isr_vector_offset = 32; // See how IDT is set up in boot.S
-    ioapic0.init(&acpi.ioapic);
-    for irq in &acpi.irq_map[0..acpi.irq_map_cnt as usize] {
-        ioapic0.register_isr(
-            irq.dst_gsi, irq.src_irq + isr_vector_offset,
-            X86IoApic::PRIORITY_FIXED,
-            if irq.active_low {X86IoApic::POLARITY_LOW} else {X86IoApic::POLARITY_HIGH},
-            if irq.lvl_trig {X86IoApic::TRIGGER_LEVEL} else {X86IoApic::TRIGGER_EDGE},
-            false, 0
-        );
+    {
+        let this_machine = THIS_MACHINE.lock();
+        let acpi = &(*this_machine).acpi_info;
+        ioapic0.init(&acpi.ioapic);
+        for irq in &acpi.irq_map[0..acpi.irq_map_cnt as usize] {
+            ioapic0.register_isr(
+                irq.dst_gsi, irq.src_irq + isr_vector_offset,
+                X86IoApic::PRIORITY_FIXED,
+                if irq.active_low {X86IoApic::POLARITY_LOW} 
+                             else {X86IoApic::POLARITY_HIGH},
+                if irq.lvl_trig {X86IoApic::TRIGGER_LEVEL}
+                             else {X86IoApic::TRIGGER_EDGE},
+                false, 0
+            );
+        }
     }
     //// TODO Route NMIs
 
-    cpu_context.lapic   = lapic0;
-    cpu_context.ioapic  = ioapic0;
-    cpu_context
 }
 
 //
@@ -966,7 +1088,6 @@ fn start_smp(acpi: &AcpiInfo, max_cpus: usize) -> PerCpuContext {
 pub const MAX_CPU_COUNT: usize = 8;
 pub const MAX_IRQ_COUNT: usize = 16;
 
-#[derive(Default)]
 struct AcpiInfo {
     madt_base:  u32,
     fadt_base:  u32,
@@ -980,22 +1101,56 @@ struct AcpiInfo {
     nmi_map_cnt:u32,
     nmi_map:    [AcpiNmiMapping; MAX_CPU_COUNT], // At most: 1 NMI-mapping/CPU
 }
+impl AcpiInfo {
+    pub const fn new() -> Self {
+        Self {
+            fadt_base:  0,
+            hpet_base:  0,
+            ioapic:     AcpiIOApic::new(),
+            irq_map:    [AcpiIRQMapping::new(); MAX_IRQ_COUNT],
+            irq_map_cnt:0,
+            lapic:      [AcpiLocalApic::new(); MAX_CPU_COUNT],
+            lapic_cnt:  0,
+            lapic_mmio: 0,
+            madt_base:  0,
+            nmi_map:    [AcpiNmiMapping::new(); MAX_CPU_COUNT],
+            nmi_map_cnt: 0
+        }
+    }
+}
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
 struct AcpiLocalApic {
     cpu_id:     u8,
     lapic_id:   u8,
     enabled:    bool
 }
+impl AcpiLocalApic {
+    pub const fn new() -> Self {
+        Self {
+            cpu_id:     0,
+            enabled:    false,
+            lapic_id:   0
+        }
+    }
+}
 
-#[derive(Default)]
 struct AcpiIOApic {
     ioapic_id:  u8,
     ioapic_mmio:u32,
     gsi_base:   u32 // must be 0 in a single IOAPIC config
 }
+impl AcpiIOApic {
+    pub const fn new() -> Self {
+        Self {
+            gsi_base:   0,
+            ioapic_id:  0,
+            ioapic_mmio:0
+        }
+    }
+}
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
 struct AcpiIRQMapping {
     src_bus:    u8,
     src_irq:    u8,
@@ -1003,13 +1158,35 @@ struct AcpiIRQMapping {
     active_low: bool, // Active Low or Active High signal
     lvl_trig:   bool, // Triggered on the Level or on the Edge of the signal
 }
+impl AcpiIRQMapping {
+    pub const fn new() -> Self {
+        Self {
+            active_low: false,
+            dst_gsi:    0,
+            lvl_trig:   false,
+            src_bus:    0,
+            src_irq:    0
+        }
+    }
+}
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
 struct AcpiNmiMapping {
     cpu_id_mask:u8,
     lint_vector:u8, // Entry# of the vector table of CPUs' LAPIC
     active_low: bool,
     lvl_trig:   bool
+}
+
+impl AcpiNmiMapping {
+    pub const fn new() -> Self {
+        Self {
+            active_low: false,
+            cpu_id_mask:0,
+            lint_vector:0,
+            lvl_trig:   false
+        }
+    }
 }
 
 fn x86_acpi_parse() -> Option<AcpiInfo>{
@@ -1029,7 +1206,7 @@ fn x86_acpi_parse() -> Option<AcpiInfo>{
     if valid_rsdp == false {
         return None;
     }
-    let mut ret = AcpiInfo::default();
+    let mut ret = AcpiInfo::new();
     // 2) Find RSDT (RSD[16] as u32)
     // FORMAT OF THE ROOT RSDT
     // OFF TYPE&NAME
