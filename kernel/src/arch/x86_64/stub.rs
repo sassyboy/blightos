@@ -4,25 +4,33 @@
 #![allow(dead_code)]
 use core::mem::size_of;
 use core::arch::asm;
+use crate::arch::asc::vga::*;
 use crate::pmm::PMMapElement;
 use crate::sched;
 use crate::util::*;
 use crate::{dump_memory, kstart};
 
+mod vga;
+
 //
 // Debugging macros
 //
-#[cfg(feature="debug_arch")]
 use core::fmt::Write;
-#[cfg(feature="debug_arch")]
 struct ArchDebugConsole;
-#[cfg(feature="debug_arch")]
 impl Write for ArchDebugConsole {
     fn write_str(&mut self, _s: &str) -> core::fmt::Result {
         kearly_console::print_str(_s.as_bytes());
         Ok(())
     }
 }
+
+macro_rules! log {
+    ($($arg:tt)*) => {
+        let mut kern_console = ArchDebugConsole{};
+        let _ = write!(&mut kern_console, $($arg)*);
+    };
+}
+
 #[cfg(feature="debug_arch")]
 macro_rules! dbg {
     ($($arg:tt)*) => {
@@ -41,7 +49,7 @@ macro_rules! dbg {
 //---------------------------------------------------------------------------//
 // Multiboot 1 Information
 #[repr(C)]
-struct MultibootInfo {
+pub struct MultibootInfo {
     flags: u32,
     mem_lower: u32,
     mem_upper: u32,
@@ -69,7 +77,7 @@ struct MultibootInfo {
     framebuffer_height: u32,
     framebuffer_bpp: u8,
     framebuffer_type: u8,
-    color_info: [u8; 6], // Placeholder for actual color info struct/padding
+    framebuffer_color_info: [u8; 6],
 }
 
 #[repr(C, packed)]
@@ -135,16 +143,21 @@ extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
     }
 
     // Todo - fetch kernel's boot command-line/parameters
-    // Todo - fetch VBE's information for a potential graphics driver
-    // Todo - Pass a list kernel modules (e.g., ramdisk) Grub loaded for us
-
-    
+    // Fetch VBE's information for the early-stage console/graphics driver
+    vbe_init(mbi);
+    vbe_set_background_rgb((240, 240, 240));
+    vbe_set_foreground_rgb((0, 0, 255));
     kearly_console::init();
-
+    let (rows, cols) = vbe_screen_size();
+    log!("VESA Graphics: Mode=0x{:X}, Rows:{}, Columns:{}\n",
+        vbe_mode_number(), rows, cols);
+    // Todo - Pass a list kernel modules (e.g., ramdisk) Grub loaded for us
+    
     // Initialize the per-cpu sections
     percpu_init_sections();
     percpu_init_cpu(0);
-    THIS_CPU_ID.write(0);
+    *THIS_CPU_ID.borrow_mut() = 0;
+    
     // SMP, LAPIC, IOAPIC, HiRes Event Timer, etc. are found in ACPI tables
     match x86_acpi_parse() {
         Some(acpi) => {
@@ -160,7 +173,6 @@ extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
             dbg!("No ACPI information found. Multiprocessing disabled.\n");
         }
     };
-    
     // Start the kernel.
     kstart(0, Some(&mem_map[0..e820_mmap_count]) );
     panic!(); // kstart shouldn't really return but if does, we should panic
@@ -349,7 +361,6 @@ X86ExceptionInfo {
 // Internal interface                                                         //
 //----------------------------------------------------------------------------//
 
-
 //
 // PerCpu Storage Support - util::PerCpuGlobal<T> requires the following
 // architecture-dependent functions to be defined here:
@@ -383,7 +394,6 @@ fn percpu_init_sections() {
         
     }
 }
-
 fn percpu_init_cpu(cpuid: usize) {
     // 1) Store the base address of the corresponding PerCPU section in %gs
     // 2) Set the THIS_PERCPU_BASE variable to the absolute address of the
@@ -539,7 +549,6 @@ struct X86IoApic{
     mmio_base:      u32,
     gsi_base:       u32
 }
-
 impl X86IoApic {
     const REG_ID:    u8 = 0x0;
     const REG_VER:   u8 = 0x1;
@@ -642,7 +651,6 @@ struct X86LocalApic {
     mmio_base:  u32,
     initialized:bool,
 }
-
 impl X86LocalApic {
 
     const REG_LAPIC_ID:         u16 = 0x20;
@@ -790,6 +798,35 @@ pub fn cpu_id() -> usize {
         apic_id as usize
     }
 }
+
+
+pub fn x86_cpuid_inst(in_eax: u32, in_ecx: u32) -> (u32, u32, u32, u32) {
+    let (mut eax, mut ebx, mut ecx, mut edx) : (u32, u32, u32, u32);
+    eax = in_eax;
+    ecx = in_ecx;
+    unsafe {
+        asm!(
+            "push rbx", // rbx is used internally by LLVM
+            "cpuid",
+            "mov {tmp:e}, ebx",
+            "pop rbx",
+            inout("eax")eax,
+            inout("ecx")ecx,
+            tmp = out(reg)ebx,
+            out("edx")edx
+        );
+    }
+    (eax, ebx, ecx, edx)
+}
+
+pub fn x86_cpuid_max_extended_leaf() -> u32 {
+    // CPUID.80000000H -- Maximum Input Value for Extended Function CPUID
+    // Information
+    let eax;
+    (eax, _, _, _) = x86_cpuid_inst(0x80000000, 0);
+    eax
+}
+
 pub fn cpu_read_timestamp() -> u64 {
     let (upper, lower): (u64, u64);
     unsafe {
@@ -847,38 +884,32 @@ pub fn x86_msr_read(msr: u32) -> u64 {
 // print_str is implemented in a synchronizing manner
 //
 pub mod kearly_console {
+    use crate::arch::asc::vga::*;
     use crate::util::Spinlock;
 
-    const VGA_BASE: u32 = 0xb8000;
-    static VGA_CUR : Spinlock<usize> = Spinlock::new(0);
+    static CURSOR : Spinlock<(u32, u32)> = Spinlock::new((0,0));
+    // CURSOR.0 -> row, .1 -> column
 
     pub fn init() {
-        let fill : u16 = 0x1f00 | b' ' as u16;
-        let mut ptr: *mut u16 = VGA_BASE as *mut u16;
-        for _ in 0..80*25 {
-            unsafe { *ptr = fill; }
-            ptr = ptr.wrapping_add(1);
-        }
+        vbe_clean_screen();
     }
 
     pub fn print_str(msg: &[u8]) {
-        let color_byte: u16 = 0x1f00;
-        let mut ptr: *mut u16 = VGA_BASE as *mut u16;
-        let mut cursor = VGA_CUR.lock();
-        ptr = ptr.wrapping_add(*cursor);
+        let (sh, sw) = vbe_screen_size();
+        let (fh, fw) = vbe_font_size();
+        let (rows, cols) = (sh / fh, sw / fw);
+        let mut cursor = CURSOR.lock();
         for &c in msg {
             if c == b'\n' {
-                if (*cursor / 80) < 24 {
-                    // Move the cursor to the next line
-                    *cursor =(*cursor / 80 + 1) *  80;
-                } else {
-                    *cursor = 0; // wrap around
-                }
-                ptr = (VGA_BASE as *mut u16).wrapping_add(*cursor);
+                (*cursor).0 = ((*cursor).0 + 1) % rows;
+                (*cursor).1 = 0;
             } else {
-                unsafe {*ptr = c as u16 | color_byte;}
-                ptr = ptr.wrapping_add(1);
-                *cursor = (*cursor + 1) % (80 * 25);
+                vbe_putc(c, (*cursor).0, (*cursor).1);
+                (*cursor).1 = (*cursor).1 + 1;
+                if (*cursor).1 == cols {
+                    (*cursor).1 = 0;
+                    (*cursor).0 = ((*cursor).0 + 1) % rows;
+                }
             }
         }
     }

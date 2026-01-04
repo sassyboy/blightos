@@ -26,7 +26,7 @@ boot_start:
   .long 1          /* Graphics mode : 0=Linear Graphics, 1=EGA Text */
 #elif STDOUT_VGA_RGB
   .long 0
-  .long 1280, 1024, 24 /* Resolution and color depth */
+  .long VGA_RGB_WIDTH, VGA_RGB_HEIGHT, 24 /* Resolution and color depth */
 #endif
 
 .text
