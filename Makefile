@@ -20,16 +20,19 @@ $(GRUB_CFG):
 	@echo "set timeout=0" > $(GRUB_CFG)
 	@echo "set default=0" >> $(GRUB_CFG)
 	@echo "menuentry "BlightOS" {" >> $(GRUB_CFG)
-	@echo "  multiboot /boot/kernel.elf" >> $(GRUB_CFG)
-	@echo "  boot" >> $(GRUB_CFG)
+	@echo "  multiboot2 /boot/kernel.elf" >> $(GRUB_CFG)
 	@echo "}" >> $(GRUB_CFG)
 
 clean:
 	make -C kernel clean
-	rm -f $(BOOT_IMG)
+	rm -rf $(BOOT_IMG) $(BUILDDIR)*
+	@mkdir -p $(BUILDDIR)/
 
 run: $(BOOT_IMG)
-	@qemu-system-x86_64 -smp 4 -drive file=$<,format=raw,media=disk
+	@qemu-system-x86_64 -enable-kvm -smp 4 -m 512M \
+	-cpu host,migratable=no,+invtsc,+tsc-deadline \
+	-serial stdio \
+	-drive file=$<,format=raw,media=disk 
 
 force: ;
 

@@ -2,33 +2,48 @@
 // Rust stub for the x86_64 architecture
 //
 #![allow(dead_code)]
-use core::mem::size_of;
+
 use core::arch::asm;
 use crate::arch::asc::vga::*;
 use crate::pmm::PMMapElement;
-use crate::sched;
+use crate::sched::SCHEDULER;
 use crate::util::*;
 use crate::{dump_memory, kstart};
+use core::fmt::Write;
 
 mod vga;
 
 //
 // Debugging macros
 //
-use core::fmt::Write;
+
+// Serial Port Debugging
+impl Write for PortBasedUART {
+    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
+        self.puts(_s.as_bytes());
+        Ok(())
+    }
+}
+#[cfg(feature="debug_arch")]
+macro_rules! seriallog {
+    ($($arg:tt)*) => {
+        let mut uart = PortBasedUART::new(0x3F8);
+        let _ = write!(&mut uart, $($arg)*);
+    };
+}
+#[cfg(not(feature="debug_arch"))]
+macro_rules! seriallog {
+    ($($arg:tt)*) => { };
+}
+
+
+// VGA/EGA Debugging & Logging
 struct ArchDebugConsole;
 impl Write for ArchDebugConsole {
     fn write_str(&mut self, _s: &str) -> core::fmt::Result {
         kearly_console::print_str(_s.as_bytes());
         Ok(())
     }
-}
-
-macro_rules! log {
-    ($($arg:tt)*) => {
-        let mut kern_console = ArchDebugConsole{};
-        let _ = write!(&mut kern_console, $($arg)*);
-    };
 }
 
 #[cfg(feature="debug_arch")]
@@ -38,60 +53,129 @@ macro_rules! dbg {
         let _ = write!(&mut kern_console, $($arg)*);
     };
 }
-
 #[cfg(not(feature="debug_arch"))]
 macro_rules! dbg {
     ($($arg:tt)*) => { };
 }
 
+macro_rules! log {
+    ($($arg:tt)*) => {
+        let mut kern_console = ArchDebugConsole{};
+        let _ = write!(&mut kern_console, $($arg)*);
+    };
+}
+
+
 //---------------------------------------------------------------------------//
 // Private Data Types and Globals                                            //
 //---------------------------------------------------------------------------//
-// Multiboot 1 Information
-#[repr(C)]
-pub struct MultibootInfo {
-    flags: u32,
-    mem_lower: u32,
-    mem_upper: u32,
-    boot_device: u32,
-    cmdline: u32,
-    mods_count: u32,
-    mods_addr: u32,
-    syms: [u32; 4], // Represents a union in C for a.out or ELF symbols
-    mmap_length: u32,
-    mmap_addr: u32,
-    drives_length: u32,
-    drives_addr: u32,
-    config_table: u32,
-    boot_loader_name: u32,
-    apm_table: u32,
-    vbe_control_info: u32,
-    vbe_mode_info: u32,
-    vbe_mode: u16,
-    vbe_interface_seg: u16,
-    vbe_interface_off: u16,
-    vbe_interface_len: u16,
-    framebuffer_addr: u64,
-    framebuffer_pitch: u32,
-    framebuffer_width: u32,
-    framebuffer_height: u32,
-    framebuffer_bpp: u8,
-    framebuffer_type: u8,
-    framebuffer_color_info: [u8; 6],
+// Multiboot 2 Information
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum Mulitboot2TagType {
+    End             = 0,
+    CmdLine         = 1,
+    BootLoaderName  = 2,
+    Module          = 3,
+    BasicMemInfo    = 4,
+    BootDevice      = 5,
+    MemoryMap       = 6,
+    VBE             = 7,
+    FrameBuffer     = 8,
+    ElfSections     = 9,
+    APM             = 10,
+    EFI32           = 11,
+    EFI64           = 12,
+    SMBIOS          = 13,
+    ACPIOld         = 14,
+    ACPINew         = 15,
+    Network         = 16,
+    EFIMemMap       = 17,
+    EFIBS           = 18,
+    EFI32IH         = 19,
+    EFI64IH         = 20,
+    LoadBaseAddr    = 21
+}
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Multiboot2TagModule{
+    mod_start: u32,
+    mod_end:   u32,
+    cmd_line:  [u8; 0]
 }
 
 #[repr(C, packed)]
-struct MemoryEntry {
-    size: u32,
-    base_addr: u64,
-    length: u64,
-    mtype: u32,
+#[derive(Clone, Copy)]
+struct Multiboot2TagBasicMemInfo{
+    mem_lower: u32,
+    mem_upper:   u32,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Multiboot2MemoryMapEntry{
+    addr:       u64,
+    len:        u64,
+    mtype:      u32, // 1: Available, 2: RSVD, 3: ACPI_REC, 4: NVS, 5: BADRAM
+    zero:       u32
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Multiboot2MemoryMap{
+    entry_size:     u32,
+    entry_version:  u32,
+    entries:        [Multiboot2MemoryMapEntry; 0]
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct Multiboot2VBE{
+    mode:               u16,
+    interface_seg:      u16,
+    interface_off:      u16,
+    interface_len:      u16,
+    info_block:         [u8; 512],
+    mode_info_block:    [u8; 512]
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct Multiboot2FrameBuffer {
+    addr:               u64,
+    pitch:              u32,
+    width:              u32,
+    height:             u32,
+    bpp:                u8,
+    fbtype:             u8, // 0 INDEXED, 1 RGB, 2 EGA_TEXT
+    rsvd:               u16,
+    color_info:         [u8; 6],
+}
+
+union Multiboot2TagData {
+    module :                Multiboot2TagModule,
+    basic_mem_info:         Multiboot2TagBasicMemInfo,
+    mem_map:                Multiboot2MemoryMap, 
+    vbe_info:               Multiboot2VBE,
+    frame_buffer:           Multiboot2FrameBuffer,
+    efi32_pointer:          u32,
+    efi64_pointer:          u64,
+    acpi_old_rsdp:          [u8; 20],
+    acpi_new_xsdp:          [u8; 36]
+
+}
+
+#[repr(C, packed)]
+struct Multiboot2Tag {
+    ttype:   Mulitboot2TagType,
+    tsize:   u32,
+    tdata:   Multiboot2TagData
 }
 
 pub struct MachineContext {
     cpu_count:  usize,
     acpi_info:  AcpiInfo,
-    ioapic:     X86IoApic
+    ioapic:     X86IoApic,
 }
 
 impl MachineContext {
@@ -99,18 +183,20 @@ impl MachineContext {
         Self {
             cpu_count:  1, // There's at least one cpu (BSP), lol!
             acpi_info:  AcpiInfo::new(),
-            ioapic:     X86IoApic::new()
+            ioapic:     X86IoApic::new(),
         }
     }
 }
 
 static THIS_MACHINE: Spinlock<MachineContext> = 
     Spinlock::new(MachineContext::new());
+static VESA_CONTEXT: Spinlock<VESAContext> = Spinlock::new(VESAContext::new());
 
 percpu_global! {
     THIS_PERCPU_BASE: usize = 0; // To avoid rdmsr(IA32_GS_BASE) every time
     THIS_LAPIC:  X86LocalApic = X86LocalApic::new();
     THIS_IOAPIC: X86IoApic    = X86IoApic::new();
+    THIS_TSC:    X86TimeStampCounter = X86TimeStampCounter::new();
 }
 
 //----------------------------------------------------------------------------//
@@ -124,42 +210,121 @@ percpu_global! {
 // to kernel's initial virtual address space
 //
 #[unsafe(no_mangle)]
-extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
-    // Create the memory map
+extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
+    // Physical Memory Map Buffer
     let mut mem_map: [PMMapElement; 32] = [
         PMMapElement {base: 0, len: 0, avail: false}; 32];
-    let e820_mmap_count = mbi.mmap_length as usize / size_of::<MemoryEntry>();
+    let mut mem_map_count = 0;
+    let mut acpi_rsdp: Option<usize> = None;
+
+    // Enumerate Muliboot 2 tags
+    // Use the default serial port for debugging since VESA is not yet enabled
+    PortBasedUART::new(0x3F8).config();
+    seriallog!("MULTIBOOT2 BASE: {:X}\n", mb2info_base);
+    let mut total_size: usize;
+    let mut tag_base: *mut u8 = (mb2info_base + 8) as *mut u8;
     unsafe {
-        let mut rptr: *mut MemoryEntry = mbi.mmap_addr as *mut MemoryEntry;
-        for i in 0..e820_mmap_count {
-            mem_map[i].base = (*rptr).base_addr as usize;
-            mem_map[i].len  = (*rptr).length as usize;
-            mem_map[i].avail = match (*rptr).mtype {
-                1 => true,
-                _ => false,
-            };
-            rptr = rptr.add(1);
-        }
+        total_size = *(mb2info_base as *mut u32) as usize;
     }
+    seriallog!("TOTAL SIZE: {}\n",total_size);
+    while total_size > 0 {
+        let tag: *mut Multiboot2Tag = tag_base as *mut Multiboot2Tag;
+        let tag_size: usize;
+        let tag_type: Mulitboot2TagType;
+        unsafe {
+            tag_size = (*tag).tsize as usize;
+            tag_type = (*tag).ttype;
+        }
+        let tag_pad  = tag_base.wrapping_add(tag_size).align_offset(8);
+        seriallog!("TAG TYPE: {} SIZE: {} (Left: {})\n",
+                    tag_type as u32, tag_size, total_size);
+        match tag_type {
+            Mulitboot2TagType::ACPIOld          => {
+                // ACPI REV 1 (RSDP -> SDT w\ 32-bit table addresses)
+                acpi_rsdp = Some((tag as usize) + 8);
+            }
+            Mulitboot2TagType::ACPINew          => {
+                // ACPI REV 2+ (XSDP -> SDT w\ 64-bit table addresses)
+                acpi_rsdp = Some((tag as usize) + 8);
+            }
+            Mulitboot2TagType::FrameBuffer      => {
+                let mut vesa = VESA_CONTEXT.lock();
+                unsafe{
+                    (*vesa).init_from_mb2(None, 
+                                         Some(&((*tag).tdata.frame_buffer)));
+                }
+            },
+            Mulitboot2TagType::VBE              => {
+                let mut vesa = VESA_CONTEXT.lock();
+                unsafe {
+                    (*vesa).init_from_mb2(Some(&((*tag).tdata.vbe_info)), None);
+                }
+            },
+            Mulitboot2TagType::MemoryMap        => {
+                let ent_size : usize;
+                unsafe {
+                    ent_size = (*tag).tdata.mem_map.entry_size as usize;
+                } 
+                mem_map_count = (tag_size - 8) / ent_size;
+                seriallog!("MEMMAP - ENT_SIZE: {}, COUNT: {}\n", 
+                        ent_size, mem_map_count);
+                let mut ent = (tag as usize + 16) as *mut Multiboot2MemoryMapEntry;
+                for i in 0..32 {
+                    if i >= mem_map_count {
+                        break;
+                    }
+                    unsafe {
+                        mem_map[i].base = (*ent).addr as usize;
+                        mem_map[i].len  = (*ent).len as usize;
+                        // Mark any available memory < 1MB as reserved
+                        if mem_map[i].base < 0x100000 {
+                            mem_map[i].avail = false;
+                        } else {
+                            mem_map[i].avail = match (*ent).mtype {
+                                1 => true,
+                                _ => false,
+                            };
+                        }
+                    }
+                    ent = ent.wrapping_add(1);
+                }
+
+            }
+            Mulitboot2TagType::End              => {
+                break;
+            }
+            _                                   => {}
+        }
+        tag_base = tag_base.wrapping_add(tag_size + tag_pad);
+        total_size -= tag_size + tag_pad;
+    }
+    
+    // Set a default video mode, and 
+    // Initialize the early-stage standard output (clears the screen too)
+    let (rows, cols, mode): (u32, u32, u16);
+    {
+        let mut vesa = VESA_CONTEXT.lock();
+        (*vesa).set_background_rgb((240, 240, 240));
+        (*vesa).set_foreground_rgb((0, 0, 255));
+        (rows, cols) = (*vesa).screen_size();
+        mode = (*vesa).mode_number();
+    }
+    kearly_console::init();
+    log!("VESA Graphics: Mode=0x{:X}, Rows:{}, Columns:{}\n", mode, rows, cols);
 
     // Todo - fetch kernel's boot command-line/parameters
-    // Fetch VBE's information for the early-stage console/graphics driver
-    vbe_init(mbi);
-    vbe_set_background_rgb((240, 240, 240));
-    vbe_set_foreground_rgb((0, 0, 255));
-    kearly_console::init();
-    let (rows, cols) = vbe_screen_size();
-    log!("VESA Graphics: Mode=0x{:X}, Rows:{}, Columns:{}\n",
-        vbe_mode_number(), rows, cols);
     // Todo - Pass a list kernel modules (e.g., ramdisk) Grub loaded for us
     
     // Initialize the per-cpu sections
+    let bsp_cpu_id = cpu_id(); // LAPIC ID
     percpu_init_sections();
-    percpu_init_cpu(0);
-    *THIS_CPU_ID.borrow_mut() = 0;
+    percpu_init_cpu(bsp_cpu_id);
+    *THIS_CPU_ID.borrow_mut() = bsp_cpu_id;
+    THIS_TSC.borrow_mut().init();
     
     // SMP, LAPIC, IOAPIC, HiRes Event Timer, etc. are found in ACPI tables
-    match x86_acpi_parse() {
+
+    match x86_acpi_parse(acpi_rsdp) {
         Some(acpi) => {
             {
                 // No concurrency here, but Rust!
@@ -167,14 +332,14 @@ extern "C" fn rust_x864_entry_bsp(mbi: &MultibootInfo, max_cpus: usize) {
                 (*this_machine).acpi_info = acpi;
             }
             // Start the application processors
-            start_smp(max_cpus);
+            start_smp(bsp_cpu_id, max_cpus);
         },
         None => {
             dbg!("No ACPI information found. Multiprocessing disabled.\n");
         }
     };
     // Start the kernel.
-    kstart(0, Some(&mem_map[0..e820_mmap_count]) );
+    kstart(bsp_cpu_id, Some(&mem_map[0..mem_map_count]) );
     panic!(); // kstart shouldn't really return but if does, we should panic
 }
 
@@ -183,6 +348,7 @@ extern "C" fn rust_x864_entry_ap(_arg: usize) {
     let cpuid = cpu_id();
     percpu_init_cpu(cpuid);
     THIS_CPU_ID.write(cpuid);
+    THIS_TSC.borrow_mut().init();
     let mylapic = THIS_LAPIC.borrow_mut();
     {
         let mut this_machine = THIS_MACHINE.lock();
@@ -291,19 +457,27 @@ extern "C" fn kexcep_simd_fp() {
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn kirq_lvt_timer() {
+    THIS_LAPIC.borrow_mut().send_eoi();
+    // Set TSC_DEADLINE if periodic mode is selected
+    unsafe {
+        X86_LAPIC_TIMER_HANDLER(*THIS_CPU_ID.borrow() as u16);
+    }
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn kirq_handler(irq: u8) {
     // For simplicity: EOI immediately not to lose IRQs in case the top-half
     // handler ends up doing a context switch or takes too long.
-
     THIS_LAPIC.borrow_mut().send_eoi();
-
     unsafe {X86_ISR_HANDLER[irq as usize](irq as u16);}
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn kstack_error(rsp: usize) {
     dump_memory(rsp, 20);
-    panic!("Kernel Stack Corruption.");
+    panic!("Stack Corruption (Context Switch). CPU={}",
+        *(THIS_CPU_ID.borrow()));
 }
 
 #[unsafe(no_mangle)]
@@ -511,7 +685,7 @@ mod x86_pic {
 
 mod x86_pit {
     #![allow(dead_code)]
-    use crate::arch::x86_ioport_write;
+    use crate::arch::{x86_ioport_read, x86_ioport_write};
 
     // I/O Ports
     const PIT_PORT_CH0: u16 = 0x40;
@@ -522,9 +696,11 @@ mod x86_pit {
     const PIT_ACCESS_LOW_BYTE: u8 = 0x1;
     const PIT_ACCESS_HI_BYTE : u8 = 0x2;
     const PIT_ACCESS_LOW_HI  : u8 = PIT_ACCESS_LOW_BYTE | PIT_ACCESS_HI_BYTE;
+    const PIT_OPMODE_ONESHOT : u8 = 0x1;
     const PIT_OPMODE_RATEGEN : u8 = 0x2;
     // Other constants
-    const PIT_FREQ_HZ: u32 = 1193182;
+    const PIT_FREQ_HZ:  u32 = 1193182;
+    const PIT_FREQ_KHZ: f64 = 1193.182;
 
     fn make_cmd(channel: u8, access: u8, opmode: u8) -> u8 {
         ((channel & 0x3) << 6 ) | 
@@ -532,14 +708,170 @@ mod x86_pit {
         ((opmode  & 0x7) << 1 )
     }
 
-    pub fn init(hz: u16) {
+    pub fn config_periodic_irq(hz: u16) {
         let reload : u16 = (PIT_FREQ_HZ / hz as u32) as u16;
         let cmd = make_cmd(0, PIT_ACCESS_LOW_HI, PIT_OPMODE_RATEGEN);
         x86_ioport_write(PIT_PORT_CMD, cmd);
         x86_ioport_write(PIT_PORT_CH0, (reload & 0xFF) as u8);
         x86_ioport_write(PIT_PORT_CH0, (reload >> 8)   as u8);
     }
+
+    pub fn config_oneshot_count(ms: u32) {
+        // Use Channel 2 in One-Shot mode to count down to zero
+        
+        // Since CH2 is wired to the PC speaker, the gated-output of the speaker
+        // should be disabled first (see bits 0-1 of port 0x61, SysControlPortB)
+        let sys_ctl_b: u8 = x86_ioport_read(0x61);
+        x86_ioport_write(0x61, sys_ctl_b & 0xFC);
+        // 
+        let reload : u16 = (PIT_FREQ_KHZ * ms as f64) as u16;
+        let cmd = make_cmd(2, PIT_ACCESS_LOW_HI, PIT_OPMODE_ONESHOT);
+        x86_ioport_write(PIT_PORT_CMD, cmd);
+        x86_ioport_write(PIT_PORT_CH0, (reload & 0xFF) as u8);
+        x86_ioport_write(PIT_PORT_CH0, (reload >> 8)   as u8);
+    }
+
+    // Should be called after config_oneshot_sleep is called
+    pub fn start_oneshot_count(){
+        // Clear and then reset bit 0 of IO port 0x61, after modifying the
+        // reload value, hence, start counting down.
+        let sys_ctl_b: u8 = x86_ioport_read(0x61);
+        x86_ioport_write(0x61, sys_ctl_b & 0xFE); // Clear bit 0
+        x86_ioport_write(0x61, sys_ctl_b | 0x01); // Set bit 0
+    }
+
+    pub fn wait_for_oneshot_count() {
+        // bit 5 of port 0x61 will go high once the counter hits zero
+        while x86_ioport_read(0x61) & 0x20 == 0 {
+        }
+    }
 }
+
+
+// For newer CPUs that support Invariant TSCs, this is going to be used
+// for time-keeping and preemption interrupts
+// TODO: fallback to PIT (or HPET) in case the system doesn't support this
+struct X86TimeStampCounter {
+    freq_hz:        u64,
+    enabled:        bool,   // True: Can be used in the kernel: freq_hz is valid
+                            //       and the frequency is invariant
+    tsc_deadline:   bool,   // LAPICs can use the TSC_DEADLINE mode
+}
+impl X86TimeStampCounter {
+    pub const fn new() -> Self {
+        Self {
+            freq_hz:        0,
+            enabled:        false,
+            tsc_deadline:   false,
+        }
+    }
+    pub fn init(&mut self) {
+        let (mut eax, ebx, mut ecx, mut edx) : (u32, u32, u32, u32);
+        let (cpu_family, mut cpu_model) : (u8, u8);
+        self.enabled = false;
+        // Is TSC supported? CPUID.01H -> EDX[4]
+        // Is TSC_DEADLINE supported? CPUID1.01H -> ECX[24]
+        (eax, _, ecx, edx) = x86_cpuid_inst(0x1, 0);
+        if edx & 0x10 == 0 {
+            panic!("Processor too old. TSC not supported.");
+        }
+        if ecx & (1 << 24) == 0 {
+            panic!("Processor too old. TSC_DEADLINE not supported.");
+        }
+        cpu_model      = ((eax & 0xF0)  >> 4) as u8;
+        cpu_family     = ((eax & 0xF00) >> 8) as u8;
+        if cpu_family == 0x06 || cpu_family ==  0x0F {
+            // Extended model (EAX[19:16]) prepended
+            cpu_model |= ((eax & 0xF0000) >> 12) as u8;
+        }
+
+        // Is the rate invariant CPUID.80000007H -> EDX.bit8 (TSC_INVARIANT)
+        if x86_cpuid_max_extended_leaf() >= 0x80000007 {
+            (_, _, _, edx) = x86_cpuid_inst(0x80000007, 0);
+            if edx & 0x100 > 0 {
+                // Derive the TSC frequency:
+                // CPUID.15H: Time Stamp Counter and Nominal Core Crystal Clock
+                // EAX -> Denominator
+                // EBX -> Numerator
+                // ECX -> Core Crysctal Freq (Could be Zero)
+                // TSC_frequency = ECX * EBX/EAX
+                (eax, ebx, ecx, _) = x86_cpuid_inst(0x15, 0);
+                dbg!("CPUID.15H - EAX: {} EBX {} ECX: {}\n", eax, ebx, ecx);
+                if ecx == 0 && cpu_family == 0x6 {
+                    // Core Crystal Clock Freq is not enumerated, but we can
+                    // look it up base on the model. According to Intel's SDM:
+                    // Table 21-95. Nominal Core Crystal Clock Frequency
+                    // 25MHz: Intel Xeon Scalable Processor Family(CPUID 06_55H)
+                    // 24MHz: 6th and 7th gen Intel Core and Intel Xeon W.
+                    // 19.2MHz: Next Generation Intel Atom processors based on
+                    //          Goldmont Microarchitecture with CPUID signature
+                    //          06_5CH (does not include Intel Xeon processors).
+                    // See Tabel 2-1.
+                    // CPUID Signature Values of DisplayFamily_DisplayModel
+                    // For a complete list
+                    // CPUID.01H -> EAX[7:4] model, EAX[11:8] family
+                    ecx = match cpu_model{
+                        0x55 => 25000000,
+                        0x4E => 24000000,
+                        0x8E => 24000000,
+                        0x5C => 19200000,
+                        _    => 0
+                    };
+                }
+                if eax > 0 && ebx > 0 && ecx > 0 {
+                    self.freq_hz = ((ecx as f64) * (ebx as f64/ eax as f64))
+                                    as u64;
+                    // TSC is supported, has a constant frequency, which is
+                    // enumerated here!
+                    self.enabled = true;
+                    dbg!("INVARIANT TSC FREQ: {} - EAX: {} EBX {} ECX: {}\n",
+                            self.freq_hz, eax, ebx, ecx);
+
+                    // Also approximate it:
+                    // x86_pit::config_oneshot_count(100); // 100 ms count-down
+                    // x86_pit::start_oneshot_count();
+                    // let start_tsc = cpu_read_timestamp();
+                    // x86_pit::wait_for_oneshot_count();
+                    // let end_tsc = cpu_read_timestamp();
+                    // let tsc_overhead1 = cpu_read_timestamp();
+                    // log!("INVARIANT TSC FREQ APPROX ~ {} HZ\n", 
+                    //     (end_tsc - start_tsc - (tsc_overhead1-end_tsc)*2) * 10);
+                } else {
+                    // Use PIT to approximate it
+                    x86_pit::config_oneshot_count(100); // 100 ms count-down
+                    x86_pit::start_oneshot_count();
+                    let start_tsc = cpu_read_timestamp();
+                    x86_pit::wait_for_oneshot_count();
+                    let end_tsc = cpu_read_timestamp();
+                    let tsc_overhead1 = cpu_read_timestamp();
+                    self.freq_hz = (end_tsc - start_tsc - (tsc_overhead1-end_tsc)*2) * 10;
+                    self.enabled = true;
+                    dbg!("INVARIANT TSC FREQ APPROX: {} HZ\n", self.freq_hz);
+                }
+            } else {
+                panic!("Processor too old - Invariant TSC not supported\n");
+            }
+        } else {
+            panic!("Processor too old - x86_cpuid_max_extended_leaf:{:X}\n",
+                x86_cpuid_max_extended_leaf()
+            );
+        }
+    }
+    pub fn read(&self) -> u64 {
+        let (upper, lower): (u64, u64);
+        unsafe {
+            asm!("rdtsc", out("rdx")upper, out("rax")lower);
+        }
+        (upper << 32) | lower
+    }
+    pub fn freq_hz(&self) -> u64 {
+        self.freq_hz
+    }
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 
 struct X86IoApic{
     acpi_id:        u8,
@@ -671,6 +1003,8 @@ impl X86LocalApic {
     const REG_TIMER_CUR_CNT:    u16 = 0x390;
     const REG_TIMER_DIV:        u16 = 0x3E0;
 
+    const MSR_IA32_TSC_DEADLINE:u32 = 0x6E0;
+
     pub const fn new() -> Self {
         Self {
             cpu_acpi_id: 0,
@@ -694,6 +1028,34 @@ impl X86LocalApic {
         }
     }
 
+    pub fn init(&mut self, lapic: &AcpiLocalApic, lapic_mmio: u32) {
+        // TODO identity-map mmio_base with caching disabled
+        // The MMIO is usually toward the end of the 4GB boundary. Don't accept
+        // an MMIO mapping under 1MB.
+        if lapic_mmio <= 0x100000 { return; }
+        self.lapic_id       = lapic.lapic_id;
+        self.cpu_acpi_id    = lapic.cpu_id;
+        self.mmio_base      = lapic_mmio;
+        self.initialized    = true;
+
+        // Setting bit 8 of the spurious interrupt vector enables the lapic
+        let siv = self.read_reg(Self::REG_SIV);
+        self.write_reg(Self::REG_SIV, siv | 0x100);
+    }
+    
+    //
+    // IRQ Functionalities
+    //
+
+    pub fn send_eoi(&mut self) {
+        self.write_reg(Self::REG_EOI, 0);
+    }
+    
+
+    //
+    // Inter-Processor Communication
+    //
+
     fn send_ipi(&mut self, dest_lapic_id: u8, cmd1: u32) {
         // Select the target LAPIC
         let reg = self.read_reg(Self::REG_INT_CMD2) & 0x00FFFFFF;
@@ -712,25 +1074,6 @@ impl X86LocalApic {
         }
     }
 
-    pub fn init(&mut self, lapic: &AcpiLocalApic, lapic_mmio: u32) {
-        // TODO identity-map mmio_base with caching disabled
-        // The MMIO is usually toward the end of the 4GB boundary. Don't accept
-        // an MMIO mapping under 1MB.
-        if lapic_mmio <= 0x100000 { return; }
-        self.lapic_id       = lapic.lapic_id;
-        self.cpu_acpi_id    = lapic.cpu_id;
-        self.mmio_base      = lapic_mmio;
-        self.initialized    = true;
-
-        // Setting bit 8 of the spurious interrupt vector enables the lapic
-        let siv = self.read_reg(Self::REG_SIV);
-        self.write_reg(Self::REG_SIV, siv | 0x100);
-    }
-
-    pub fn send_eoi(&mut self) {
-        self.write_reg(Self::REG_EOI, 0);
-    }
-
     pub fn send_init_ipi(&mut self, dest_lapic_id: u8) {
         // clear errors
         self.write_reg(Self::REG_ERROR_STATUS, 0);
@@ -747,8 +1090,46 @@ impl X86LocalApic {
         self.write_reg(Self::REG_ERROR_STATUS, 0);
         // Send SIPI
         self.send_ipi(dest_lapic_id, 0x600 | entry_point_pg as u32);
-		cpu_busywait(2_000_000); // TODO: precise 200 uS
+		cpu_busywait_us(200);
 		self.wait_ipi_send();
+    }
+
+    //
+    // Timer Functionalities
+    // For now only One-shot TSC_DEADLINE mode is supported
+    // See section 12.5.4.1 TSC-Deadline Mode in Intel's SDM
+    //
+    // REG_LVT_TIMER bit specification:
+    // IRQ Handler Vector:              [7..0]
+    // Delivery Status                  [12]
+    // IRQ Masked                       [16]
+    // Timer Mode                       [18..17]
+    pub fn config_timer(&mut self, irq_handler_vector: u8, irq_masked: bool) {
+        self.write_reg(Self::REG_ERROR_STATUS, 0);
+        // Set the initial tsc deadline to 0 so that no unwanted IRQ is raised
+        self.set_timer(0);
+        // Set the mode to TSC_DEADLINE (LVT_TIMER.bits[18..17] <- 10b)
+        // Set the vector to irq_handler_vector
+        // unmask the IRQ if necessary
+        let mut lvtreg = self.read_reg(Self::REG_LVT_TIMER) & 0xFFF8EF00;
+        if irq_masked{
+            lvtreg |= 1 << 16;
+        }
+        lvtreg |= irq_handler_vector as u32 | (1 << 18);
+        self.write_reg(Self::REG_LVT_TIMER, lvtreg);
+    }
+
+    //  Writing a non-zero 64-bit value into IA32_TSC_DEADLINE arms the timer.
+    pub fn set_timer(&mut self, target_tsc: u64) {
+        x86_msr_write(Self::MSR_IA32_TSC_DEADLINE, target_tsc);
+    }
+
+    pub fn set_timer_irq_mask(&mut self, irq_masked: bool) {
+        let mut lvtreg = self.read_reg(Self::REG_LVT_TIMER) & 0xFFFEFFFF;
+        if irq_masked{
+            lvtreg |= 1 << 16;
+        }
+        self.write_reg(Self::REG_LVT_TIMER, lvtreg);
     }
 }
 
@@ -757,6 +1138,7 @@ impl X86LocalApic {
 //----------------------------------------------------------------------------//
 percpu_global!{
     pub THIS_CPU_ID: usize = 0; // To avoid issuing cpuid every time
+    pub THIS_CPU_SYSTIMER:  SystemTimer = SystemTimer::new();
 }
 
 
@@ -786,19 +1168,10 @@ pub fn cpu_count() -> usize {
 // Returns LAPIC CPU ID of the current CPU calling the routine using the
 // CPUID instruction with Extended Topology Leaf (0BH)
 pub fn cpu_id() -> usize {
-    unsafe {
-        let apic_id: u32;
-        asm!(
-            "mov    eax, 0xb",
-            "mov    ecx, 0x0",
-            "cpuid",
-            // EDX should hold the APIC ID
-            out("edx")apic_id
-        );
-        apic_id as usize
-    }
+    let apic_cpu_id: u32;
+    (_, _, _, apic_cpu_id) = x86_cpuid_inst(0xB, 0x0);
+    apic_cpu_id as usize
 }
-
 
 pub fn x86_cpuid_inst(in_eax: u32, in_ecx: u32) -> (u32, u32, u32, u32) {
     let (mut eax, mut ebx, mut ecx, mut edx) : (u32, u32, u32, u32);
@@ -834,7 +1207,13 @@ pub fn cpu_read_timestamp() -> u64 {
     }
     (upper << 32) | lower
 }
-pub fn cpu_busywait(delay_tsc: u64) {
+pub fn cpu_busywait_us(delay_us: u64) {
+    let tsc = THIS_TSC.borrow_mut();
+    let mut freq_hz = 1_500_000_000; // Default to 1.5GHz by default
+    if tsc.enabled {
+        freq_hz = tsc.freq_hz;
+    }
+    let delay_tsc = freq_hz / 1_000_000 * delay_us;
     let target_tsc = cpu_read_timestamp() + delay_tsc;
     while cpu_read_timestamp() < target_tsc {
         core::hint::spin_loop();
@@ -877,6 +1256,48 @@ pub fn x86_msr_read(msr: u32) -> u64 {
     (high as u64) << 32 | low as u64
 }
 
+pub struct PortBasedUART {
+    port:   u16,
+}
+impl PortBasedUART {
+    pub const fn new(p: u16) -> Self {
+        Self {
+            port: p,
+        }
+    }
+
+    pub fn config(&mut self) {
+        x86_ioport_write(self.port + 1, 0x00);    // Disable all interrupts
+        x86_ioport_write(self.port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
+        x86_ioport_write(self.port + 0, 0x03);    // Set divisor to 3 (lo byte) 38400 baud
+        x86_ioport_write(self.port + 1, 0x00);    //                  (hi byte)
+        x86_ioport_write(self.port + 3, 0x03);    // 8 bits, no parity, one stop bit
+        x86_ioport_write(self.port + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
+        x86_ioport_write(self.port + 4, 0x0B);    // IRQs enabled, RTS/DSR set
+        x86_ioport_write(self.port + 4, 0x1E);    // Set in loopback mode, test the serial chip
+        x86_ioport_write(self.port + 0, 0xAE);    // Test serial chip (send byte 0xAE and check if serial returns same byte)
+        // If serial is not faulty set it in normal operation mode
+        // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
+        x86_ioport_write(self.port + 4, 0x0F);
+
+
+    }
+
+    pub fn putc(&self, c: u8) {
+        while x86_ioport_read(self.port + 5) & 0x20 == 0 {
+            core::hint::spin_loop();
+        }
+        x86_ioport_write(self.port, c);
+    }
+
+    pub fn puts(&self, msg: &[u8]) {
+        for &c in msg {
+            self.putc(c);
+        }
+    }
+
+}
+
 //
 // Initial/Boot-time Console
 // VGA/80x24TXT mode
@@ -884,19 +1305,26 @@ pub fn x86_msr_read(msr: u32) -> u64 {
 // print_str is implemented in a synchronizing manner
 //
 pub mod kearly_console {
-    use crate::arch::asc::vga::*;
+    use crate::arch::asc::*;
     use crate::util::Spinlock;
 
     static CURSOR : Spinlock<(u32, u32)> = Spinlock::new((0,0));
     // CURSOR.0 -> row, .1 -> column
 
     pub fn init() {
-        vbe_clean_screen();
+        let mut vesa = VESA_CONTEXT.lock();
+        (*vesa).clean_screen();
     }
 
+
     pub fn print_str(msg: &[u8]) {
-        let (sh, sw) = vbe_screen_size();
-        let (fh, fw) = vbe_font_size();
+        let (sh, sw) : (u32, u32);
+        let (fh, fw) : (u32, u32);
+        {
+            let vesa = VESA_CONTEXT.lock();
+            (sh, sw) = (*vesa).screen_size();
+            (fh, fw) = (*vesa).font_size();
+        }
         let (rows, cols) = (sh / fh, sw / fw);
         let mut cursor = CURSOR.lock();
         for &c in msg {
@@ -904,7 +1332,10 @@ pub mod kearly_console {
                 (*cursor).0 = ((*cursor).0 + 1) % rows;
                 (*cursor).1 = 0;
             } else {
-                vbe_putc(c, (*cursor).0, (*cursor).1);
+                {
+                    let mut vesa = VESA_CONTEXT.lock();
+                    (*vesa).putc(c, (*cursor).0, (*cursor).1);
+                }
                 (*cursor).1 = (*cursor).1 + 1;
                 if (*cursor).1 == cols {
                     (*cursor).1 = 0;
@@ -918,10 +1349,101 @@ pub mod kearly_console {
 //
 // System Timer(s)
 //
-pub fn systimer_set_periodic(freq_hz: u16, isr_callback: IsrHandlerFn) {
-    isr_register(0, isr_callback);
-    x86_pit::init(freq_hz);
+#[derive(Clone, Copy)]
+pub enum SysTimerDuration {
+    Seconds(u64),
+    Milliseconds(u64),
+    Microseconds(u64),
+    Nanoseconds(u64),
+    Ticks(u64)
 }
+
+pub enum SysTimerMode {
+    OneShot,
+    Periodic,
+    Disabled
+}
+
+// System-wide - Every core runs the same IRQ handler function
+
+
+pub struct SystemTimer {
+    mode: SysTimerMode
+}
+impl SystemTimer {
+    pub const fn new() -> Self {
+        Self{
+            mode: SysTimerMode::Disabled
+        }
+    }
+
+    // To be called once during kernel's serialized initialization to install a
+    // single IRQ handler. Every core will execute the same handler code, even
+    // though each having an individual timer (and set of events)
+    pub fn global_init(isr_callback: IsrHandlerFn) {
+        unsafe {
+            X86_LAPIC_TIMER_HANDLER = isr_callback;
+        }
+    }
+
+    // Per-CPU - Each CPU can configure a different mode for its timer
+    pub fn set_mode(&mut self, mode: SysTimerMode){
+        match mode {
+            SysTimerMode::OneShot   => {
+                THIS_LAPIC.borrow_mut().config_timer(33, false);
+            }
+            SysTimerMode::Periodic  => {
+                panic!("The SystemTimer doesn't support a periodic mode yet.");
+            }
+            SysTimerMode::Disabled  => {
+                THIS_LAPIC.borrow_mut().config_timer(33, true);
+            }
+        }
+        self.mode = mode;   
+    }
+
+    // Per-CPU - Sets the period of IRQs or the next IRQ to generate depending
+    // on the mode set for the timer.
+    pub fn arm(&self, duration: SysTimerDuration) {
+        match self.mode {
+            SysTimerMode::Disabled      => {},
+            SysTimerMode::OneShot       => {self.arm_one_shot(duration);}
+            SysTimerMode::Periodic      => {self.arm_periodic(duration);}
+        }
+    }
+
+    //
+    fn arm_one_shot(&self, d: SysTimerDuration) {
+        let tsc = THIS_TSC.borrow_mut();
+        let duration_tsc = match d {
+            SysTimerDuration::Ticks(t)          => {
+                t
+            },
+            SysTimerDuration::Seconds(s)        => {
+                s * tsc.freq_hz
+            },
+            SysTimerDuration::Milliseconds(ms)  => {
+                ((ms as f64 / 1_000.0) * tsc.freq_hz as f64) as u64
+            },
+            SysTimerDuration::Microseconds(us)  => {
+                ((us as f64 / 1_000_000.0) * tsc.freq_hz as f64) as u64
+            },
+            SysTimerDuration::Nanoseconds(ns)   => {
+                ((ns as f64 / 1_000_000_000.0) * tsc.freq_hz as f64) as u64
+            },
+        };
+        let target = tsc.read() + duration_tsc;
+        // log!("ARM({} ns) - duration tsc = {} target = {}\n",
+        //     duration, duration_tsc as u64, target);
+        THIS_LAPIC.borrow_mut().set_timer(target);
+    }
+
+    fn arm_periodic(&self, _p: SysTimerDuration) {
+        panic!("Not implemented yet!\n");
+    }
+}
+
+
 
 //
 // IRQ Interface
@@ -929,7 +1451,7 @@ pub fn systimer_set_periodic(freq_hz: u16, isr_callback: IsrHandlerFn) {
 type IsrHandlerFn = fn(u16);
 
 fn isr_default_imp(_: u16) { }
-
+static mut X86_LAPIC_TIMER_HANDLER: IsrHandlerFn = isr_default_imp;
 static mut X86_ISR_HANDLER: [IsrHandlerFn; 16] = [isr_default_imp; 16];
 
 pub fn irq_controller_init() {
@@ -978,7 +1500,7 @@ pub fn mmu_unmap_page(_virt_addr: usize) {
 //
 // Symmetric Multiprocessing Support
 //
-fn start_smp(max_cpus: usize) {
+fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
     let lapic_count;
     let lapic0 =  THIS_LAPIC.borrow_mut();
     {
@@ -1022,7 +1544,9 @@ fn start_smp(max_cpus: usize) {
         dbg!("\n");
         //// Initialize the LocaAPIC controller for BSP (CPU 0)
         for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
-            if lapic.cpu_id == 0 {
+            if lapic.lapic_id == bsp_cpu_id as u8 {
+                dbg!("BSP [{}] LAPIC ID: {} INITIALIZING\n",
+                    lapic.cpu_id, lapic.lapic_id);
                 lapic0.init(lapic, acpi.lapic_mmio);
                 break;
             }
@@ -1046,25 +1570,28 @@ fn start_smp(max_cpus: usize) {
     dbg!("MAX CPUs: {}\n", max_cpus);
     for i in 0..lapic_count as usize {
         let lapic_id;
+        let lapic_en;
         {
             let this_machine = THIS_MACHINE.lock();
-            lapic_id = (*this_machine).acpi_info.lapic[i].cpu_id;
+            lapic_id = (*this_machine).acpi_info.lapic[i].lapic_id;
+            lapic_en = (*this_machine).acpi_info.lapic[i].enabled;
+
         }
-        if lapic_id > 0 && lapic_id < max_cpus as u8 {
+        if lapic_id > 0 && lapic_id < max_cpus as u8 && lapic_en == true {
             let current_cpu_cnt = cpu_count();
-            dbg!("Senging INIT-SIPI to CPU[{}]\n", lapic_id);
+            dbg!("Senging INIT-SIPI to LAPIC[{}]\n", lapic_id);
             lapic0.send_init_ipi(lapic_id);
-            cpu_busywait(10_000_000); // Wait for the cpu to initialize (~10ms)
+            cpu_busywait_us(10_000); // Wait for the cpu to initialize (~10ms)
             lapic0.send_startup_ipi(lapic_id, 0x8); 
-            cpu_busywait(10_000_000); // Wait for the AP to initialize
+            cpu_busywait_us(1_000); // Wait for the AP to initialize
             if cpu_count() == current_cpu_cnt {
                 // Send another SIPI
-                dbg!("Sending another SIPI to CPU[{}]\n", lapic_id);
+                dbg!("Sending another SIPI to LAPIC[{}]\n", lapic_id);
                 lapic0.send_startup_ipi(lapic_id, 0x8);
             }
            
             loop {
-                cpu_busywait(1_000_000);
+                cpu_busywait_us(1_000);
                 if cpu_count() > current_cpu_cnt {break;}
             }
         }
@@ -1079,7 +1606,7 @@ fn start_smp(max_cpus: usize) {
     ////   corresponding driver is initialized!
     //// - route them to CPU0 by default.
     let ioapic0 = THIS_IOAPIC.borrow_mut();
-    let isr_vector_offset = 32; // See how IDT is set up in boot.S
+    let isr_vector_offset = 34; // See how IDT is set up in boot.S
     {
         let this_machine = THIS_MACHINE.lock();
         let acpi = &(*this_machine).acpi_info;
@@ -1092,7 +1619,7 @@ fn start_smp(max_cpus: usize) {
                              else {X86IoApic::POLARITY_HIGH},
                 if irq.lvl_trig {X86IoApic::TRIGGER_LEVEL}
                              else {X86IoApic::TRIGGER_EDGE},
-                false, 0
+                true, 0
             );
         }
     }
@@ -1207,28 +1734,47 @@ impl AcpiNmiMapping {
     }
 }
 
-fn x86_acpi_parse() -> Option<AcpiInfo>{
+fn x86_acpi_parse(rsdp:Option<usize>) -> Option<AcpiInfo>{
     // 1) Find "RSD PTR " in low memory - on a 
-    let mut ptr: *mut u64 = 400 as *mut u64;
     let mut valid_rsdp = false;
-
-    for _i in 0..0x20000 {
-        unsafe {
-            if *ptr == 0x2052545020445352 { 
-                valid_rsdp = true;
-                break;
+    let mut ptr: *mut u64;
+    match rsdp {
+        Some(addr) => {
+            // RSD PTR already provided by the bootloader/EFI firmware
+            ptr = addr as *mut u64;
+            unsafe {
+                if *ptr == 0x2052545020445352 {
+                    valid_rsdp = true;
+                }
             }
-            ptr = ptr.wrapping_add(2); // 16-byte boundary
+        }
+        None => {
+            // Have to search for the pointer in the lower memory
+            ptr = 400 as *mut u64;
+            for _i in 0..0x20000 {
+                unsafe {
+                    if *ptr == 0x2052545020445352 { 
+                        valid_rsdp = true;
+                        break;
+                    }
+                    ptr = ptr.wrapping_add(2); // 16-byte boundary
+                }
+            }
         }
     }
+
     if valid_rsdp == false {
         return None;
     }
+
     let mut ret = AcpiInfo::new();
-    // 2) Find RSDT (RSD[16] as u32)
-    // FORMAT OF THE ROOT RSDT
+    let mut sdt: *mut u32;
+    let num_tables: u32;
+    let addr_size;
+    // 2) Find RSDT/XSDT (RSD[16] as u32)
+    // FORMAT OF THE (X)ROOT SDT
     // OFF TYPE&NAME
-    // 0   char Signature[4]; <-- "RSDT"
+    // 0   char Signature[4]; <-- "RSDT"/"XSDT"
     // 4   uint32_t Length;   <-- Total size of the table including this header
     // 8   uint8_t Revision;
     // 9   uint8_t Checksum;
@@ -1242,28 +1788,38 @@ fn x86_acpi_parse() -> Option<AcpiInfo>{
     // ....
     // u32 address of the last SDT
     unsafe {
-
-        let mut rsdt: *mut u32 = *(ptr.wrapping_add(2)) as *mut u32;
-        let num_tables : u32 = (*rsdt.wrapping_add(1) - 36) / 4;
-        // let acpi_ver: u8 = *(rsdt.wrapping_add(2) as *mut u8);
-        // archlog!("ACPI v{} (RSDT) @{:p}. SIG: {:X}, LEN:{} #TBLS: {}\n", 
-        //             acpi_ver, rsdt, *rsdt, *(rsdt.wrapping_add(1)), num_tables);
-        rsdt = rsdt.wrapping_add(9);
+        let rev = *((ptr as *mut u8).wrapping_add(15));
+        if rev == 0 {
+            // REVISION 1 - RSDT
+            sdt = *(ptr.wrapping_add(2)) as *mut u32;
+            addr_size = 4; // Addrs are 32-bit
+        } else if rev == 2 {
+            sdt = *((ptr.wrapping_add(3))) as *mut u32;
+            addr_size = 8; // Addrs are 64-bit            
+        } else {
+            dbg!("ACPI REVISION UNKNOWN ({})\n", rev);
+            return None;
+        }
+        num_tables = (*sdt.wrapping_add(1) - 36) / addr_size; 
+        dbg!("ACPI REVISION {} - Root Table @ {:p} - RSDT Length: {} ({} tables)\n",
+                rev, sdt, *sdt.wrapping_add(1), num_tables
+        );
+        
+        sdt = sdt.wrapping_add(9);
         for _ in 0..num_tables {
-            let sdt: *mut u32 = *rsdt as *mut u32;
+            let tbl: *mut u32 = *sdt as *mut u32;
             // System Description Table header signatures to look for:
             // "APIC" = 0x43495041 => MADT (Multi-APIC Description Table)
             // "FACP" = 0x50434146 => FADT (Fixed ACPI Description Table)
             // "HPET" = 0x54455048 => HPET (High Resolution Event Timer)
-            match *sdt {
-                0x43495041 => x86_acpi_parse_madt(&mut ret, sdt as u32), 
-                0x50434146 => x86_acpi_parse_facp(&mut ret, sdt as u32),
-                0x54455048 => x86_acpi_parse_hpet(&mut ret, sdt as u32),
-                _ => ()
+            match *tbl {
+                0x43495041  => x86_acpi_parse_madt(&mut ret, tbl as u32), 
+                0x50434146  => x86_acpi_parse_facp(&mut ret, tbl as u32),
+                0x54455048  => x86_acpi_parse_hpet(&mut ret, tbl as u32),
+                _           => ()
             };
-            rsdt = rsdt.wrapping_add(1);
-
-        }
+            sdt = sdt.wrapping_add(addr_size as usize / 4);
+        }    
     }
     Some(ret)
 }
@@ -1453,7 +2009,7 @@ impl TaskContext {
         (task.ep)();
         // Terminate the task
         task.state = Self::STATE_DEAD;
-        sched::terminate_task();
+        SCHEDULER.borrow().terminate_task();
         panic!("Continued a dead task's code where it have been unreachable!");
     }
 }
@@ -1475,9 +2031,9 @@ pub fn cpu_start_first_task(task: &mut TaskContext) {
     }
 }
 
-pub fn cpu_switch_context(from: &mut TaskContext, to: &mut TaskContext) {
+pub fn cpu_switch_context(from: &TaskContext, to: &TaskContext) {
     unsafe{
-        switch_context(from as *mut TaskContext as usize,
-                        to as *mut TaskContext as usize);
+        switch_context(from as *const TaskContext as usize,
+                        to as *const TaskContext as usize);
     }
 }

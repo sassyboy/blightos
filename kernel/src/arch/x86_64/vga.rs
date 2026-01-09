@@ -1,4 +1,4 @@
-use crate::arch::MultibootInfo;
+use crate::arch::{Multiboot2FrameBuffer, Multiboot2VBE};
 
 ///
 /// Basic VBE (VESA BIOS Extension) Graphics Driver for x86_64
@@ -6,7 +6,7 @@ use crate::arch::MultibootInfo;
 /// 
 
 #[derive(Clone, Copy)]
-pub enum VBEFrameBufferType{
+enum VBEFrameBufferType{
     Indexed { 
         palette_addr:       u32,
         num_colors:         u16
@@ -27,7 +27,7 @@ pub enum VBEFrameBufferType{
 }
 
 #[derive(Clone, Copy)]
-pub struct VBEFrameBuffer {
+struct VBEFrameBuffer {
     base_address:   u64,
     pitch:          u32,    // total # of bytes in one horizontal line
     width:          u32,    // in pixels
@@ -36,9 +36,13 @@ pub struct VBEFrameBuffer {
     type_color:     VBEFrameBufferType, // Type and Color information
 
 }
+pub type RGB = (u8, u8, u8);
 
+//
+// Basic struct to set/access VESA Bios Extension
+//
 #[derive(Clone, Copy)]
-struct VBEInfo {
+pub struct VESAContext {
     control_info:       u32,
     mode_info:          u32,
     mode:               u16,
@@ -50,7 +54,10 @@ struct VBEInfo {
     background_rgb:     RGB,
     foreground_rgb:     RGB,
 }
-impl VBEInfo {
+impl VESAContext {
+	//
+	// Public Interface
+	//
     pub const fn new() -> Self {
         Self {
             control_info:       0,
@@ -71,201 +78,168 @@ impl VBEInfo {
             foreground_rgb:     (200, 200, 200),
         }
     }
-}
 
-static mut VBE: VBEInfo = VBEInfo::new();
+	pub fn init_from_mb2(&mut self, vbe: Option<&Multiboot2VBE>, 
+									fb: Option<&Multiboot2FrameBuffer>) {
+		match vbe {
+			Some(inp) 	=> {
+        		self.control_info        = 0; // TODO
+        		self.mode_info           = 0; // TODO
+        		self.mode                = inp.mode;
+        		self.interface_segment   = inp.interface_seg;
+        		self.interface_offset    = inp.interface_off;
+        		self.interface_length    = inp.interface_len;
+			}
+			_			=> {}
+		}
 
-pub type RGB = (u8, u8, u8);
-
-pub fn vbe_init(mbi: &MultibootInfo) {
-    unsafe {
-        VBE.control_info        = mbi.vbe_control_info;
-        VBE.mode_info           = mbi.vbe_mode_info;
-        VBE.mode                = mbi.vbe_mode;
-        VBE.interface_segment   = mbi.vbe_interface_seg;
-        VBE.interface_offset    = mbi.vbe_interface_off;
-        VBE.interface_length    = mbi.vbe_interface_len;
-        VBE.frame_buffer.base_address   = mbi.framebuffer_addr;
-        VBE.frame_buffer.pitch          = mbi.framebuffer_pitch;
-        VBE.frame_buffer.width          = mbi.framebuffer_width;
-        VBE.frame_buffer.height         = mbi.framebuffer_height;
-        VBE.frame_buffer.bpp            = mbi.framebuffer_bpp;
-        VBE.frame_buffer.type_color = match mbi.framebuffer_type {
-            2 => {VBEFrameBufferType::Text},
-            1 => {VBEFrameBufferType::RGB { 
-                red_field_position:     mbi.framebuffer_color_info[0],
-                red_mask_size:          mbi.framebuffer_color_info[1],
-                green_field_position:   mbi.framebuffer_color_info[2],
-                green_mask_size:        mbi.framebuffer_color_info[3],
-                blue_field_position:    mbi.framebuffer_color_info[4],
-                blue_mask_size:         mbi.framebuffer_color_info[5]}},
-            0 => {VBEFrameBufferType::Indexed { // Not supported for now
-                palette_addr: 0,
-                num_colors:   0 }},
-            _ => {VBEFrameBufferType::None}
-        }
+		match fb {
+			Some(inp)	=> {
+        		self.frame_buffer.base_address   = inp.addr;
+        		self.frame_buffer.pitch          = inp.pitch;
+        		self.frame_buffer.width          = inp.width;
+        		self.frame_buffer.height         = inp.height;
+        		self.frame_buffer.bpp            = inp.bpp;
+        		self.frame_buffer.type_color = match inp.fbtype {
+           			2 => {VBEFrameBufferType::Text},
+           			1 => {VBEFrameBufferType::RGB { 
+               			red_field_position:     inp.color_info[0],
+               			red_mask_size:          inp.color_info[1],
+              			green_field_position:   inp.color_info[2],
+              			green_mask_size:        inp.color_info[3],
+               			blue_field_position:    inp.color_info[4],
+               			blue_mask_size:         inp.color_info[5]}},
+           			0 => {VBEFrameBufferType::Indexed { // Not supported for now
+               			palette_addr: 0,
+               			num_colors:   0 }},
+           			_ => {VBEFrameBufferType::None}
+        		}
+			}
+			_ => {}
+		}
+    	// Map the buffer memory
+	}
+	pub fn mode_number(&self) -> u16 {
+        self.mode
     }
-    // Map the buffer memory
-    // Clear the screen to a default color
-}
-
-//
-// Public Interface
-//
-pub fn vbe_mode_number() -> u16 {
-    unsafe {
-        VBE.mode
+	pub fn screen_size(&self) -> (u32, u32) {
+        (self.frame_buffer.height, self.frame_buffer.width)
     }
-}
-
-pub fn vbe_screen_size() -> (u32, u32) {
-    unsafe {
-        (VBE.frame_buffer.height, VBE.frame_buffer.width)
-    }
-}
-
-pub fn vbe_font_size() -> (u32, u32) {
-    unsafe {
-        match VBE.frame_buffer.type_color {
+	pub fn font_size(&self) -> (u32, u32) {
+        match self.frame_buffer.type_color {
             VBEFrameBufferType::Text => (1, 1),
             VBEFrameBufferType::RGB{red_field_position: _, red_mask_size: _,
                                     green_field_position: _, green_mask_size: _,
                                     blue_field_position: _, blue_mask_size: _}
                                     => (20, 10),
-            _ => (0, 0)
+            _ 						=> (0, 0)
         }
     }
-}
-
-pub fn vbe_set_background_rgb(bg: RGB) {
-    unsafe {
-        VBE.background_rgb = bg;
+	pub fn set_background_rgb(&mut self, bg: RGB) {
+        self.background_rgb = bg;
     }
-}
-
-pub fn vbe_set_foreground_rgb(fg: RGB) {
-    unsafe {
-        VBE.foreground_rgb = fg;
+	pub fn set_foreground_rgb(&mut self, fg: RGB) {
+        self.foreground_rgb = fg;
     } 
-}
-
-pub fn vbe_clean_screen(){
-    unsafe {
-        match VBE.frame_buffer.type_color {
-            VBEFrameBufferType::Text => {clean_screen_text_mode();},
+	pub fn clean_screen(&mut self) {
+        match self.frame_buffer.type_color {
+            VBEFrameBufferType::Text => {self.clean_screen_text_mode();},
             VBEFrameBufferType::RGB{red_field_position: _, red_mask_size: _,
                                     green_field_position: _, green_mask_size: _,
                                     blue_field_position: _, blue_mask_size: _}
-                                    => {clean_screen_rgb_mode();},
-            _ => ()
+                                    => {self.clean_screen_rgb_mode();},
+            _ 						=> ()
         };
     }
-}
-
-pub fn vbe_putc(c: u8, row: u32, col: u32){
-    unsafe {
-        match VBE.frame_buffer.type_color {
+	pub fn putc(&mut self, c: u8, row: u32, col: u32) {
+        match self.frame_buffer.type_color {
             VBEFrameBufferType::Text => {
-                putc_text_mode(c, row, col);
+                self.putc_text_mode(c, row, col);
             },
             VBEFrameBufferType::RGB{red_field_position: _, red_mask_size: _,
                                     green_field_position: _, green_mask_size: _,
                                     blue_field_position: _, blue_mask_size: _}
                                     => {
-                putc_rgb_mode(c, row, col);
+                self.putc_rgb_mode(c, row, col);
             },
-            _ => ()
+            _ 						=> ()
         };
     }
-}
-
-//
-// Text Mode Implementation
-// 
-
-fn clean_screen_text_mode() {
-    let fill : u16 = 0x1f00 | b' ' as u16;
-    unsafe {
-        let mut ptr: *mut u16 = VBE.frame_buffer.base_address as *mut u16;
-        for _ in 0..80*25 {
-            *ptr = fill;
-            ptr = ptr.wrapping_add(1);
-        }
-    }
-}
-
-fn putc_text_mode(c: u8, row: u32, col: u32) {
-    let color_byte: u16 = 0x1f00;
-    unsafe {
-        let mut ptr: *mut u16 = VBE.frame_buffer.base_address as *mut u16;
-        ptr = ptr.wrapping_add((row * 80 + col) as usize);
-        *ptr = c as u16 | color_byte;
-    }
-}
-
-//
-// RGB Mode Implementation
-//
-
-fn set_pixel(row: u32, col: u32, rgb: (u8, u8, u8)){
-    unsafe {
-        if VBE.frame_buffer.bpp != 32 && VBE.frame_buffer.bpp != 24 {
-            return; // Unsupported color depth
-        }
-        if row >= VBE.frame_buffer.height || col >= VBE.frame_buffer.width {
+	//
+	// Text Mode Implementation
+	// 
+	fn clean_screen_text_mode(&mut self) {
+    	let fill : u16 = 0x1f00 | b' ' as u16;
+    	unsafe {
+        	let mut ptr: *mut u16 = self.frame_buffer.base_address as *mut u16;
+        	for _ in 0..80*25 {
+            	*ptr = fill;
+            	ptr = ptr.wrapping_add(1);
+        	}
+    	}
+	}
+	fn putc_text_mode(&mut self, c: u8, row: u32, col: u32) {
+    	let color_byte: u16 = 0x1f00;
+    	unsafe {
+        	let mut ptr: *mut u16 = self.frame_buffer.base_address as *mut u16;
+        	ptr = ptr.wrapping_add((row * 80 + col) as usize);
+        	*ptr = c as u16 | color_byte;
+    	}
+	}
+	//
+	// RGB Mode Implementation
+	//
+	fn set_pixel(&mut self, row: u32, col: u32, rgb: (u8, u8, u8)){
+    	unsafe {
+        	if self.frame_buffer.bpp != 32 && self.frame_buffer.bpp != 24 {
+            	return; // Unsupported color depth
+        	}
+        	if row >= self.frame_buffer.height ||
+				col >= self.frame_buffer.width {
             return; // Out of bounds
-        }
+        	}
 
-        let pixel_offset = VBE.frame_buffer.base_address as usize + 
-                        VBE.frame_buffer.pitch as usize * row as usize +
-                        (VBE.frame_buffer.bpp as usize/8) * col as usize;
-        let mut bufp : *mut u8 = pixel_offset as *mut u8;
-        *bufp = rgb.2;
-        bufp = bufp.wrapping_add(1);
-        *bufp = rgb.1;
-        bufp = bufp.wrapping_add(1);
-        *bufp = rgb.0;
-    }
-}
-
-fn clean_screen_rgb_mode(){
-    let bg_color : RGB;
-    unsafe {
-        bg_color = VBE.background_rgb;
-    }
-
-    let (rows, cols) = vbe_screen_size();
-    for r in 0..rows {
-        for c in 0..cols {
-            set_pixel(r, c, bg_color);
-        }
-    }
-}
-
-fn putc_rgb_mode(c: u8, row: u32, col: u32) {
-    let bg_color : RGB;
-    let fg_color : RGB;
-    unsafe {
-        bg_color = VBE.background_rgb;
-        fg_color = VBE.foreground_rgb;
-    }
-
-    for y in 0..20 as u32 {
-        for x in 0..10 as u32 {
-            let font_map_index = (c as usize) * 40 + (y * 16 + x) as usize / 8;
-            if VGA_FONT10X20[font_map_index] & (1 << ((y * 16 + x) % 8)) > 0 {
-                // Background Pixel
-                set_pixel(row * 20 + y, col * 10 + x, fg_color);
-            } else {
-                set_pixel(row * 20 + y, col * 10 + x, bg_color);
-            }
-        }
-    }
+        	let pixel_offset = self.frame_buffer.base_address as usize + 
+                        	self.frame_buffer.pitch as usize * row as usize +
+                        	(self.frame_buffer.bpp as usize/8) * col as usize;
+        	let mut bufp : *mut u8 = pixel_offset as *mut u8;
+        	*bufp = rgb.2;
+        	bufp = bufp.wrapping_add(1);
+        	*bufp = rgb.1;
+        	bufp = bufp.wrapping_add(1);
+        	*bufp = rgb.0;
+    	}
+	}
+	fn clean_screen_rgb_mode(&mut self){
+    	let (rows, cols) = self.screen_size();
+    	for r in 0..rows {
+        	for c in 0..cols {
+            	self.set_pixel(r, c, self.background_rgb);
+        	}
+    	}
+	}
+	fn putc_rgb_mode(&mut self, c: u8, row: u32, col: u32) {
+    	for y in 0..20 as u32 {
+        	for x in 0..10 as u32 {
+            	let fmi = (c as usize) * 40 + (y * 16 + x) as usize / 8;
+            	if VGA_FONT10X20[fmi] & (1 << ((y * 16 + x) % 8)) > 0 {
+                	self.set_pixel(row * 20 + y, col * 10 + x, 
+									self.foreground_rgb);
+            	} else {
+                	self.set_pixel(row * 20 + y, col * 10 + x,
+									self.background_rgb);
+            	}
+        	}
+    	}
+	}
 }
 
 //
 // BITMAP OF ASCII CHARACTERS TO DRAW IN RGB VGA MODE
 //
+// 40 bytes per character
+// 20 rows, 2 bytes per row
+// 10 columns per row, 1 bit per column
 const VGA_FONT10X20: [u8; 10240] = [
 	0x0, 0x0,
 	0x0, 0x0,

@@ -5,8 +5,6 @@
  * Entry-Point from a multiboot bootloader which switches the BSP processor to
  * Long mode and calls x64init() in kstub.c
  *
- * Change Log:
- * 12/25/25 - Sasan Golchin - Creation.
  */
 
 .code32
@@ -15,19 +13,39 @@
 .globl boot_start
 boot_start:
   jmp bsp_start32
-  /* Multiboot header -- Safe to place this header in 1st page of memory for GRUB */
-  .align 4
-  .long 0x1BADB002 /* Multiboot magic number */
-  .long 0x00000007 /* Align modules to 4KB, req. mem size, req video mode init*/
-                   /* See 'info multiboot' for further info */
-  .long 0xE4524FF7 /* Checksum */
-  .long 0, 0, 0, 0, 0
-#if STDOUT_EGA_TEXT
-  .long 1          /* Graphics mode : 0=Linear Graphics, 1=EGA Text */
-#elif STDOUT_VGA_RGB
+
+/* Multiboot 2.0 Header - Section 3.1 - OS Image Format
+ * - Must appear in the first 32KB of the kernel image.
+ * - The header and each tag must be 8-byte aligned
+ */
+.align 8
+_mb2h_start:
+  .long 0xE85250D6                                /* magic */
+  .long 0x00000000                                /* Arch - 0: i386 */
+  .long _mb2h_end - _mb2h_start                   /* Header Length (bytes) */
+  .long -(0xE85250D6 + (_mb2h_end - _mb2h_start)) /* Checksum */
+  
+/* Framebuffer Tag (type 5, len 20) */
+_mb2h_framebuffer:
+  .short 5  
+  .short 1  /* Optional - Bootloader is free to choose any mode */
+  .long  _mb2h_frambuffer_end - _mb2h_framebuffer
+#ifdef STDOUT_VGA_RGB
+  .long  VGA_RGB_WIDTH
+  .long  VGA_RGB_HEIGHT
+  .long  32 /* color depth */
+#else
+  .long 80
+  .long 25
   .long 0
-  .long VGA_RGB_WIDTH, VGA_RGB_HEIGHT, 24 /* Resolution and color depth */
 #endif
+_mb2h_frambuffer_end:
+_mb2h_null:
+.align 8
+  .short  0
+  .short  0
+  .long   8
+_mb2h_end:
 
 .text
 bsp_start32:
@@ -277,6 +295,18 @@ excep_simd_fp:
   RESTORE_CALLER_SAVED
   iretq
 
+sys_handler:
+  STORE_CALLER_SAVED
+  call    ksyscall_handler
+  RESTORE_CALLER_SAVED
+	iretq
+
+irq_lvt_timer:
+  STORE_CALLER_SAVED
+  call    kirq_lvt_timer
+  RESTORE_CALLER_SAVED
+  iretq
+
 irq_handler0:
   CALL_KIRQ_HANDLER 0
 	iretq
@@ -340,12 +370,6 @@ irq_handler14:
 irq_handler15:
   CALL_KIRQ_HANDLER 15
   iretq
-
-sys_handler:
-  STORE_CALLER_SAVED
-  call    ksyscall_handler
-  RESTORE_CALLER_SAVED
-	iretq
 
 /*******************************************************************************
  * Global Descriptor Table
@@ -441,6 +465,8 @@ idt_vectors:
   .quad   int_default
   .quad   int_default
   .quad   int_default
+  .quad   sys_handler     /* System call <- INT 0x20 */
+  .quad   irq_lvt_timer   /* LAPIC Timer interrupt <- 0x21 */
   .quad   irq_handler0
   .quad   irq_handler1
   .quad   irq_handler2
@@ -457,7 +483,6 @@ idt_vectors:
   .quad   irq_handler13
   .quad   irq_handler14
   .quad   irq_handler15
-  .quad   sys_handler
 
 /******************************************************************************
  * Task State Segment - One per CPU                                           *

@@ -13,11 +13,13 @@ pub mod arch;
 // Standard utilities
 #[macro_use]
 pub mod util;
+
+
 use core::sync::atomic::{AtomicBool, Ordering};
-
 use util::*;
-
 use crate::arch::*;
+use crate::sched::SCHEDULER;
+
 // Physical Memory Manager
 #[path = "mem/pmm.rs"]
 pub mod pmm;
@@ -39,71 +41,63 @@ static BSP_INITIALIZED : AtomicBool = AtomicBool::new(false);
 // resource allocation purposes).
 pub fn kstart(cpuid: usize, mmap_opt: Option<&[pmm::PMMapElement]>) {
     if cpuid == 0 {
-        let mmap : &[pmm::PMMapElement];
+        // BSP-only initialization
+        klog!("BlightOS - Number of CPUs online: {}\n", cpu_count());
+
         match mmap_opt {
-            Some(mmap_passed) => {mmap = mmap_passed;},
+            Some(mmap) => {
+                let kernel_start: usize;
+                let kernel_end: usize;
+                unsafe{
+                    kernel_start = &_KERNEL_START as *const usize as usize;
+                    kernel_end = &_KERNEL_END as *const usize as usize;
+                }
+                // Initialize the physical memory manager
+                pmm::pmm_init(mmap, kernel_start, kernel_end);
+            },
             _ => {panic!("No memory map was sent to the BSP!")}
         }
-        // BSP-only initialization
-        klog!("Number of CPUs online: {}\n", cpu_count());
-        // Print the E820 memory map
-        klog!("BlightOS - Physical Memory Map:\n");
-        for item in mmap {
-            klog!("{:016X} - {:016X}: {}\n",
-                item.base, item.base + item.len - 1,
-                match item.avail {
-                    true => "[USABLE]",
-                    false=> "[RESERV]"
-                }
-            );
-        }
-        // Print the kernel image range
-        let kernel_start: usize;
-        let kernel_end: usize;
-        unsafe{
-            kernel_start = &_KERNEL_START as *const usize as usize;
-            kernel_end = &_KERNEL_END as *const usize as usize;
-        }
-        klog!("Kernel Image [{:016X} - {:016X}], {:.2} MB\n",
-            kernel_start, kernel_end, 
-            ((kernel_end - kernel_start) as f64)/(1024 * 1024) as f64
-        );
+    
+        // Time keeping...
+        SystemTimer::global_init(systimer_irq_handler);
+        // Todo: Need an event timer to implement sleep, etc.
 
-        // Initialize the physical memory manager
-        pmm::pmm_init(); // Todo: simple bitmap of PAGE_SIZE should do
-
-        // Enable the interrupts and the system timer
-        arch::systimer_set_periodic(1000, ktick);
-        //arch::irq_controller_init();
-        arch::cpu_enable_ints();
-
+        // End of serialized kernel startup. Let APs start!
+        klog!("Launching 2 tasks per CPU to compete over the same counter and \
+                screen buffer...\n");
         BSP_INITIALIZED.store(true, Ordering::Relaxed);
-        // Todo Initialize the scheduler and spawn the init process
-        sched::new_task(0, idle_task);
-        sched::new_task(1, task1_exec);
-        sched::new_task(2, task2_exec);
 
+        // Create the inital task pool for this CPU
+        let sched = SCHEDULER.borrow_mut();
+        sched.config_round_robin(SysTimerDuration::Milliseconds(1));
+        sched.create_task(0, idle_task, 1);
+        sched.create_task(1, task1_exec, 2);
+        sched.create_task(2, task2_exec, 4);
         // Jump to the first task and never come back ;)
-        sched::start_scheduling(1);
-
+        sched.start_scheduling(1, 0);
     } else {
         // AP initialization
+
+        // Wait for BSP to perform the serialized portion of
+        // kernel's initializaton
         while BSP_INITIALIZED.load(Ordering::Relaxed) == false {
             core::hint::spin_loop();
         }
-        let cpuid = *THIS_CPU_ID.borrow();
-        loop {
-            klog!("<CPU{}>", cpuid);
-            cpu_busywait(1_000_000_000 * cpuid as u64);
-        }
+        // Create the inital task pool for this CPU
+        let sched = SCHEDULER.borrow_mut();
+        sched.config_round_robin(SysTimerDuration::Milliseconds(1));
+        sched.create_task(0, idle_task, 1);
+        sched.create_task(1, task1_exec, 2);
+        sched.create_task(2, task2_exec, 3);
+        // Jump to the first task!
+        sched.start_scheduling(1, 0);
     }
     panic!("Reached the end of kstart!");
 }
 
-fn ktick(_: u16){
-    // klog!("!");
-    sched::preempt();
-}
+fn systimer_irq_handler(_cpuid: u16){
+    SCHEDULER.borrow().preempt();
+}  
 
 pub fn dump_memory(base: usize, qwords: usize) {
     unsafe {
@@ -140,28 +134,35 @@ static SHARED_VAR : Spinlock<i32> = Spinlock::new(0);
 
 // TESTING...
 fn task1_exec() {
-    for _ in 0..20 {
+    let cpuid = *(THIS_CPU_ID.borrow());
+    loop {
         {
             let mut shared_var = SHARED_VAR.lock();
+            if *shared_var >= 100 {
+                break;
+            }
             *shared_var += 1;
-            arch::cpu_busywait(1_000_000);
-            klog!("<T1:{}>", *shared_var);
+            klog!("<C{}/T1:{}>", cpuid, *shared_var);
         }
-        arch::cpu_busywait(1_000_000);
-        
+        arch::cpu_busywait_us(10_000);
     }
 }
 
 fn task2_exec() {
-    sched::new_task(3, task3_exec);
-    for _ in 0..40 {
+    let cpuid = *(THIS_CPU_ID.borrow());
+    if cpuid == 0 {
+        SCHEDULER.borrow_mut().create_task(3, task3_exec, 1);
+    }
+    loop {
         {
             let mut shared_var = SHARED_VAR.lock();
+            if *shared_var >= 100 {
+                break;
+            }
             *shared_var += 1;
-            arch::cpu_busywait(500_000);
-            klog!("<T2:{}>", *shared_var);
+            klog!("<C{}/T2:{}>", cpuid, *shared_var);
         }
-        arch::cpu_busywait(500_000);
+        arch::cpu_busywait_us(20_000);
     }
 }
 
@@ -172,7 +173,11 @@ fn task3_exec() {
 fn idle_task() {
     // Halt puts the CPU in low-power mode and stops exection until there's an
     // interrupt. Each CPU should end up here if there is no task to run
-    klog!("<IDLE>");
+    let cpuid = *(THIS_CPU_ID.borrow());
+    {
+        SHARED_VAR.lock();
+        klog!("<CPU{}/IDLE>", cpuid);
+    }
     loop {
         arch::cpu_enable_ints();
         arch::cpu_halt();

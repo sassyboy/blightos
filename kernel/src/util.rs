@@ -24,6 +24,21 @@ macro_rules! klog {
 }
 
 //
+// Basic arithmetics
+//
+macro_rules! round_up {
+    ($num:expr, $multiple:expr) => {
+        (($num + $multiple - 1) / $multiple) * $multiple
+    };
+}
+
+macro_rules! round_down {
+    ($num:expr, $multiple:expr) => {
+        ($num / $multiple) * $multiple
+    };
+}
+
+//
 // Raw memory manipulation
 //
 #[inline(never)]
@@ -35,6 +50,14 @@ pub unsafe fn raw_memcpy(dst: usize, src: usize, n: usize) {
         *destp = *srcp;
         destp  = destp.wrapping_add(1);
         srcp   = srcp.wrapping_add(1); 
+    }
+}
+
+pub unsafe fn raw_memset(addr: usize, len: usize, filler: u8){
+    let mut destp : *mut u8 = addr as *mut u8;
+    for _i in 0..len {
+        *destp = filler;
+        destp  = destp.wrapping_add(1);
     }
 }
 

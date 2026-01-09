@@ -9,13 +9,15 @@ Install rust and the nightly `x86_64-unknown-none` toolchain, `gcc`,
 
 ---
 ## Features
-- Minimal x86_64 (64-bit/Long Mode) architecture support 
-- Basic 25x80 EGA-Text as the early/startup console
-- Legacy PIC and PIT support for now (will be replaced by APIC & HPET)
-- Minimal/Sad Round Robin task scheduler
+- Legacy BIOS and UEFI Multiboot-2 support
+- Minimal x86_64 (64-bit/Long Mode) architecture support
 - Minimal ACPI support for SMP enumeration
-- IOAPIC/LAPIC support (In progress...)
-- Symmetric Multiprocessing (In progress...)
+- Symmetric Multiprocessing (SMP)
+- IOAPIC and LAPIC support for SMP IRQ routing and per-cpu task preemption
+- Local FSFC and RR task schedulers
+- Flat 4GB PML-4 virtual memory
+- Bitmap-based physical memory allocator
+- Basic VESA Graphics support with built-in bitmap font rendering
 ---
 ## Screenshot
 ![Screenshot](https://github.com/sassyboy/blightos/blob/main/screenshot.png)
