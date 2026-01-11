@@ -8,14 +8,23 @@ PLATDIR=x86_64
 #
 RC=cargo build
 
-
-ifdef DEBUG
-	FEATURES+="debug_arch"
+ifeq ($(findstring all,$(DEBUG)),all)
+	FEATURES+=debug_arch,debug_pmm,debug_heap
+else
+	ifeq ($(findstring arch,$(DEBUG)),arch)
+		FEATURES+=debug_arch,
+	endif
+	ifeq ($(findstring pmm,$(DEBUG)),pmm)
+		FEATURES+=debug_pmm,
+	endif
+	ifeq ($(findstring heap,$(DEBUG)),heap)
+		FEATURES+=debug_heap,
+	endif
 endif
 
 #To generate Debug info: make FEATURES="debug_arch"
 ifdef FEATURES
-	RCFEATS=--features $(FEATURES)
+	RCFEATS=--features "$(FEATURES)"
 else
 	RCFEATS=
 endif

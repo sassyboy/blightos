@@ -5,13 +5,23 @@
 ///   Use this in the absence of the std library.
 ///
 
-use crate::{arch::{kearly_console, percpu_borrow, percpu_borrow_mut}, sched};
+use crate::arch::{kdebug_console, kearly_console};
+use crate::arch::{percpu_borrow, percpu_borrow_mut};
+use crate::sched;
 pub use core::fmt::Write;
 
 pub struct ConsoleOut;
 impl Write for ConsoleOut {
     fn write_str(&mut self, _s: &str) -> core::fmt::Result {
         kearly_console::print_str(_s.as_bytes());
+        Ok(())
+    }
+}
+
+pub struct DebugOut;
+impl Write for DebugOut {
+    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
+        kdebug_console::print_str(_s.as_bytes());
         Ok(())
     }
 }
@@ -98,7 +108,6 @@ macro_rules! percpu_global {
         )*
     };
 }
-pub(crate) use percpu_global;
 
 ///
 /// Provides a type-safe/thread-safe encapsulation of `percpu` variables defined 

@@ -7,24 +7,27 @@
 #![no_std]
 #![no_main]
 
+// Imports from the toolchain this is part of the toolchain
+extern crate alloc; 
+
 // Include all relevant kernel code here for everybody else to use
-// Architecture-dependent code
-pub mod arch;
-// Standard utilities
+//// Standard utilities ////
 #[macro_use]
 pub mod util;
-
+//// Architecture-dependent code ////
+pub mod arch;
+//// Various Memory Managers ////
+pub mod mem;
+//// Task Scheduler ////
+pub mod sched;
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use util::*;
 use crate::arch::*;
+use crate::mem::physical::pmm_num_free_frames;
 use crate::sched::SCHEDULER;
-
-// Physical Memory Manager
-#[path = "mem/pmm.rs"]
-pub mod pmm;
-// Task Scheduler
-pub mod sched;
 
 
 unsafe extern "C" {
@@ -34,12 +37,15 @@ unsafe extern "C" {
 
 static BSP_INITIALIZED : AtomicBool = AtomicBool::new(false);
 
+#[global_allocator]
+static ALLOCATOR: mem::heap::Kalloc = mem::heap::Kalloc::new();
+
 // kstart : Kernel's Generic Entry Point
 // This function will be called by all onlined CPUs (BSP with cpuid=0) in any
 // order, albeit only after all onlined CPUs have reported to the arch-specific
 // stub code so that the generic code has the correct CPU count (e.g., for 
 // resource allocation purposes).
-pub fn kstart(cpuid: usize, mmap_opt: Option<&[pmm::PMMapElement]>) {
+pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::physical::PMMapElement]>) {
     if cpuid == 0 {
         // BSP-only initialization
         klog!("BlightOS - Number of CPUs online: {}\n", cpu_count());
@@ -53,7 +59,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[pmm::PMMapElement]>) {
                     kernel_end = &_KERNEL_END as *const usize as usize;
                 }
                 // Initialize the physical memory manager
-                pmm::pmm_init(mmap, kernel_start, kernel_end);
+                mem::physical::pmm_init(mmap, kernel_start, kernel_end);
             },
             _ => {panic!("No memory map was sent to the BSP!")}
         }
@@ -125,7 +131,7 @@ pub fn panic(_info: &core::panic::PanicInfo) -> ! {
     } else {
         klog!("  LOCATION: {} @ ln {}\n", fname, ln);
     }
-    
+    klog!("  CPU: {}\n", arch::cpu_id());
     arch::cpu_halt();
     loop {}
 }
@@ -168,6 +174,31 @@ fn task2_exec() {
 
 fn task3_exec() {
     klog!("<THIS IS A LONG MESSAGE TO TEST THE CONSOLE PRINT_STR LOCK>");
+    cpu_busywait_us(1_000_000 * 3); // wait 3 seconds
+
+    klog!("\n[START] Heap Allocator Test - FREE FRAMES: {}\n",
+            pmm_num_free_frames());
+    {
+        let _myvar1: Box<usize> = Box::new(1234);
+        let _myvar2: Box<usize> = Box::new(2341);
+        let _myvar3: Box<usize> = Box::new(3412);
+        let _myvar4: Box<usize> = Box::new(4123);
+        let mut myvec: Vec<i32> = Vec::new();
+        for i in 0..1000 {
+            myvec.push(i);
+        }
+        klog!("[MIDPOINT] FREE FRAMES: {}\n", pmm_num_free_frames());
+        klog!("_myvars: {}, {}, {}, {}\n",
+                    *_myvar1, *_myvar2, *_myvar3, *_myvar4);
+        for i in 0..1000 {
+            if myvec[i] != i as i32 {
+                klog!("[FAIL] Vector element {} corrupted!\n", i);
+                break;
+            }
+        }
+    }
+    klog!("[FINISHED] Heap Allocator Test - FREE FRAMES: {}\n",
+            pmm_num_free_frames());    
 }
 
 fn idle_task() {
@@ -177,6 +208,9 @@ fn idle_task() {
     {
         SHARED_VAR.lock();
         klog!("<CPU{}/IDLE>", cpuid);
+        if cpuid == 0 {
+            klog!("FINAL FREE FRAMES: {}\n", pmm_num_free_frames());
+        }
     }
     loop {
         arch::cpu_enable_ints();

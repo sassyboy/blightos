@@ -5,7 +5,7 @@
 
 use core::arch::asm;
 use crate::arch::asc::vga::*;
-use crate::pmm::PMMapElement;
+use crate::mem::physical::PMMapElement;
 use crate::sched::SCHEDULER;
 use crate::util::*;
 use crate::{dump_memory, kstart};
@@ -25,44 +25,16 @@ impl Write for PortBasedUART {
     }
 }
 #[cfg(feature="debug_arch")]
-macro_rules! seriallog {
+macro_rules! x64dbg {
     ($($arg:tt)*) => {
-        let mut uart = PortBasedUART::new(0x3F8);
-        let _ = write!(&mut uart, $($arg)*);
+        let mut debug_console = DebugOut;
+        let _ = write!(&mut debug_console, "[X64] ");
+        let _ = write!(&mut debug_console, $($arg)*);
     };
 }
 #[cfg(not(feature="debug_arch"))]
-macro_rules! seriallog {
+macro_rules! x64dbg{
     ($($arg:tt)*) => { };
-}
-
-
-// VGA/EGA Debugging & Logging
-struct ArchDebugConsole;
-impl Write for ArchDebugConsole {
-    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
-        kearly_console::print_str(_s.as_bytes());
-        Ok(())
-    }
-}
-
-#[cfg(feature="debug_arch")]
-macro_rules! dbg {
-    ($($arg:tt)*) => {
-        let mut kern_console = ArchDebugConsole{};
-        let _ = write!(&mut kern_console, $($arg)*);
-    };
-}
-#[cfg(not(feature="debug_arch"))]
-macro_rules! dbg {
-    ($($arg:tt)*) => { };
-}
-
-macro_rules! log {
-    ($($arg:tt)*) => {
-        let mut kern_console = ArchDebugConsole{};
-        let _ = write!(&mut kern_console, $($arg)*);
-    };
 }
 
 
@@ -220,13 +192,13 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     // Enumerate Muliboot 2 tags
     // Use the default serial port for debugging since VESA is not yet enabled
     PortBasedUART::new(0x3F8).config();
-    seriallog!("MULTIBOOT2 BASE: {:X}\n", mb2info_base);
+    x64dbg!("MULTIBOOT2 BASE: {:X}\n", mb2info_base);
     let mut total_size: usize;
     let mut tag_base: *mut u8 = (mb2info_base + 8) as *mut u8;
     unsafe {
         total_size = *(mb2info_base as *mut u32) as usize;
     }
-    seriallog!("TOTAL SIZE: {}\n",total_size);
+    x64dbg!("TOTAL SIZE: {}\n",total_size);
     while total_size > 0 {
         let tag: *mut Multiboot2Tag = tag_base as *mut Multiboot2Tag;
         let tag_size: usize;
@@ -236,7 +208,7 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
             tag_type = (*tag).ttype;
         }
         let tag_pad  = tag_base.wrapping_add(tag_size).align_offset(8);
-        seriallog!("TAG TYPE: {} SIZE: {} (Left: {})\n",
+        x64dbg!("TAG TYPE: {} SIZE: {} (Left: {})\n",
                     tag_type as u32, tag_size, total_size);
         match tag_type {
             Mulitboot2TagType::ACPIOld          => {
@@ -266,7 +238,7 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
                     ent_size = (*tag).tdata.mem_map.entry_size as usize;
                 } 
                 mem_map_count = (tag_size - 8) / ent_size;
-                seriallog!("MEMMAP - ENT_SIZE: {}, COUNT: {}\n", 
+                x64dbg!("MEMMAP - ENT_SIZE: {}, COUNT: {}\n", 
                         ent_size, mem_map_count);
                 let mut ent = (tag as usize + 16) as *mut Multiboot2MemoryMapEntry;
                 for i in 0..32 {
@@ -310,7 +282,7 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
         mode = (*vesa).mode_number();
     }
     kearly_console::init();
-    log!("VESA Graphics: Mode=0x{:X}, Rows:{}, Columns:{}\n", mode, rows, cols);
+    klog!("VESA Graphics: Mode=0x{:X}, Rows:{}, Columns:{}\n", mode, rows, cols);
 
     // Todo - fetch kernel's boot command-line/parameters
     // Todo - Pass a list kernel modules (e.g., ramdisk) Grub loaded for us
@@ -335,7 +307,7 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
             start_smp(bsp_cpu_id, max_cpus);
         },
         None => {
-            dbg!("No ACPI information found. Multiprocessing disabled.\n");
+            x64dbg!("No ACPI information found. Multiprocessing disabled.\n");
         }
     };
     // Start the kernel.
@@ -362,7 +334,7 @@ extern "C" fn rust_x864_entry_ap(_arg: usize) {
         (*this_machine).cpu_count += 1;
     }
     
-    dbg!("CPU[{}] calling kstart\n", THIS_CPU_ID.borrow());
+    x64dbg!("CPU[{}] calling kstart\n", THIS_CPU_ID.borrow());
     // Initialize the LAPIC for the current CPU
 
     // Start the kernel for this AP
@@ -556,11 +528,11 @@ fn percpu_init_sections() {
         let pcpu_s:usize = &_KERNEL_PERCPU_START as *const usize as usize;
         let pcpu_e:usize = &_KERNEL_PERCPU_END as *const usize as usize;
         if sect_size < 1 {
-            dbg!("NO PERCPU VARIABLE!\n");
+            x64dbg!("NO PERCPU VARIABLE!\n");
             return;
         }
         let nsects  = (pcpu_e - pcpu_s) / sect_size;
-        dbg!("PERCPU: VMA {:X} bytes starting @ 0, LMA[{:X} - {:X}], #Copies: {}\n",
+        x64dbg!("PERCPU: VMA {:X} bytes starting @ 0, LMA[{:X} - {:X}], #Copies: {}\n",
             sect_size, pcpu_s, pcpu_e, nsects);
         for s in 1..nsects {
             raw_memcpy(pcpu_s + s * sect_size, pcpu_s, sect_size);
@@ -796,7 +768,7 @@ impl X86TimeStampCounter {
                 // ECX -> Core Crysctal Freq (Could be Zero)
                 // TSC_frequency = ECX * EBX/EAX
                 (eax, ebx, ecx, _) = x86_cpuid_inst(0x15, 0);
-                dbg!("CPUID.15H - EAX: {} EBX {} ECX: {}\n", eax, ebx, ecx);
+                x64dbg!("CPUID.15H - EAX: {} EBX {} ECX: {}\n", eax, ebx, ecx);
                 if ecx == 0 && cpu_family == 0x6 {
                     // Core Crystal Clock Freq is not enumerated, but we can
                     // look it up base on the model. According to Intel's SDM:
@@ -824,7 +796,7 @@ impl X86TimeStampCounter {
                     // TSC is supported, has a constant frequency, which is
                     // enumerated here!
                     self.enabled = true;
-                    dbg!("INVARIANT TSC FREQ: {} - EAX: {} EBX {} ECX: {}\n",
+                    x64dbg!("INVARIANT TSC FREQ: {} - EAX: {} EBX {} ECX: {}\n",
                             self.freq_hz, eax, ebx, ecx);
 
                     // Also approximate it:
@@ -846,7 +818,7 @@ impl X86TimeStampCounter {
                     let tsc_overhead1 = cpu_read_timestamp();
                     self.freq_hz = (end_tsc - start_tsc - (tsc_overhead1-end_tsc)*2) * 10;
                     self.enabled = true;
-                    dbg!("INVARIANT TSC FREQ APPROX: {} HZ\n", self.freq_hz);
+                    x64dbg!("INVARIANT TSC FREQ APPROX: {} HZ\n", self.freq_hz);
                 }
             } else {
                 panic!("Processor too old - Invariant TSC not supported\n");
@@ -943,7 +915,7 @@ impl X86IoApic {
         self.version = (ver & 0xFF) as u8;
         self.max_irqs= ((ver >> 16) & 0xFF) as u8 + 1;
 
-        dbg!("IOAPIC init => ID:{} MMIO: {:X} Ver:{} Max IRQs:{}\n", 
+        x64dbg!("IOAPIC init => ID:{} MMIO: {:X} Ver:{} Max IRQs:{}\n", 
             self.acpi_id, self.mmio_base, self.version, self.max_irqs
         );
     }
@@ -1298,6 +1270,14 @@ impl PortBasedUART {
 
 }
 
+pub mod kdebug_console {
+    use crate::arch::PortBasedUART;
+    pub fn print_str(msg: &[u8]) {
+        let uart = PortBasedUART::new(0x3F8);
+        uart.puts(msg);
+    }
+}
+
 //
 // Initial/Boot-time Console
 // VGA/80x24TXT mode
@@ -1433,8 +1413,6 @@ impl SystemTimer {
             },
         };
         let target = tsc.read() + duration_tsc;
-        // log!("ARM({} ns) - duration tsc = {} target = {}\n",
-        //     duration, duration_tsc as u64, target);
         THIS_LAPIC.borrow_mut().set_timer(target);
     }
 
@@ -1510,23 +1488,23 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
         let acpi = &(*this_machine).acpi_info;
         // Print what we found on ACPI tables if compiled with debug_arch
         // CPUs/LAPICS
-        dbg!("LAPIC MMIO @ {:X}\n", acpi.lapic_mmio);
+        x64dbg!("LAPIC MMIO @ {:X}\n", acpi.lapic_mmio);
         for _lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
-            dbg!("CPU[{}]: LAPIC ID: {}, Enabled: {}\n",
+            x64dbg!("CPU[{}]: LAPIC ID: {}, Enabled: {}\n",
                 _lapic.cpu_id,
                 _lapic.lapic_id,
                 _lapic.enabled
             );
         }
         // IOAPIC
-        dbg!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
+        x64dbg!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
             acpi.ioapic.ioapic_id,
             acpi.ioapic.ioapic_mmio,
             acpi.ioapic.gsi_base
         );
         // IRQ->GSI mappings
         for _irq in &acpi.irq_map[..acpi.irq_map_cnt as usize] {
-            dbg!("<IRQ#{}.{} -> GSI#{} ON {}{}> ",
+            x64dbg!("<IRQ#{}.{} -> GSI#{} ON {}{}>\n",
                 _irq.src_bus, _irq.src_irq, _irq.dst_gsi,
                 if _irq.active_low {"Low"} else {"High"},
                 if _irq.lvl_trig {"Level"} else {"Edge"}
@@ -1534,18 +1512,18 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
         }
         // NMI->LINT mappings
         for _i in 0..acpi.nmi_map_cnt as usize {
-            dbg!("<NMI.CPUS[{:X}] -> LINT#{} ON {}{}> ",
+            x64dbg!("<NMI.CPUS[{:X}] -> LINT#{} ON {}{}> ",
                 acpi.nmi_map[_i].cpu_id_mask,
                 acpi.nmi_map[_i].lint_vector,
                 if acpi.nmi_map[_i].active_low {"Low"} else {"High"},
                 if acpi.nmi_map[_i].lvl_trig {"Level"} else {"Edge"}
             );
         }
-        dbg!("\n");
+        x64dbg!("\n");
         //// Initialize the LocaAPIC controller for BSP (CPU 0)
         for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
             if lapic.lapic_id == bsp_cpu_id as u8 {
-                dbg!("BSP [{}] LAPIC ID: {} INITIALIZING\n",
+                x64dbg!("BSP [{}] LAPIC ID: {} INITIALIZING\n",
                     lapic.cpu_id, lapic.lapic_id);
                 lapic0.init(lapic, acpi.lapic_mmio);
                 break;
@@ -1567,7 +1545,7 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
     }
     //// 2) Send INIT-SIPI_SIPI for each AP and check the magic# on their stack
     ////    That would indicate the completion of their trampoline code.
-    dbg!("MAX CPUs: {}\n", max_cpus);
+    x64dbg!("MAX CPUs: {}\n", max_cpus);
     for i in 0..lapic_count as usize {
         let lapic_id;
         let lapic_en;
@@ -1579,14 +1557,14 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
         }
         if lapic_id > 0 && lapic_id < max_cpus as u8 && lapic_en == true {
             let current_cpu_cnt = cpu_count();
-            dbg!("Senging INIT-SIPI to LAPIC[{}]\n", lapic_id);
+            x64dbg!("Senging INIT-SIPI to LAPIC[{}]\n", lapic_id);
             lapic0.send_init_ipi(lapic_id);
             cpu_busywait_us(10_000); // Wait for the cpu to initialize (~10ms)
             lapic0.send_startup_ipi(lapic_id, 0x8); 
             cpu_busywait_us(1_000); // Wait for the AP to initialize
             if cpu_count() == current_cpu_cnt {
                 // Send another SIPI
-                dbg!("Sending another SIPI to LAPIC[{}]\n", lapic_id);
+                x64dbg!("Sending another SIPI to LAPIC[{}]\n", lapic_id);
                 lapic0.send_startup_ipi(lapic_id, 0x8);
             }
            
@@ -1797,11 +1775,11 @@ fn x86_acpi_parse(rsdp:Option<usize>) -> Option<AcpiInfo>{
             sdt = *((ptr.wrapping_add(3))) as *mut u32;
             addr_size = 8; // Addrs are 64-bit            
         } else {
-            dbg!("ACPI REVISION UNKNOWN ({})\n", rev);
+            x64dbg!("ACPI REVISION UNKNOWN ({})\n", rev);
             return None;
         }
         num_tables = (*sdt.wrapping_add(1) - 36) / addr_size; 
-        dbg!("ACPI REVISION {} - Root Table @ {:p} - RSDT Length: {} ({} tables)\n",
+        x64dbg!("ACPI REVISION {} - Root Table @ {:p} - RSDT Length: {} ({} tables)\n",
                 rev, sdt, *sdt.wrapping_add(1), num_tables
         );
         
@@ -1885,7 +1863,7 @@ fn x86_acpi_parse_madt(acpi: &mut AcpiInfo, madt_addr: u32) {
                     nmi_cnt += 1;
                 }
                 _ => {
-                    dbg!("MADT Entry T[{}] Ignored\n ",entry_type);
+                    x64dbg!("MADT Entry T[{}] Ignored\n ",entry_type);
                 }
             };
             entry_addr += entry_len as u32;

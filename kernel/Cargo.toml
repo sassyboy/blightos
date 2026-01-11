@@ -8,5 +8,11 @@ crate-type = ["staticlib"]
 name = "kernel"
 path = "src/kernel.rs"
 
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+
+
 [features]
 debug_arch = []
+debug_pmm  = []
+debug_heap = []

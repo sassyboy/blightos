@@ -31,7 +31,7 @@ clean:
 run: $(BOOT_IMG)
 	@qemu-system-x86_64 -enable-kvm -smp 4 -m 512M \
 	-cpu host,migratable=no,+invtsc,+tsc-deadline \
-	-serial stdio \
+	-monitor stdio -serial file:debug.log \
 	-drive file=$<,format=raw,media=disk 
 
 force: ;

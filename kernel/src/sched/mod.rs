@@ -9,7 +9,7 @@ use core::panic;
 //
 use crate::arch::{self, SysTimerDuration};
 use crate::arch::THIS_CPU_ID;
-use crate::pmm::{PHY_FRAME_SIZE, palloc_continuous, pfree};
+use crate::mem::physical::{PHY_FRAME_SIZE, palloc_continuous, pfree_continuous};
 use crate::sched::sched_rr::RoundRobinScheduler;
 use crate::util::*;
 use core::slice::*;
@@ -212,9 +212,7 @@ impl Scheduler {
     }
 
     fn stack_free(&self, task: &mut Task) {
-        for i in 0..task.stack_pages {
-            pfree(task.stack_base + i * PHY_FRAME_SIZE);
-        }
+        pfree_continuous(task.stack_base, task.stack_pages);
     }
 } 
 
