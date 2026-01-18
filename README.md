@@ -34,3 +34,22 @@ any combination of components. Available debug options are:
 ---
 ## Screenshot
 ![Screenshot](https://github.com/sassyboy/blightos/blob/main/screenshot.png)
+
+---
+## Installation Steps on Ubuntu
+### Toolchain
+- Install rust:
+`curl --proto '=https' --tlsv1.3 https://sh.rustup.rs -sSf | sh`
+- Once the installation is complete, you may need to reload your shell's PATH environment variable. You can do this by running:
+`source "$HOME/.cargo/env"`
+- Add the x64 bare-metal development target `x86_64-unknown-none` to your rust environemt, and install the nightly toolchain to use the target:
+```
+rustup target add x86_64-unknown-none
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly-x86_64-unknown-none
+```
+- Boot disk image creation tools:
+`sudo apt install grub-pc-bin xorriso`
+
+- Emulation environment (QEMU+KVM)
+`sudo apt install qemu-kvm libvirt-daemon-system bridge-utils virt-manager virtinst libvirt-clients -y`

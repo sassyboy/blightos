@@ -6,7 +6,7 @@ PLATDIR=x86_64
 #                                     all compiler internals necessary
 # --target=x86_64-unknown-none: bare-metal x86_64 compiler target/internals
 #
-RC=cargo build
+RC=cargo +nightly build -Z build-std=core,alloc
 
 ifeq ($(findstring all,$(DEBUG)),all)
 	FEATURES+=debug_arch,debug_pmm,debug_heap
