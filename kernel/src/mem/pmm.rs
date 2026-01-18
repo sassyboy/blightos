@@ -81,7 +81,7 @@ pub fn pmm_init(mmap: &[PMMapElement], kernel_start: usize, kernel_end: usize) {
     // 1) Find the last allocatable usable memory address (and print the map)
     //    and derive the size of the bitmap to represent that many frames
     for entry in mmap {
-        klog!("{:016X} - {:016X}: {}\n",
+        dbg!("{:016X} - {:016X}: {}\n",
                 entry.base, entry.base + entry.len - 1,
                 match entry.avail {
                     true => "[USABLE]",

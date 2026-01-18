@@ -85,6 +85,24 @@ bsp_start32:
   mov   %ax, %ss
   lidt  idt_pointer
 
+  /* Fixing up TSS for CPU0
+   * TODO: move this to Rust and do it for all enabled CPUs
+   */
+  /* Flags -> RAX*/
+  movq  $0x8900, %rax
+  shlq  $32, %rax 
+  /* TSS Base and Limit -> RCX */
+  movq  $tss64_base+(0x68 * 0), %rcx
+  shlq  $16, %rcx /* TSS Base */
+  orq   $0x68, %rcx /* TSS Limit */
+  /* First QWORD of the descriptor --> RAX */
+  orq   %rcx, %rax 
+  movq  %rax, gdt64_tssd_base
+
+  /* Load the task register with the descriptor offset in GDT */
+  mov   $0x28, %ax
+  ltr   %ax
+
   xor   %rdi, %rdi
   mov   %ebx, %edi              /* The multiboot structure address */
   mov   $MAX_CPU_COUNT, %rsi
@@ -373,45 +391,50 @@ irq_handler15:
 
 /*******************************************************************************
  * Global Descriptor Table
+ * See Section 3.4.5 - Segment Descriptors
  ******************************************************************************/
 .data
 .align 16
 gdt64_base:
   /* 0x00: Null descriptor */
   .quad 0x0
-  /* 0x08: 64-bit code descriptor (exec/read) */
+  /* 0x08: 64-bit code descriptor (exec/read)  - RING 0 (KERNEL CODE) */
   .quad 0x00209A0000000000
-  /* 0x10: 64-bit data descriptor (read/write) */
+  /* 0x10: 64-bit data descriptor (read/write) - RING 0 (KERNEL DATA) */
   .quad 0x0000920000000000
+  /* 0x18: 64-bit code descriptor (exec/read)  - RING 3 (USER   CODE) */
+  .quad 0x0020FA0000000000
+  /* 0x20: 64-bit data descriptor (read/write) - RING 3 (USER   DATA) */
+  .quad 0x0000F20000000000
 
   /*
    * 64-bit 1 TSS per Processor is required for Long Mode.
    * to keep track of Interrupt Stack Table (only storing rsp0 (ring0) for now)
-   * 
+   * See Section 9.2.3 - TSS Descriptor in 64-bit mode
    */
 gdt64_tssd_base:
-  /* 0x18: CPU 0 TSS */
-  .quad 0x20890000000068 
-  .quad tss64_base+(0x68 * 0)
-  /* 0x28: CPU 1 TSS */
+  /* 0x28: CPU 0 TSS */
+  .quad 0x0
+  .quad 0x0
+  /* 0x38: CPU 1 TSS */
   .quad 0x20890000000068 
   .quad tss64_base+(0x68 * 1)
-  /* 0x38: CPU 2 TSS */
+  /* 0x48: CPU 2 TSS */
   .quad 0x20890000000068 
   .quad tss64_base+(0x68 * 2)
-  /* 0x48: CPU 3 TSS */
+  /* 0x58: CPU 3 TSS */
   .quad 0x20890000000068 
   .quad tss64_base+(0x68 * 3)
-  /* 0x58: CPU 4 TSS */
+  /* 0x68: CPU 4 TSS */
   .quad 0x20890000000068 
   .quad tss64_base+(0x68 * 4)
-  /* 0x68: CPU 5 TSS */
+  /* 0x78: CPU 5 TSS */
   .quad 0x20890000000068 
   .quad tss64_base+(0x68 * 5)
-  /* 0x78: CPU 6 TSS */
+  /* 0x88: CPU 6 TSS */
   .quad 0x20890000000068 
   .quad tss64_base+(0x68 * 6)
-  /* 0x88: CPU 7 TSS */
+  /* 0x98: CPU 7 TSS */
   .quad 0x20890000000068 
   .quad tss64_base+(0x68 * 7)
 
@@ -424,8 +447,8 @@ gdt64_pointer:
  ******************************************************************************/
 .globl idt_base
 idt_base:
-  .fill 49,8,0		# idt is uninitialized
-  .fill 49,8,0		# idt is uninitialized
+  .fill 50,8,0		# idt is uninitialized
+  .fill 50,8,0		# idt is uninitialized
 
 .globl idt_pointer
 idt_pointer:
@@ -488,6 +511,7 @@ idt_vectors:
  * Task State Segment - One per CPU                                           *
  * Todo - Use this buffer when adding the support for a dual-mode kernel      *
  ******************************************************************************/
+.globl tss64_base
 tss64_base:
 .zero 104 * MAX_CPU_COUNT 
 
@@ -549,7 +573,6 @@ tss64_base:
  */
 .globl start_first_thread
 start_first_thread:
-  movq      $3, 0x18(%rdi)      /* Update status to 3 (RUNNING) */
   movq      8(%rdi), %rsp       /* Retrieve new's stack pointer */
   RESTORE_CONTEXT
   retq
@@ -566,7 +589,6 @@ switch_context:
 /*  fxsave    48(%rdi)       TODO Save x87 FPU, MMX Technology, and SSE State */
   SAVE_CONTEXT                /* Save general x86_64 registers */
   movq      %rsp, 8(%rdi)     /* Update old's stack pointer in its TCB */
-  movq      $3, 0x18(%rsi)    /* Update new->status to 3 (RUNNING)*/
   movq      8(%rsi), %rsp     /* Retrieve new's stack pointer */
 /*  fxrstor   48(%rsi)      TODO Restore x87 FPU, MMX Technology, and SSE State */
   RESTORE_CONTEXT             /* Restore general x86_64 registers */
@@ -575,6 +597,25 @@ switch_context:
   /* Stack consistency has failed */
   movq      %rsp, %rdi
   callq     kstack_error
+
+/*******************************************************************************
+ * switch_to_userspace(rdi: entrypoint, rsi: stackpointer, rdx: pml4_base, 
+                       rcx: tss_rsp0_addr)
+ */
+.globl switch_to_userspace
+switch_to_userspace:
+  cli
+  pushq   $(0x20 | 3)   /* Ring-3 Stack Segment */
+  pushq   %rsi          /* Ring-3 Stack Pointer */
+  pushq   $0x202        /* Ring-3 Starting RFLAGS */
+  pushq   $(0x18 | 3)   /* Ring-3 Code Segment */
+  pushq   $1f           /* Ring-3 RIP */
+  mov     %rsp, (%rcx)  /* Ring-0 Stack Pointer */
+  mov     %rdx, %cr3    /* Swith to the new address-space */
+  iretq
+1: /* In the destination Address Space and Ring-3 */
+  jmp    *%rdi          /* Call the main function of the user-space process */
+  hlt
 
 /*******************************************************************************
  * Initial kernel buffers (stack, paging structs, etc.)

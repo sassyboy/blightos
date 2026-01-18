@@ -7,22 +7,30 @@ Install rust and the nightly `x86_64-unknown-none` toolchain, `gcc`,
 - `make DEBUG=all` or `make DEBUG=comp1,comp2,etc` for building with additional
 debugging information (directed at the default serial port) pertaining to all or
 any combination of components. Available debug options are:
-    - `arch`: Architecture-dependent module (arch/x86_64/stub.rs).
-    - `pmm` : Physical memory allocator (mem/pmm.rs)
-    - `heap`: Dynamic memory allocator (mem/heap.rs)
+    - `arch` : Architecture-dependent module (arch/x86_64/stub.rs)
+    - `pmm`  : Physical memory allocator (mem/pmm.rs)
+    - `heap` : Dynamic memory allocator (mem/heap.rs)
+    - `sched`: Task scheduler events
 
 ---
 ## Features
-- Legacy BIOS and UEFI Multiboot-2 support
-- Minimal x86_64 (64-bit/Long Mode) architecture support
-- Minimal ACPI support for SMP enumeration
-- Symmetric Multiprocessing (SMP)
-- IOAPIC and LAPIC support for SMP IRQ routing and per-cpu task preemption
-- Local FCFS and RR task schedulers
-- Flat 4GB PML-4 virtual memory
-- Bitmap physical memory allocator
-- Simplified TLSF heap allocator
-- Basic VESA Graphics support with built-in bitmap font rendering
+- Kernel:
+    - Architecture: Dual-mode monolithic (Ring3: user-space/ Ring0: kernel-space)
+    - H/W Architecture: x86_64 Long Mode (64-bit)
+    - Startup: BIOS/UEFI Multiboot2-compatible bootloader required
+    - Minimal ACPI support for SMP enumeration
+    - Symmetric Multiprocessing (SMP) up to 8 CPUs
+    - Local Round-Robin and FCFS task schedulers
+    - Bitmap physical memory allocator
+    - Flat 4GB PML-4 virtual memory
+    - Simplified TLSF heap allocator
+- Device support:
+    - IOAPIC/LAPIC for SMP IRQ routing and per-cpu task preemption
+    - Basic VESA Graphics support with built-in bitmap font rendering
+    - Basic i8046 PS/2 Keyboard driver
+- User-space runtime library
+    - Basic formatted std-output and std-readline syscall wrappers
+
 ---
 ## Screenshot
 ![Screenshot](https://github.com/sassyboy/blightos/blob/main/screenshot.png)

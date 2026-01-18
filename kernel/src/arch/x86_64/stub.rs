@@ -5,9 +5,9 @@
 
 use core::arch::asm;
 use crate::arch::asc::vga::*;
-use crate::mem::physical::PMMapElement;
-use crate::sched::SCHEDULER;
-use crate::util::*;
+use crate::mem::physical::{PMMapElement, palloc};
+use crate::sched::Task;
+use crate::{Syscall, SyscallHandlerFn, SyscallOpCode, util::*};
 use crate::{dump_memory, kstart};
 use core::fmt::Write;
 
@@ -18,14 +18,8 @@ mod vga;
 //
 
 // Serial Port Debugging
-impl Write for PortBasedUART {
-    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
-        self.puts(_s.as_bytes());
-        Ok(())
-    }
-}
 #[cfg(feature="debug_arch")]
-macro_rules! x64dbg {
+macro_rules! dbg {
     ($($arg:tt)*) => {
         let mut debug_console = DebugOut;
         let _ = write!(&mut debug_console, "[X64] ");
@@ -33,7 +27,7 @@ macro_rules! x64dbg {
     };
 }
 #[cfg(not(feature="debug_arch"))]
-macro_rules! x64dbg{
+macro_rules! dbg{
     ($($arg:tt)*) => { };
 }
 
@@ -189,16 +183,19 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     let mut mem_map_count = 0;
     let mut acpi_rsdp: Option<usize> = None;
 
+    // Init user program (module) addr:
+    let mut mod_base: usize = 0;
+    let mut mod_end: usize = 0;
     // Enumerate Muliboot 2 tags
     // Use the default serial port for debugging since VESA is not yet enabled
     PortBasedUART::new(0x3F8).config();
-    x64dbg!("MULTIBOOT2 BASE: {:X}\n", mb2info_base);
+    dbg!("MULTIBOOT2 BASE: {:X}\n", mb2info_base);
     let mut total_size: usize;
     let mut tag_base: *mut u8 = (mb2info_base + 8) as *mut u8;
     unsafe {
         total_size = *(mb2info_base as *mut u32) as usize;
     }
-    x64dbg!("TOTAL SIZE: {}\n",total_size);
+    dbg!("TOTAL SIZE: {}\n",total_size);
     while total_size > 0 {
         let tag: *mut Multiboot2Tag = tag_base as *mut Multiboot2Tag;
         let tag_size: usize;
@@ -208,7 +205,7 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
             tag_type = (*tag).ttype;
         }
         let tag_pad  = tag_base.wrapping_add(tag_size).align_offset(8);
-        x64dbg!("TAG TYPE: {} SIZE: {} (Left: {})\n",
+        dbg!("TAG TYPE: {} SIZE: {} (Left: {})\n",
                     tag_type as u32, tag_size, total_size);
         match tag_type {
             Mulitboot2TagType::ACPIOld          => {
@@ -238,7 +235,7 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
                     ent_size = (*tag).tdata.mem_map.entry_size as usize;
                 } 
                 mem_map_count = (tag_size - 8) / ent_size;
-                x64dbg!("MEMMAP - ENT_SIZE: {}, COUNT: {}\n", 
+                dbg!("MEMMAP - ENT_SIZE: {}, COUNT: {}\n", 
                         ent_size, mem_map_count);
                 let mut ent = (tag as usize + 16) as *mut Multiboot2MemoryMapEntry;
                 for i in 0..32 {
@@ -261,6 +258,15 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
                     ent = ent.wrapping_add(1);
                 }
 
+            }
+            Mulitboot2TagType::Module           => {
+                unsafe {
+                    mod_base    = (*tag).tdata.module.mod_start as usize;
+                    mod_end     = (*tag).tdata.module.mod_end as usize;
+                    dbg!("Init Program loaded @ {:X} to {:X}\n",
+                        mod_base, mod_end);
+                }
+                
             }
             Mulitboot2TagType::End              => {
                 break;
@@ -307,11 +313,31 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
             start_smp(bsp_cpu_id, max_cpus);
         },
         None => {
-            x64dbg!("No ACPI information found. Multiprocessing disabled.\n");
+            dbg!("No ACPI information found. Multiprocessing disabled.\n");
         }
     };
+
+    // Fix the syscall interrupt entry (0x20) in IDT to accept calls from Ring3
+    extern "C" {
+        static idt_base : usize;
+    }
+    unsafe {
+        let idte: *mut u64 = &idt_base as *const usize as *mut u64;
+        *(idte.wrapping_add(0x20 * 2)) |= 0x600000000000; // DPL = 3
+    }
+
     // Start the kernel.
-    kstart(bsp_cpu_id, Some(&mem_map[0..mem_map_count]) );
+    if mod_base == 0 {
+        // No RAMDISK
+        kstart(bsp_cpu_id, Some(&mem_map[0..mem_map_count]), None );
+    } else {
+        kstart(bsp_cpu_id, Some(&mem_map[0..mem_map_count]),
+                Some(crate::RamdiskInfo {
+                    start_phy_addr: mod_base,
+                    length: mod_end - mod_base + 1
+                })
+        );
+    }
     panic!(); // kstart shouldn't really return but if does, we should panic
 }
 
@@ -334,11 +360,11 @@ extern "C" fn rust_x864_entry_ap(_arg: usize) {
         (*this_machine).cpu_count += 1;
     }
     
-    x64dbg!("CPU[{}] calling kstart\n", THIS_CPU_ID.borrow());
+    dbg!("CPU[{}] calling kstart\n", THIS_CPU_ID.borrow());
     // Initialize the LAPIC for the current CPU
 
     // Start the kernel for this AP
-    kstart(cpuid as usize, None);
+    kstart(cpuid as usize, None, None);
 }
 
 //
@@ -452,8 +478,6 @@ extern "C" fn kstack_error(rsp: usize) {
         *(THIS_CPU_ID.borrow()));
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn ksyscall_handler() {}
 
 #[derive(Default)]
 struct X86ExceptionInfo {
@@ -528,11 +552,11 @@ fn percpu_init_sections() {
         let pcpu_s:usize = &_KERNEL_PERCPU_START as *const usize as usize;
         let pcpu_e:usize = &_KERNEL_PERCPU_END as *const usize as usize;
         if sect_size < 1 {
-            x64dbg!("NO PERCPU VARIABLE!\n");
+            dbg!("NO PERCPU VARIABLE!\n");
             return;
         }
         let nsects  = (pcpu_e - pcpu_s) / sect_size;
-        x64dbg!("PERCPU: VMA {:X} bytes starting @ 0, LMA[{:X} - {:X}], #Copies: {}\n",
+        dbg!("PERCPU: VMA {:X} bytes starting @ 0, LMA[{:X} - {:X}], #Copies: {}\n",
             sect_size, pcpu_s, pcpu_e, nsects);
         for s in 1..nsects {
             raw_memcpy(pcpu_s + s * sect_size, pcpu_s, sect_size);
@@ -768,7 +792,7 @@ impl X86TimeStampCounter {
                 // ECX -> Core Crysctal Freq (Could be Zero)
                 // TSC_frequency = ECX * EBX/EAX
                 (eax, ebx, ecx, _) = x86_cpuid_inst(0x15, 0);
-                x64dbg!("CPUID.15H - EAX: {} EBX {} ECX: {}\n", eax, ebx, ecx);
+                dbg!("CPUID.15H - EAX: {} EBX {} ECX: {}\n", eax, ebx, ecx);
                 if ecx == 0 && cpu_family == 0x6 {
                     // Core Crystal Clock Freq is not enumerated, but we can
                     // look it up base on the model. According to Intel's SDM:
@@ -796,7 +820,7 @@ impl X86TimeStampCounter {
                     // TSC is supported, has a constant frequency, which is
                     // enumerated here!
                     self.enabled = true;
-                    x64dbg!("INVARIANT TSC FREQ: {} - EAX: {} EBX {} ECX: {}\n",
+                    dbg!("INVARIANT TSC FREQ: {} - EAX: {} EBX {} ECX: {}\n",
                             self.freq_hz, eax, ebx, ecx);
 
                     // Also approximate it:
@@ -818,7 +842,7 @@ impl X86TimeStampCounter {
                     let tsc_overhead1 = cpu_read_timestamp();
                     self.freq_hz = (end_tsc - start_tsc - (tsc_overhead1-end_tsc)*2) * 10;
                     self.enabled = true;
-                    x64dbg!("INVARIANT TSC FREQ APPROX: {} HZ\n", self.freq_hz);
+                    dbg!("INVARIANT TSC FREQ APPROX: {} HZ\n", self.freq_hz);
                 }
             } else {
                 panic!("Processor too old - Invariant TSC not supported\n");
@@ -915,7 +939,7 @@ impl X86IoApic {
         self.version = (ver & 0xFF) as u8;
         self.max_irqs= ((ver >> 16) & 0xFF) as u8 + 1;
 
-        x64dbg!("IOAPIC init => ID:{} MMIO: {:X} Ver:{} Max IRQs:{}\n", 
+        dbg!("IOAPIC init => ID:{} MMIO: {:X} Ver:{} Max IRQs:{}\n", 
             self.acpi_id, self.mmio_base, self.version, self.max_irqs
         );
     }
@@ -1127,6 +1151,15 @@ pub fn cpu_disable_ints() {
         asm!("cli");
     }
 }
+pub fn cpu_ints_enabled() -> bool {
+    let rflg = x64_read_rflags();
+    rflg & 0x200 > 0
+}
+pub fn cpu_unmask_irq(irq: u32) {
+    THIS_IOAPIC.borrow_mut().set_irq_mask(irq, false);
+}
+
+
 pub fn cpu_halt() {
     unsafe {
         asm!("hlt");
@@ -1201,6 +1234,26 @@ pub fn x86_ioport_read(port: u16) -> u8 {
 pub fn x86_ioport_write(port: u16, data: u8) {
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") data);
+    }
+}
+
+pub fn x64_read_rflags() -> u64 {
+    let r: u64;
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) r, options(nomem, preserves_flags));
+    }
+    r
+}
+
+unsafe extern "C" {
+    static tss64_base: usize;
+}
+pub fn x64_tss_rsp0_addr() -> usize{
+    let cpuid = *(THIS_CPU_ID.borrow());
+    
+    unsafe{
+        let base = &tss64_base as *const usize as usize;
+        base + (104 * cpuid) +4
     }
 }
 
@@ -1329,7 +1382,7 @@ pub mod kearly_console {
 //
 // System Timer(s)
 //
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum SysTimerDuration {
     Seconds(u64),
     Milliseconds(u64),
@@ -1444,15 +1497,154 @@ pub fn isr_register(irq: u16, handler_fn: IsrHandlerFn) {
     }
 }
 
-//
-// Memory Management Unit (MMU) Primitives
-//
-pub fn mmu_page_size() -> usize {
-    0x1000
+pub fn cpu_trigger_systimer_irq() {
+    unsafe{
+        asm!(
+            "int 0x21" // See boot.S
+        );
+    };
 }
 
-pub fn mmu_addr_to_page_index(addr: usize) -> usize {
-    addr >> 12
+
+//
+// Process Address Space and MMU 
+//
+
+pub struct Process {
+    pml4_base: usize,
+}
+impl Process {
+    // See boot.S for our GDT Entries
+    const GDTE_USER_CODE: u16 = 0x18;
+    const GDTE_USER_DATA: u16 = 0x20;
+    // Segment Selector Values: See Section 3.4.2 - Segment Selectors
+    const SEGSEL_USER_CODE: u16 = Self::GDTE_USER_CODE | 0x3; // CPL: Ring 3
+    const SEGSEL_USER_DATA: u16 = Self::GDTE_USER_DATA | 0x3; // CPL: Ring 3
+    // Paging Structure Entry Definitions
+    const PGENT_PRESENT:        u64 = 0x1;
+    const PGENT_WRITABLE:       u64 = 0x2;
+    const PGENT_USERMODE:       u64 = 0x4;
+    const PGENT_PWT:            u64 = 0x8;  // Page-level Write-throuhg
+    const PGENT_PCD:            u64 = 0x10; // Page-level Cache Disable
+    const PGENT_PS:             u64 = 0x80; // Set for large pages
+    const PGENT_G:              u64 = 0x100; // Global
+    
+    pub const fn new() -> Self {
+        Self {
+            pml4_base: 0
+        }
+    }
+
+    // Creates the initial paging structures for the process that includes
+    // the kernel mappings. The rest should be
+    pub fn init(&mut self) {
+        // Allocate and zero out:
+        //   1 page for the PML4 table and 1 page for the first PDPT table
+        self.pml4_base  = palloc().expect("Out of memory");
+        let pdpt0       = palloc().expect("Out of memory");
+        unsafe {
+            raw_memset(self.pml4_base, 4096, 0);
+            raw_memset(pdpt0,          4096, 0);
+        }
+
+        // Set PML4[0] --> PDPT0 that covers the first 512 GB
+        let pml4e0 = pdpt0 as u64 | Self::PGENT_PRESENT |
+                    Self::PGENT_WRITABLE | Self::PGENT_USERMODE;
+        Self::write_table_entry(self.pml4_base, 0, pml4e0);
+
+        // Set PDPT0[0..=3] to Identity-map the first 4GB as user-mode for now
+        let pdpt0e = Self::PGENT_PRESENT | Self::PGENT_WRITABLE |
+                    Self::PGENT_USERMODE | Self::PGENT_PS; // 1GB page
+        for i in 0..4 {
+            let phys_addr : u64 = i << 30;
+            Self::write_table_entry(pdpt0, i as usize, pdpt0e | phys_addr);
+        }
+
+        // Log everything for testing
+        dbg!("PML4 Base: {:X}, PML4E0: {:X}\n",
+            self.pml4_base,
+            Self::read_table_entry(self.pml4_base, 0)
+        );
+        dbg!("PDPT0 Base: {:X}\n", pdpt0);
+        for _i in 0..4 {
+            dbg!("    PDPT0[{}] : {:X}\n", _i,
+                    Self::read_table_entry(pdpt0, _i));
+        }
+    }
+
+    /*
+     * Execution/Segmentation Management methods
+     */
+    ///
+    /// Converts the currently running kernel task into a user-space task as a
+    /// part of this process address space. The calling (kernel) task will not
+    /// return to the next instruction after its call to move_to_userspace.
+    /// The user-space execution must end with an Exit system call, at which
+    /// point the task terminates.
+    /// 
+    pub fn move_to_userspace(&self, entry_point: usize, user_stack: usize) {
+        // Prepare CS, DS, SS for ring 3 transition and then jump to the
+        // entry point address given. x64 doesn't support ljmp, so Iretq it is!
+        // Should save the RSP0 pointer in the TSS for this CPU so that when
+        // the cpu traps in ring-0 again, kernel's stack is recovered
+        let _tss_rsp0: usize = x64_tss_rsp0_addr();
+        dbg!("TSS[0].RSP0 is located at {:X}\n", _tss_rsp0);
+        unsafe {
+            switch_to_userspace(entry_point, user_stack, self.pml4_base,
+                                x64_tss_rsp0_addr());
+        }
+        panic!("Must have been unreachable!\n");
+    }
+
+    //
+    // Paging structure management methods 
+    //
+    // Virtual Address ----> Physical Address translation
+    // 4GB - 0         ----> 4GB - 0 as four 1GB pages as supervisor access
+    // Above 4GB       ----> Non-contiguous 4KB physical pages as user access
+    //
+    //
+    pub fn page_size() -> usize {
+        0x1000
+    }
+
+    pub fn addr_to_page_index(addr: usize) -> usize {
+        addr >> 12
+    }
+
+    // Maps a page (virtual address > 4GB) to a frame (physical address) 
+    pub fn map_pages(_virt_addr: usize, _phys_addr: usize, _num_pages: usize,
+                    _privileged: bool, _writeable: bool, _executable: bool,
+                    _caching: MmuCachingPolicy) {
+        // Todo - Should look at CR3, map the structs into a temporary scratchpad
+        //        space and then add the new map.
+        // Forgot how MTRR registers affect specific memory region caching...
+        // Look it up.
+    }
+
+    pub fn unmap_pages(_virt_addr: usize, _num_pages: usize) {
+
+    }
+
+    fn write_table_entry(table_virt_base: usize, index: usize, value: u64) {
+        unsafe {
+            let destp : *mut u64 = table_virt_base as *mut u64;
+            *(destp.wrapping_add(index)) = value;
+        }
+    }
+
+    fn read_table_entry(table_virt_base: usize, index: usize) -> u64 {
+        unsafe {
+            let destp : *mut u64 = table_virt_base as *mut u64;
+            *(destp.wrapping_add(index))
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Release the paging structures
+    }
 }
 
 pub enum MmuCachingPolicy {
@@ -1460,19 +1652,10 @@ pub enum MmuCachingPolicy {
     WriteThrough,  // Fast Memory R, Slow Memory/MMIO W - Not safe for MMIO Read
     WriteBack      // Fast Memory-only R/W - Not for MMIO
 }
-// Maps a page (virtual address) to a frame (physical address) in the current
-// address-space (CR3)
-pub fn mmu_map_page(_virt_addr: usize, _phys_addr: usize, _privileged: bool,
-            _writeable: bool, _executable: bool, _caching: MmuCachingPolicy) {
-    // Todo - Should look at CR3, map the structs into a temporary scratchpad
-    //        space and then add the new map.
-    // Forgot how MTRR registers affect specific memory region caching...
-    // Look it up.
-    
-}
 
-pub fn mmu_unmap_page(_virt_addr: usize) {
-
+extern "C" {
+    fn switch_to_userspace(rip: usize, rsp: usize, pml4_base: usize,
+                            tss_rsp0_addr: usize);
 }
 
 //
@@ -1488,23 +1671,23 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
         let acpi = &(*this_machine).acpi_info;
         // Print what we found on ACPI tables if compiled with debug_arch
         // CPUs/LAPICS
-        x64dbg!("LAPIC MMIO @ {:X}\n", acpi.lapic_mmio);
+        dbg!("LAPIC MMIO @ {:X}\n", acpi.lapic_mmio);
         for _lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
-            x64dbg!("CPU[{}]: LAPIC ID: {}, Enabled: {}\n",
+            dbg!("CPU[{}]: LAPIC ID: {}, Enabled: {}\n",
                 _lapic.cpu_id,
                 _lapic.lapic_id,
                 _lapic.enabled
             );
         }
         // IOAPIC
-        x64dbg!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
+        dbg!("IOAPIC[{}]: MMIO Base: {:X}, GSI Base: {:X}\n",
             acpi.ioapic.ioapic_id,
             acpi.ioapic.ioapic_mmio,
             acpi.ioapic.gsi_base
         );
         // IRQ->GSI mappings
         for _irq in &acpi.irq_map[..acpi.irq_map_cnt as usize] {
-            x64dbg!("<IRQ#{}.{} -> GSI#{} ON {}{}>\n",
+            dbg!("<IRQ#{}.{} -> GSI#{} ON {}{}>\n",
                 _irq.src_bus, _irq.src_irq, _irq.dst_gsi,
                 if _irq.active_low {"Low"} else {"High"},
                 if _irq.lvl_trig {"Level"} else {"Edge"}
@@ -1512,18 +1695,18 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
         }
         // NMI->LINT mappings
         for _i in 0..acpi.nmi_map_cnt as usize {
-            x64dbg!("<NMI.CPUS[{:X}] -> LINT#{} ON {}{}> ",
+            dbg!("<NMI.CPUS[{:X}] -> LINT#{} ON {}{}> ",
                 acpi.nmi_map[_i].cpu_id_mask,
                 acpi.nmi_map[_i].lint_vector,
                 if acpi.nmi_map[_i].active_low {"Low"} else {"High"},
                 if acpi.nmi_map[_i].lvl_trig {"Level"} else {"Edge"}
             );
         }
-        x64dbg!("\n");
+        dbg!("\n");
         //// Initialize the LocaAPIC controller for BSP (CPU 0)
         for lapic in &acpi.lapic[..acpi.lapic_cnt as usize] {
             if lapic.lapic_id == bsp_cpu_id as u8 {
-                x64dbg!("BSP [{}] LAPIC ID: {} INITIALIZING\n",
+                dbg!("BSP [{}] LAPIC ID: {} INITIALIZING\n",
                     lapic.cpu_id, lapic.lapic_id);
                 lapic0.init(lapic, acpi.lapic_mmio);
                 break;
@@ -1545,7 +1728,7 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
     }
     //// 2) Send INIT-SIPI_SIPI for each AP and check the magic# on their stack
     ////    That would indicate the completion of their trampoline code.
-    x64dbg!("MAX CPUs: {}\n", max_cpus);
+    dbg!("MAX CPUs: {}\n", max_cpus);
     for i in 0..lapic_count as usize {
         let lapic_id;
         let lapic_en;
@@ -1557,14 +1740,14 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
         }
         if lapic_id > 0 && lapic_id < max_cpus as u8 && lapic_en == true {
             let current_cpu_cnt = cpu_count();
-            x64dbg!("Senging INIT-SIPI to LAPIC[{}]\n", lapic_id);
+            dbg!("Senging INIT-SIPI to LAPIC[{}]\n", lapic_id);
             lapic0.send_init_ipi(lapic_id);
             cpu_busywait_us(10_000); // Wait for the cpu to initialize (~10ms)
             lapic0.send_startup_ipi(lapic_id, 0x8); 
             cpu_busywait_us(1_000); // Wait for the AP to initialize
             if cpu_count() == current_cpu_cnt {
                 // Send another SIPI
-                x64dbg!("Sending another SIPI to LAPIC[{}]\n", lapic_id);
+                dbg!("Sending another SIPI to LAPIC[{}]\n", lapic_id);
                 lapic0.send_startup_ipi(lapic_id, 0x8);
             }
            
@@ -1600,6 +1783,10 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
                 true, 0
             );
         }
+        // TEMP: Register the keyboard interrupt
+        ioapic0.register_isr(1, 35, X86IoApic::PRIORITY_FIXED,
+               X86IoApic::POLARITY_HIGH , X86IoApic::TRIGGER_EDGE,
+               false , 0);
     }
     //// TODO Route NMIs
 
@@ -1775,11 +1962,11 @@ fn x86_acpi_parse(rsdp:Option<usize>) -> Option<AcpiInfo>{
             sdt = *((ptr.wrapping_add(3))) as *mut u32;
             addr_size = 8; // Addrs are 64-bit            
         } else {
-            x64dbg!("ACPI REVISION UNKNOWN ({})\n", rev);
+            dbg!("ACPI REVISION UNKNOWN ({})\n", rev);
             return None;
         }
         num_tables = (*sdt.wrapping_add(1) - 36) / addr_size; 
-        x64dbg!("ACPI REVISION {} - Root Table @ {:p} - RSDT Length: {} ({} tables)\n",
+        dbg!("ACPI REVISION {} - Root Table @ {:p} - RSDT Length: {} ({} tables)\n",
                 rev, sdt, *sdt.wrapping_add(1), num_tables
         );
         
@@ -1863,7 +2050,7 @@ fn x86_acpi_parse_madt(acpi: &mut AcpiInfo, madt_addr: u32) {
                     nmi_cnt += 1;
                 }
                 _ => {
-                    x64dbg!("MADT Entry T[{}] Ignored\n ",entry_type);
+                    dbg!("MADT Entry T[{}] Ignored\n ",entry_type);
                 }
             };
             entry_addr += entry_len as u32;
@@ -1889,29 +2076,18 @@ fn x86_acpi_parse_hpet(acpi: &mut AcpiInfo, addr: u32) {
 // + Context creation
 // + Context switch
 //
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct TaskContext {
     ep:     fn(),   // Initial RIP value, i.e., Entry-point
     rsp:    usize,  // Last RSP (Stack Pointer) value
-    pas:    usize,  // Process Address-Space Id (0: Kernel's initial)
-    state:  usize,  // one of STATE_* | FLAGS_*
-    tid:    usize,
+    tid:    usize,  // For debugging purposes
 }
 
 impl TaskContext {
-    pub const STATE_DEAD:       usize = 0; // DEAD or uninitialized
-    pub const STATE_NEW:        usize = 1; // Initialized but not run yet
-    pub const STATE_READY:      usize = 2; // To be scheduled
-    pub const STATE_RUNNING:    usize = 3; // Currently running
-    pub const STATE_BLOCKED:    usize = 4; // Waiting for an event (IO, SYNC,..)
-    pub const STATE_TERMINATING:usize = 5;
-
 
     pub const fn new() -> Self {
         Self {
-            pas: 0,
-            state: Self::STATE_DEAD,
             ep: empty_task,
             rsp: 0,
             tid: 0,
@@ -1965,12 +2141,7 @@ impl TaskContext {
 
         self.ep = func;
         self.rsp = (&stack[stacklen - 19] as *const usize) as usize;
-        self.state = Self::STATE_NEW;
         self.tid = id;
-    }
-
-    pub fn runnable(&self) -> bool {
-        self.state >= Self::STATE_NEW && self.state < Self::STATE_BLOCKED
     }
 
     pub fn tid(&self) -> usize {
@@ -1981,13 +2152,9 @@ impl TaskContext {
     fn launch_task(task: &mut TaskContext) {
         // archlog!("Starting task[{}]: state {}, rip:{:X}, rsp:{:X}\n",
         //     task.tid, task.state, task.ep as usize, task.rsp);
-        if task.state < Self::STATE_NEW {
-            panic!("Starting an uninitialized task!");
-        }
         (task.ep)();
         // Terminate the task
-        task.state = Self::STATE_DEAD;
-        SCHEDULER.borrow().terminate_task();
+        Task::exit();
         panic!("Continued a dead task's code where it have been unreachable!");
     }
 }
@@ -2001,11 +2168,12 @@ extern "C" {
     fn switch_context(old_p: usize,  new_p: usize);
 }
 
-// Per-CPU initialization code calls this for the very first task.
-// There is no previous context to retrieve!
-pub fn cpu_start_first_task(task: &mut TaskContext) {
+// Switch to the context of the specified task without saving the current
+// context. Used when the current task is terminating or for the very first
+// task before which there is no previous context to retrieve!
+pub fn cpu_switch_context_nosave(task: &TaskContext) {
     unsafe{
-        start_first_thread(task as *mut TaskContext as usize);
+        start_first_thread(task as *const TaskContext as usize);
     }
 }
 
@@ -2015,3 +2183,84 @@ pub fn cpu_switch_context(from: &TaskContext, to: &TaskContext) {
                         to as *const TaskContext as usize);
     }
 }
+
+
+
+//
+// SYSCALL Interface
+//
+fn syscall_default_imp(arg0: usize, arg1: usize, arg2: usize, arg3: usize) {
+    klog!("Syscall({:X}, {:X}, {:X}, {:X}) - not registered.",
+            arg0, arg1, arg2, arg3);
+}
+static mut X64_SYSCALL_HANDLER:[SyscallHandlerFn; SyscallOpCode::Max as usize] = 
+                            [syscall_default_imp; SyscallOpCode::Max as usize];
+
+pub fn syscall_register(opcode: SyscallOpCode, handler: SyscallHandlerFn) -> bool {
+    if opcode < SyscallOpCode::Max {
+        unsafe {
+            X64_SYSCALL_HANDLER[opcode as usize] = handler;
+        }
+        return true;
+    }
+    false
+}
+
+pub fn syscall(params: Syscall) {
+    match params {
+        Syscall::Exit { status }                                        => {
+            syscall_trigger_int(SyscallOpCode::Exit as usize, status, 0, 0, 0)
+        },
+        Syscall::Open { path_ptr, mode, ret_ptr }                       => {
+            syscall_trigger_int(SyscallOpCode::Open as usize,
+                                path_ptr, mode, ret_ptr, 0)
+        },
+        Syscall::Read { fd, buf_ptr, buf_len, ret_ptr }                 => {
+            syscall_trigger_int(SyscallOpCode::Read as usize,
+                                fd, buf_ptr, buf_len, ret_ptr)
+        },
+        Syscall::Write { fd, buf_ptr, buf_len, ret_ptr }                => {
+            syscall_trigger_int(SyscallOpCode::Write as usize,
+                                fd, buf_ptr, buf_len, ret_ptr);
+        },
+        Syscall::Exec { fd, cmd_buf_ptr, buf_len, ret_ptr }               => {
+            syscall_trigger_int(SyscallOpCode::Exec as usize,
+                                fd, cmd_buf_ptr, buf_len, ret_ptr);
+        },
+        Syscall::Close { fd }                                           => {
+            syscall_trigger_int(SyscallOpCode::Close as usize , fd, 0, 0, 0);
+        }
+    }
+}
+
+fn syscall_trigger_int(opcode: usize,
+                        arg0: usize, arg1: usize, arg2: usize, arg3: usize) {
+    unsafe{
+        asm!(
+            "int 0x20", // See boot.S
+            in("rax") opcode,
+            in("rdi") arg0,
+            in("rsi") arg1,
+            in("rdx") arg2,
+            in("rcx") arg3,
+        );
+    };
+}
+
+#[unsafe(no_mangle)]
+extern "C"
+fn ksyscall_handler(arg0: usize, arg1: usize, arg2: usize, arg3: usize) {
+    let opcode: usize;
+    unsafe {
+        asm!(
+            "mov {0}, rax",
+            out(reg)opcode
+        );
+    }
+    if opcode < SyscallOpCode::Max as usize {
+        unsafe {
+            X64_SYSCALL_HANDLER[opcode](arg0, arg1, arg2, arg3);
+        }
+    }
+}
+

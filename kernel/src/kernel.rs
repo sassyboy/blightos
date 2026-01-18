@@ -6,6 +6,7 @@
 // 
 #![no_std]
 #![no_main]
+#![feature(linked_list_retain)]
 
 // Imports from the toolchain this is part of the toolchain
 extern crate alloc; 
@@ -20,14 +21,17 @@ pub mod arch;
 pub mod mem;
 //// Task Scheduler ////
 pub mod sched;
+//// Device Drivers ////
+pub mod drivers;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::time::Duration;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use util::*;
 use crate::arch::*;
-use crate::mem::physical::pmm_num_free_frames;
-use crate::sched::SCHEDULER;
+use crate::mem::physical::{palloc_continuous, pmm_num_free_frames};
+use crate::sched::{SCHEDULER, Scheduler, Task, WaitChannel};
 
 
 unsafe extern "C" {
@@ -40,12 +44,26 @@ static BSP_INITIALIZED : AtomicBool = AtomicBool::new(false);
 #[global_allocator]
 static ALLOCATOR: mem::heap::Kalloc = mem::heap::Kalloc::new();
 
+static BSP_T1_TID: AtomicUsize = AtomicUsize::new(0);
+static BSP_T2_TID: AtomicUsize = AtomicUsize::new(0);
+static BSP_T3_TID: AtomicUsize = AtomicUsize::new(0);
+
+pub struct RamdiskInfo {
+    // Start/End of the physical address where the image is copied
+    pub start_phy_addr: usize,
+    pub length:         usize // In bytes
+}
+static USER_INIT_EP: AtomicUsize = AtomicUsize::new(0);
+
 // kstart : Kernel's Generic Entry Point
 // This function will be called by all onlined CPUs (BSP with cpuid=0) in any
 // order, albeit only after all onlined CPUs have reported to the arch-specific
 // stub code so that the generic code has the correct CPU count (e.g., for 
 // resource allocation purposes).
-pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::physical::PMMapElement]>) {
+pub fn kstart(cpuid: usize,
+                mmap_opt: Option<&[mem::physical::PMMapElement]>,
+                ramdisk: Option<RamdiskInfo>)
+{
     if cpuid == 0 {
         // BSP-only initialization
         klog!("BlightOS - Number of CPUs online: {}\n", cpu_count());
@@ -64,45 +82,71 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::physical::PMMapElement]>) {
             _ => {panic!("No memory map was sent to the BSP!")}
         }
     
+        // Load the drivers
+        let drvs = drivers::get_builtin_drivers();
+        for d in drvs.iter() {
+            let ndevs = (d.enumerate)();
+            klog!("Built-in Driver: {} - Enumerated {} device(s)\n",
+                d.name, ndevs);
+        }
+
         // Time keeping...
         SystemTimer::global_init(systimer_irq_handler);
         // Todo: Need an event timer to implement sleep, etc.
 
+        // Install the system call handlers
+        arch::syscall_register(SyscallOpCode::Exit,     syscall_exit);
+        arch::syscall_register(SyscallOpCode::Open,     syscall_open);
+        arch::syscall_register(SyscallOpCode::Read,     syscall_read);
+        arch::syscall_register(SyscallOpCode::Write,    syscall_write);
+        arch::syscall_register(SyscallOpCode::Exec,     syscall_exec);
+        arch::syscall_register(SyscallOpCode::Close,    syscall_close);
+        
         // End of serialized kernel startup. Let APs start!
-        klog!("Launching 2 tasks per CPU to compete over the same counter and \
-                screen buffer...\n");
+        klog!("[KERNEL SELF-TEST]: Starting...\n");
+        klog!("[TEST] Launching 2 tasks per CPU to compete over the same counter and \
+                screen buffer\n");
         BSP_INITIALIZED.store(true, Ordering::Relaxed);
 
         // Create the inital task pool for this CPU
-        let sched = SCHEDULER.borrow_mut();
-        sched.config_round_robin(SysTimerDuration::Milliseconds(1));
-        sched.create_task(0, idle_task, 1);
-        sched.create_task(1, task1_exec, 2);
-        sched.create_task(2, task2_exec, 4);
+        Scheduler::config_round_robin(SysTimerDuration::Milliseconds(1));
+        // Scheduler::config_first_come_first_served();
+        BSP_T1_TID.store(Task::spawn(task1_exec), Ordering::Relaxed);
+        BSP_T2_TID.store(Task::spawn(task2_exec), Ordering::Relaxed);
+
+        // Spawn the first user-space task from the provided ramdisk if any
+        if let Some(initelf) = ramdisk {
+            unsafe {
+                // Copy the user program to 16MB
+                raw_memcpy(0x1000000, initelf.start_phy_addr, initelf.length);
+                // TODO validate the ELF header
+                // TODO Mark the range as reserved on the PMM
+                // Extract the entry point from the ELF64 header (8-bytes at 0x18)
+                USER_INIT_EP.store(*(0x1000018 as *const u64) as usize,
+                                    Ordering::Relaxed);
+            }
+            Task::spawn(user_init_exec);
+        }
         // Jump to the first task and never come back ;)
-        sched.start_scheduling(1, 0);
+        SCHEDULER.borrow_mut().start_scheduling(BSP_T1_TID.load(Ordering::Relaxed));
     } else {
         // AP initialization
-
         // Wait for BSP to perform the serialized portion of
         // kernel's initializaton
         while BSP_INITIALIZED.load(Ordering::Relaxed) == false {
             core::hint::spin_loop();
         }
         // Create the inital task pool for this CPU
-        let sched = SCHEDULER.borrow_mut();
-        sched.config_round_robin(SysTimerDuration::Milliseconds(1));
-        sched.create_task(0, idle_task, 1);
-        sched.create_task(1, task1_exec, 2);
-        sched.create_task(2, task2_exec, 3);
+        Scheduler::config_round_robin(SysTimerDuration::Milliseconds(1));
+        Task::spawn(task2_exec);
         // Jump to the first task!
-        sched.start_scheduling(1, 0);
+        SCHEDULER.borrow_mut().start_scheduling(Task::spawn(task1_exec));
     }
     panic!("Reached the end of kstart!");
 }
 
 fn systimer_irq_handler(_cpuid: u16){
-    SCHEDULER.borrow().preempt();
+    SCHEDULER.borrow_mut().preempt_irq();
 }  
 
 pub fn dump_memory(base: usize, qwords: usize) {
@@ -148,16 +192,16 @@ fn task1_exec() {
                 break;
             }
             *shared_var += 1;
-            klog!("<C{}/T1:{}>", cpuid, *shared_var);
+            klog!("<C{}/T{}={}>", cpuid, Task::current(), *shared_var);
         }
-        arch::cpu_busywait_us(10_000);
+        Task::sleep(Duration::from_millis(5));
     }
 }
 
 fn task2_exec() {
     let cpuid = *(THIS_CPU_ID.borrow());
     if cpuid == 0 {
-        SCHEDULER.borrow_mut().create_task(3, task3_exec, 1);
+        BSP_T3_TID.store(Task::spawn(task3_exec), Ordering::Relaxed); 
     }
     loop {
         {
@@ -166,28 +210,53 @@ fn task2_exec() {
                 break;
             }
             *shared_var += 1;
-            klog!("<C{}/T2:{}>", cpuid, *shared_var);
+            klog!("<C{}/T{}={}>", cpuid, Task::current(), *shared_var);
         }
-        arch::cpu_busywait_us(20_000);
+        Task::sleep(Duration::from_millis(5));
     }
 }
 
-fn task3_exec() {
-    klog!("<THIS IS A LONG MESSAGE TO TEST THE CONSOLE PRINT_STR LOCK>");
-    cpu_busywait_us(1_000_000 * 3); // wait 3 seconds
+static WC : WaitChannel = WaitChannel::new();
 
-    klog!("\n[START] Heap Allocator Test - FREE FRAMES: {}\n",
-            pmm_num_free_frames());
+fn task3_exec() {
     {
+        SHARED_VAR.lock();
+        klog!("<A LONG MESSAGE TO TEST THE CONSOLE PRINT_STR LOCK - TID{}>",
+                Task::current());
+    }
+    // Wait for the first two tasks to finish
+    Task::join(BSP_T1_TID.load(Ordering::Relaxed));
+    Task::join(BSP_T2_TID.load(Ordering::Relaxed));
+    Task::sleep(Duration::from_secs(1)); // Wait for task on other CPUs
+    klog!("\n[Test] Parallel heap allocations - Free frames: {}\n",
+            pmm_num_free_frames());
+
+    let t4 = Task::spawn(|| {
+        klog!("<Task {} allocate/verify/free 1000 i32>\n", Task::current());
+        let mut myvec: Vec<i32> = Vec::new();
+        for i in 0..1000 {
+            myvec.push(i);
+        }
+        for i in 0..1000 {
+            if myvec[i] != i as i32 {
+                klog!("[FAIL] Vector element {} corrupted!\n", i);
+                break;
+            }
+        }
+    });
+    
+    {
+        Task::sleep(Duration::from_millis(20));
         let _myvar1: Box<usize> = Box::new(1234);
         let _myvar2: Box<usize> = Box::new(2341);
         let _myvar3: Box<usize> = Box::new(3412);
         let _myvar4: Box<usize> = Box::new(4123);
         let mut myvec: Vec<i32> = Vec::new();
+        klog!("<Task {} allocate/verify/free 1000 i32>\n", Task::current());
         for i in 0..1000 {
             myvec.push(i);
         }
-        klog!("[MIDPOINT] FREE FRAMES: {}\n", pmm_num_free_frames());
+        klog!("[MIDPOINT] Free frames: {}\n", pmm_num_free_frames());
         klog!("_myvars: {}, {}, {}, {}\n",
                     *_myvar1, *_myvar2, *_myvar3, *_myvar4);
         for i in 0..1000 {
@@ -197,23 +266,143 @@ fn task3_exec() {
             }
         }
     }
-    klog!("[FINISHED] Heap Allocator Test - FREE FRAMES: {}\n",
-            pmm_num_free_frames());    
-}
+    Task::join(t4);
+    klog!("Free frames: {}, Cached TLSF Metadata: 5\n", pmm_num_free_frames());
+    klog!("[TEST] Co-op scheduling\n");
+    let t5 = Task::spawn(|| {
+        for _i in 0..10 {
+            klog!("<T5>");
+            Task::preempt();
+        }
+    });
 
-fn idle_task() {
-    // Halt puts the CPU in low-power mode and stops exection until there's an
-    // interrupt. Each CPU should end up here if there is no task to run
-    let cpuid = *(THIS_CPU_ID.borrow());
-    {
-        SHARED_VAR.lock();
-        klog!("<CPU{}/IDLE>", cpuid);
-        if cpuid == 0 {
-            klog!("FINAL FREE FRAMES: {}\n", pmm_num_free_frames());
+    for _i in 0..10 {
+        klog!("<T3>");
+        Task::preempt();
+    }
+
+    Task::join(t5);
+    klog!("\n[TEST] Shared wait channel...\n");
+    let mut wtid : [usize; 5] = [0; 5];
+    for i in 0..5 {
+        wtid[i] = 
+            Task::spawn(|| {
+                klog!("<New task {} waiting on wc>", Task::current());
+                WC.wait();
+                klog!("<Task {} out of wait>", Task::current());
+            });
+    }
+    Task::sleep(Duration::from_millis(1000));
+    klog!("\n<Task {} Signaling all the waiters>\n", Task::current());
+    WC.signal_all();
+    for i in 0..5 {
+        if wtid[i] > 0 {
+            Task::join(wtid[i]);
         }
     }
-    loop {
-        arch::cpu_enable_ints();
-        arch::cpu_halt();
+    klog!("\n[KERNEL SELF-TEST] Finished - Free frames: {}\n",
+        pmm_num_free_frames());
+}
+
+//////
+/// The initial user-space task (if RAMDISK was provided by the bootloader)
+///
+fn user_init_exec() {
+    // Wait for kernel's self-test to start and finish:
+    while BSP_T3_TID.load(Ordering::Relaxed) == 0 {
+        Task::preempt();
     }
+    Task::join(BSP_T3_TID.load(Ordering::Relaxed));
+
+    // Spawn the initial user-space process and convert this task into a
+    // user-space task in the initial process!
+    let userstack = palloc_continuous(4).expect("Out of memory");
+    {
+        SHARED_VAR.lock();
+        klog!("[INIT] Task {} - Switching to the INIT user-space process..\n",
+            Task::current());
+        klog!("User Stack: [{:X} - {:X}]\n\n", userstack, userstack + 4096 * 4);
+    }
+
+    let mut shell_proc : arch::Process = arch::Process::new();
+    shell_proc.init();
+    shell_proc.move_to_userspace(USER_INIT_EP.load(Ordering::Relaxed),
+                                userstack + 4096 * 4);
+    panic!("Must have been unreachable!");
+}
+
+
+///////
+/// User-space interface
+/// 
+
+#[repr(usize)]
+#[derive(PartialEq, PartialOrd)]
+pub enum SyscallOpCode {
+    Exit            = 0,
+    Open            = 1,
+    Read            = 2,
+    Write           = 3,
+    Exec            = 4,
+    Close           = 5,
+    Max             = 6
+}
+pub enum Syscall {
+    Exit{status: usize},
+    Open{path_ptr: usize, mode: usize, ret_ptr: usize},
+    Read{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
+    Write{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
+    Exec{fd: usize, cmd_buf_ptr: usize, buf_len: usize, ret_ptr: usize},
+    Close{fd: usize},
+}
+pub type SyscallHandlerFn = fn(usize, usize, usize, usize);
+
+fn syscall_exit(status: usize, _: usize, _: usize, _: usize) {
+    {
+        SHARED_VAR.lock();
+        klog!("\nProgram Exited with status {} - Current TID:{}\n",
+            status, Task::current());
+    }
+    Task::exit();
+}
+
+fn syscall_open(path_ptr: usize, mode: usize, _ret_ptr: usize, _: usize) {
+    SHARED_VAR.lock();
+    klog!("\nSyscall: OPEN({}, {}) by TID:{}\n", 
+                path_ptr, mode, Task::current());
+}
+
+fn syscall_read(fd: usize, buf: usize, len: usize, _ret_ptr: usize) {
+    if fd == 0 && len >= 1 {
+        // Standard input - i8046 keyboard
+        unsafe {
+            // return the last keychar to the user-space
+            let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
+            out[0] = drivers::I8046::read_key_ascii();
+                
+        }
+    }
+}
+
+fn syscall_write(fd: usize, buf: usize, len: usize, _ret_ptr: usize) {
+    SHARED_VAR.lock();
+    if fd == 0 {
+        // Standard output - VGA console
+        unsafe {
+            kearly_console::print_str(
+                        core::slice::from_raw_parts(buf as *const u8, len));
+            
+        }
+    }
+    
+}
+
+fn syscall_exec(fd: usize, _cmd_ptr: usize, _cmd_len: usize, _ret_ptr: usize) {
+    SHARED_VAR.lock();
+    klog!("\nSyscall: EXEC({}, {}) by TID:{}\n", fd, _cmd_ptr, Task::current());
+}
+
+fn syscall_close(fd: usize, _: usize, _: usize, _: usize) {
+    SHARED_VAR.lock();
+    klog!("\nSyscall: CLOSE({}) by TID:{}\n", fd, Task::current());
 }

@@ -20,6 +20,9 @@ else
 	ifeq ($(findstring heap,$(DEBUG)),heap)
 		FEATURES+=debug_heap,
 	endif
+	ifeq ($(findstring sched,$(DEBUG)),sched)
+		FEATURES+=debug_sched,
+	endif
 endif
 
 #To generate Debug info: make FEATURES="debug_arch"

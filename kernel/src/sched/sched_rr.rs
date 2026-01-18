@@ -3,18 +3,55 @@
 //
 // Round-Robin Task Scheduler
 //
-
+use alloc::collections::LinkedList;
 use crate::{arch::{SysTimerDuration, THIS_CPU_SYSTIMER}, sched::*};
 
 
+//
+// Default Scheduler : FCFS - Runs tasks to completion in order
+//
+#[derive(Debug)]
+pub struct FcfsScheduler {
+    run_queue:   LinkedList<usize>
+}
+impl FcfsScheduler {
+    pub const fn new() -> Self {
+        Self {
+            run_queue: LinkedList::new()
+        }
+    }
+
+    pub fn add_task(&mut self, tid: usize) {
+        self.run_queue.push_back(tid);
+    }
+
+    pub fn rem_task(&mut self, tid: usize) {
+        self.run_queue.retain(|x| *x != tid);
+    }
+
+    pub fn next_task(&mut self) -> Option<usize>
+    {
+        match self.run_queue.pop_front() {
+            Some(tid)      => {
+                self.run_queue.push_front(tid);
+                Some(tid)
+            }
+            None            => None
+        }       
+    }
+}
+
+#[derive(Debug)]
 pub struct RoundRobinScheduler{
     quantum_us : SysTimerDuration,
+    run_queue:   LinkedList<usize>
 }
 
 impl RoundRobinScheduler {
     pub const fn new() -> Self{
         Self {
-            quantum_us: SysTimerDuration::Ticks(0)
+            quantum_us: SysTimerDuration::Ticks(0),
+            run_queue: LinkedList::new()
         }
     }
 
@@ -25,25 +62,25 @@ impl RoundRobinScheduler {
         systimer.arm(self.quantum_us);
     }
     
-    pub fn next_task(&self, tasks: &mut [Task], cur: usize, idle: usize)
-                    -> usize
+    pub fn add_task(&mut self, tid: usize) {
+        self.run_queue.push_back(tid);
+    }
+
+    pub fn rem_task(&mut self, tid: usize) {
+        self.run_queue.retain(|x| *x != tid);
+        // klog!("..{:?}..", self.run_queue);
+    }
+
+    pub fn next_task(&mut self) -> Option<usize>
     {
-        // pick the next runnable task
-        for &mut t in &mut tasks[cur+1..] {
-            if t.runnable() && t.tid() != idle {
+        match self.run_queue.pop_front() {
+            Some(tid)       => {
+                self.run_queue.push_back(tid);
                 THIS_CPU_SYSTIMER.borrow().arm(self.quantum_us);
-                return t.tid();
+                Some(tid)
             }
-        }
-        // hit the end of the pool, start from the beginning
-        for &mut t in &mut tasks[0..=cur] {
-            if t.runnable() && t.tid() != idle {
-                THIS_CPU_SYSTIMER.borrow().arm(self.quantum_us);
-                return t.tid();
-            }
-        }
-        // No runnable task found. Return the idle task
-        idle
+            None            => None
+        }           
     }
     
 }    

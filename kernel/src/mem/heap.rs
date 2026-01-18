@@ -32,8 +32,11 @@ macro_rules! heapdbg {
     ($($arg:tt)*) => { };
 }
 
+static HEAP_LOCK: Spinlock<usize> = Spinlock::new(0);
+
 unsafe impl GlobalAlloc for Kalloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let lock = HEAP_LOCK.lock();
         let mut addr : *mut u8;
         addr = self.tlsf_alloc(layout);
         if addr == null_mut() {
@@ -46,10 +49,12 @@ unsafe impl GlobalAlloc for Kalloc {
             };
             heapdbg!("PALLOC {:p} Pages = {}\n", addr, page_count);
         }
+        drop(lock);
         addr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let lock = HEAP_LOCK.lock();
         if self.tlsf_free(ptr, layout) == false {
             // Must have been allocated from PMM
             let page_count= 
@@ -58,6 +63,7 @@ unsafe impl GlobalAlloc for Kalloc {
             heapdbg!("PFREE {:p} Pages = {}\n", ptr, page_count);
             pfree_continuous(ptr as usize, page_count);
         }
+        drop(lock);
     }
 }
 
@@ -238,6 +244,7 @@ impl Kalloc {
                 if cd.au_bitmap == 0xFFFFFFFFFFFFFFFF {
                     // This cluster is empty - return the allocation
                     Self::cluster_free(cd.base_addr as usize, au_index);
+                    cd.base_addr = 0;
                 }
                 return;
             }
