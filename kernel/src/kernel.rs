@@ -68,7 +68,12 @@ pub fn kstart(cpuid: usize,
     if cpuid == 0 {
         // BSP-only initialization
         klog!("BlightOS - Number of CPUs online: {}\n", cpu_count());
-        let initramdisk : bool;
+        let initramdisk : Option<(usize, usize)>;
+        if let Some(initelf) = ramdisk {
+            initramdisk = Some((initelf.start_phy_addr, initelf.end_phy_addr));
+        } else {
+            initramdisk = None;
+        }
 
         match mmap_opt {
             Some(mmap) => {
@@ -78,41 +83,11 @@ pub fn kstart(cpuid: usize,
                     kernel_start = &_KERNEL_START as *const usize as usize;
                     kernel_end = &_KERNEL_END as *const usize as usize;
                 }
-                // Initialize the physical memory manager
-                mem::phys::pmm_init(mmap, kernel_start, kernel_end);
+                // Initialize the physical memory manager. Also marks the kernel
+                // and the initramdisk (if any) as used
+                mem::phys::pmm_init(mmap, kernel_start, kernel_end, initramdisk);
             },
             _ => {panic!("No memory map was sent to the BSP!")}
-        }
-    
-        // Mark the initramfs as used in the physical memory
-        if let Some(initelf) = ramdisk {
-            unsafe {
-                let ep_virt = ((initelf.start_phy_addr + 0x18) as *const usize)
-                                .read();
-                klog!("InitELF: {:X} to {:X}\n", 
-                        initelf.start_phy_addr,  initelf.end_phy_addr);
-                // Frame aligned address range of the image
-                let first_addr= round_down!(initelf.start_phy_addr,
-                                            mem::phys::PHY_FRAME_SIZE);
-                let last_addr = round_up!(initelf.end_phy_addr,
-                                            mem::phys::PHY_FRAME_SIZE);
-                let frame_cnt = (last_addr - first_addr) /
-                                mem::phys::PHY_FRAME_SIZE;
-                // Mark the frames as used
-                mem::phys::pmm_mark_continuous(first_addr, frame_cnt, true);
-                // Create the process address space
-                match AddressSpace::spawn(first_addr, last_addr, ep_virt) {
-                    Some(pid)   => {
-                        USER_INIT_PID.store(pid, Ordering::Relaxed);
-                        initramdisk = true;
-                    },
-                    None        => {
-                        panic!("Could not create a process of INIT");
-                    }
-                }
-            }
-        } else {
-            initramdisk = false;
         }
 
         // Load the drivers
@@ -148,8 +123,22 @@ pub fn kstart(cpuid: usize,
         BSP_T2_TID.store(Task::spawn(task2_exec), Ordering::Relaxed);
 
         // Spawn the first user-space task from the provided ramdisk if any
-        if initramdisk == true {
-            Task::spawn(user_init_exec);
+        if let Some((first_addr, last_addr)) = initramdisk {
+            let ep_virt;
+            unsafe {
+                ep_virt = ((first_addr + 0x18) as *const usize).read_volatile();
+            }
+            
+            // Create the process address spaceS
+            match AddressSpace::spawn(first_addr, last_addr, ep_virt) {
+                Some(pid)   => {
+                    USER_INIT_PID.store(pid, Ordering::Relaxed);
+                    Task::spawn(user_init_exec);
+                },
+                None        => {
+                    panic!("Could not create a process of INIT");
+                }
+            }
         }
         // Jump to the first task and never come back ;)
         SCHEDULER.borrow_mut().start_scheduling(BSP_T1_TID.load(Ordering::Relaxed));

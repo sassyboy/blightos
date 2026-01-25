@@ -75,7 +75,8 @@ static BITMAP : Spinlock<FramesBitmap> = Spinlock::new(FramesBitmap::new());
 // Public Interface                                                          //
 //---------------------------------------------------------------------------//
 
-pub fn pmm_init(mmap: &[PMMapElement], kernel_start: usize, kernel_end: usize) {
+pub fn pmm_init(mmap: &[PMMapElement], kernel_start: usize, kernel_end: usize,
+                kmod: Option<(usize, usize)>) {
     let mut last_alloc_ram : usize = 0;
 
     // 1) Find the last allocatable usable memory address (and print the map)
@@ -107,7 +108,15 @@ pub fn pmm_init(mmap: &[PMMapElement], kernel_start: usize, kernel_end: usize) {
     //    There may be unspecified memory regions in the map, and it's safer to
     //    assume they are unusable
     //    TODO: Make sure there is enough available memory for the bitmap
-    bitmap.base = round_up!(kernel_end + 1, PHY_FRAME_SIZE);
+    bitmap.base = round_up!(kernel_end + 1, PHY_FRAME_SIZE); 
+    if let Some((_, mod_end)) = kmod {
+        // There is a module loaded after the kernel. Place the bitmap after
+        // that so that it doesn't overwrite the loaded module
+        if mod_end > kernel_end {
+            bitmap.base = round_up!(mod_end + 1, PHY_FRAME_SIZE);
+        }
+    }
+    
     unsafe {
         (bitmap.base as *mut u8).write_bytes(0, bitmap.size);
     }
@@ -135,10 +144,13 @@ pub fn pmm_init(mmap: &[PMMapElement], kernel_start: usize, kernel_end: usize) {
     bitmap.red_zone_end  = round_up!(bitmap.red_zone_end, PHY_FRAME_SIZE) - 1;
     pmm_mark_continuous_nolock(bitmap,
                             bitmap.red_zone_start, bitmap.red_zone_end, true);
-    
     dbg!("Kernel loaded from {:X} to {:X} ({:.2} KBs)\n",
         kernel_start, kernel_end,
         (kernel_end - kernel_start) as f64 /1024.0);
+    if let Some((mod_start, mod_end)) = kmod {
+        pmm_mark_continuous_nolock(bitmap, mod_start,mod_end, true);
+        dbg!("KMod marked used from {:X} to {:X}\n", mod_start, mod_end);
+    }
     dbg!("PMM Bitmap from {:X} to {:X} (maps {} frames) - ",
         bitmap.base, bitmap.base + bitmap.size - 1, bitmap.total_frames);
     dbg!("Red Zone from {:X} to {:X} ({:.2} KBs)\n",
