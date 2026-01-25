@@ -30,7 +30,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use util::*;
 use crate::arch::*;
-use crate::mem::physical::{palloc_continuous, pmm_num_free_frames};
+use crate::mem::phys::{pmm_num_free_frames};
+use crate::mem::virt::AddressSpace;
 use crate::sched::{SCHEDULER, Scheduler, Task, WaitChannel};
 
 
@@ -51,9 +52,9 @@ static BSP_T3_TID: AtomicUsize = AtomicUsize::new(0);
 pub struct RamdiskInfo {
     // Start/End of the physical address where the image is copied
     pub start_phy_addr: usize,
-    pub length:         usize // In bytes
+    pub end_phy_addr:   usize
 }
-static USER_INIT_EP: AtomicUsize = AtomicUsize::new(0);
+static USER_INIT_PID: AtomicUsize = AtomicUsize::new(0);
 
 // kstart : Kernel's Generic Entry Point
 // This function will be called by all onlined CPUs (BSP with cpuid=0) in any
@@ -61,12 +62,13 @@ static USER_INIT_EP: AtomicUsize = AtomicUsize::new(0);
 // stub code so that the generic code has the correct CPU count (e.g., for 
 // resource allocation purposes).
 pub fn kstart(cpuid: usize,
-                mmap_opt: Option<&[mem::physical::PMMapElement]>,
+                mmap_opt: Option<&[mem::phys::PMMapElement]>,
                 ramdisk: Option<RamdiskInfo>)
 {
     if cpuid == 0 {
         // BSP-only initialization
         klog!("BlightOS - Number of CPUs online: {}\n", cpu_count());
+        let initramdisk : bool;
 
         match mmap_opt {
             Some(mmap) => {
@@ -77,11 +79,42 @@ pub fn kstart(cpuid: usize,
                     kernel_end = &_KERNEL_END as *const usize as usize;
                 }
                 // Initialize the physical memory manager
-                mem::physical::pmm_init(mmap, kernel_start, kernel_end);
+                mem::phys::pmm_init(mmap, kernel_start, kernel_end);
             },
             _ => {panic!("No memory map was sent to the BSP!")}
         }
     
+        // Mark the initramfs as used in the physical memory
+        if let Some(initelf) = ramdisk {
+            unsafe {
+                let ep_virt = ((initelf.start_phy_addr + 0x18) as *const usize)
+                                .read();
+                klog!("InitELF: {:X} to {:X}\n", 
+                        initelf.start_phy_addr,  initelf.end_phy_addr);
+                // Frame aligned address range of the image
+                let first_addr= round_down!(initelf.start_phy_addr,
+                                            mem::phys::PHY_FRAME_SIZE);
+                let last_addr = round_up!(initelf.end_phy_addr,
+                                            mem::phys::PHY_FRAME_SIZE);
+                let frame_cnt = (last_addr - first_addr) /
+                                mem::phys::PHY_FRAME_SIZE;
+                // Mark the frames as used
+                mem::phys::pmm_mark_continuous(first_addr, frame_cnt, true);
+                // Create the process address space
+                match AddressSpace::spawn(first_addr, last_addr, ep_virt) {
+                    Some(pid)   => {
+                        USER_INIT_PID.store(pid, Ordering::Relaxed);
+                        initramdisk = true;
+                    },
+                    None        => {
+                        panic!("Could not create a process of INIT");
+                    }
+                }
+            }
+        } else {
+            initramdisk = false;
+        }
+
         // Load the drivers
         let drvs = drivers::get_builtin_drivers();
         for d in drvs.iter() {
@@ -104,8 +137,8 @@ pub fn kstart(cpuid: usize,
         
         // End of serialized kernel startup. Let APs start!
         klog!("[KERNEL SELF-TEST]: Starting...\n");
-        klog!("[TEST] Launching 2 tasks per CPU to compete over the same counter and \
-                screen buffer\n");
+        klog!("[TEST] Launching 2 tasks per CPU to compete over the same \
+               counter and screen buffer\n");
         BSP_INITIALIZED.store(true, Ordering::Relaxed);
 
         // Create the inital task pool for this CPU
@@ -115,16 +148,7 @@ pub fn kstart(cpuid: usize,
         BSP_T2_TID.store(Task::spawn(task2_exec), Ordering::Relaxed);
 
         // Spawn the first user-space task from the provided ramdisk if any
-        if let Some(initelf) = ramdisk {
-            unsafe {
-                // Copy the user program to 16MB
-                raw_memcpy(0x1000000, initelf.start_phy_addr, initelf.length);
-                // TODO validate the ELF header
-                // TODO Mark the range as reserved on the PMM
-                // Extract the entry point from the ELF64 header (8-bytes at 0x18)
-                USER_INIT_EP.store(*(0x1000018 as *const u64) as usize,
-                                    Ordering::Relaxed);
-            }
+        if initramdisk == true {
             Task::spawn(user_init_exec);
         }
         // Jump to the first task and never come back ;)
@@ -316,19 +340,13 @@ fn user_init_exec() {
 
     // Spawn the initial user-space process and convert this task into a
     // user-space task in the initial process!
-    let userstack = palloc_continuous(4).expect("Out of memory");
+    
     {
         SHARED_VAR.lock();
         klog!("[INIT] Task {} - Switching to the INIT user-space process..\n",
             Task::current());
-        klog!("User Stack: [{:X} - {:X}]\n\n", userstack, userstack + 4096 * 4);
     }
-
-    let mut shell_proc : arch::Process = arch::Process::new();
-    shell_proc.init();
-    shell_proc.move_to_userspace(USER_INIT_EP.load(Ordering::Relaxed),
-                                userstack + 4096 * 4);
-    panic!("Must have been unreachable!");
+    AddressSpace::launch(USER_INIT_PID.load(Ordering::Relaxed));
 }
 
 

@@ -1,4 +1,6 @@
-PLATDIR=x86_64
+ARCH=x86_64
+TARGET=$(ARCH)-unknown-none
+PROFILE=release
 #
 # rustc options:
 # -O: optimizes for --release and avoids some debug calls/instrumentations
@@ -6,7 +8,7 @@ PLATDIR=x86_64
 #                                     all compiler internals necessary
 # --target=x86_64-unknown-none: bare-metal x86_64 compiler target/internals
 #
-RC=cargo +nightly build -Z build-std=core,alloc
+RC=cargo build -Zbuild-std=core,alloc
 
 ifeq ($(findstring all,$(DEBUG)),all)
 	FEATURES+=debug_arch,debug_pmm,debug_heap
@@ -38,27 +40,39 @@ OBJCPY=$(TOOLCHAIN_PREFIX)objcopy
 # Prepare the list of the object files to compile into the kernel:
 # 1) Add the platform-dependent object files are already added by the
 # corresponding include.mk
-include src/arch/$(PLATDIR)/include.mk
+include src/arch/$(ARCH)/include.mk
 # 2) Add the platform-agnostic parts of the kernel
 
 
 BUILDDIR=../build/
-KERN_RST=$(BUILDDIR)libkernel.a
+KERN_RST=../target/$(TARGET)/$(PROFILE)/libkernel.a
 KERN_ELF=$(BUILDDIR)kernel.elf
+KERN_RST_SRC= \
+		src/kernel.rs \
+		src/util.rs	\
+		src/arch/x86_64/stub.rs \
+		src/arch//x86_64/vga.rs	\
+		src/arch/mod.rs	\
+		src/mem/mod.rs	\
+		src/mem/phys.rs	\
+		src/mem/virt.rs	\
+		src/mem/heap.rs	\
+		src/sched/mod.rs \
+		src/sched/sched_rr.rs \
+		src/drivers/mod.rs
 
 all: $(KERN_ELF)
 
 $(KERN_ELF): $(OBJFILES) $(KERN_RST)
-	$(LD) -T src/arch/$(PLATDIR)/link.ld $(LFLAGS) -o $@ $^
+	@mkdir -p $(BUILDDIR)
+	$(LD) -T src/arch/$(ARCH)/link.ld $(LFLAGS) -o $@ $^
 
-$(KERN_RST): src/kernel.rs
-	$(RC) --release --target="x86_64-unknown-none" $(RCFEATS)
-	mv ../target/x86_64-unknown-none/release/libkernel.a $(KERN_RST)
-	rm -rf ../target
+$(KERN_RST): $(KERN_RST_SRC)
+	$(RC) --$(PROFILE) --target="$(TARGET)" $(RCFEATS)
 
 %.o: %.S
 	$(CC) -c $(CFLAGS) $< -o $@
 
 clean:
 	cargo clean
-	rm -rf $(OBJFILES) $(KERN_RST) $(KERN_ELF) $(BOOT_IMG)
+	rm -rf $(OBJFILES) $(KERN_ELF) $(BOOT_IMG)

@@ -1,7 +1,7 @@
 OUTPUT_FORMAT("elf64-x86-64")
 
 /* For now we assume the user-space starts at 16MB */
-_USERSPACE_START = 0x1000000 + SIZEOF_HEADERS;
+_USERSPACE_START = 0x100000000 + SIZEOF_HEADERS;
 
 ENTRY(_start)
 SECTIONS {

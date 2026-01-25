@@ -31,8 +31,7 @@ $(GRUB_CFG):
 
 clean:
 	make -C kernel clean
-	rm -rf $(BOOT_IMG) $(BUILDDIR)*
-	@mkdir -p $(BUILDDIR)/
+	rm -rf $(BUILDDIR)
 
 run: $(BOOT_IMG)
 	@qemu-system-x86_64 -enable-kvm -smp 4 -m 512M \

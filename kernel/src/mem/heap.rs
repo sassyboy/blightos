@@ -16,8 +16,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use crate::util::*;
-use crate::mem::physical::{PHY_FRAME_SIZE, palloc, palloc_continuous,
-                            pfree_continuous};
+use crate::mem::phys::*;
 
 #[cfg(feature="debug_heap")]
 macro_rules! heapdbg {

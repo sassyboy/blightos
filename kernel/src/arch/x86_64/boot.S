@@ -605,16 +605,17 @@ switch_context:
 .globl switch_to_userspace
 switch_to_userspace:
   cli
+  /* Push the dummy irq stack onto the current kernel stack to jump to the
+   * new user address-space based in rdx
+   */
   pushq   $(0x20 | 3)   /* Ring-3 Stack Segment */
   pushq   %rsi          /* Ring-3 Stack Pointer */
   pushq   $0x202        /* Ring-3 Starting RFLAGS */
   pushq   $(0x18 | 3)   /* Ring-3 Code Segment */
-  pushq   $1f           /* Ring-3 RIP */
+  pushq   %rdi          /* Ring-3 RIP (Entry Point) */
   mov     %rsp, (%rcx)  /* Ring-0 Stack Pointer */
   mov     %rdx, %cr3    /* Swith to the new address-space */
   iretq
-1: /* In the destination Address Space and Ring-3 */
-  jmp    *%rdi          /* Call the main function of the user-space process */
   hlt
 
 /*******************************************************************************

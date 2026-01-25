@@ -7,7 +7,8 @@
 //
 use crate::arch::{self, SysTimerDuration};
 use crate::arch::THIS_CPU_ID;
-use crate::mem::physical::{PHY_FRAME_SIZE, palloc_continuous, pfree_continuous};
+use crate::mem::phys::*;
+use crate::mem::virt::AddressSpace;
 use crate::sched::sched_rr::FcfsScheduler;
 use crate::sched::sched_rr::RoundRobinScheduler;
 use crate::util::*;
@@ -81,7 +82,7 @@ impl Display for TaskState {
 #[derive(Clone, Debug)]
 pub struct Task {
     tid:            usize, // Task ID
-    pid:            usize, // Process Address Space ID
+    pid:            usize, // Process Address Space ID (0: Kernel-space/no proc)
     pub state:      TaskState,
     pub cpu:        u64, // Todo use as a mask, but for now run on 1 cpu only
     //
@@ -177,6 +178,23 @@ impl Task {
     pub fn exit() {
         SCHEDULER.borrow_mut().terminate_task();
     }
+
+    pub fn migrate_to_process(pid: usize) {
+        if let Ok(_lock) = Preemption::lock() {
+            let tid = *(CURR_TID.borrow());
+            let tpool = TASK_POOL.borrow_mut();
+            match tpool.get_mut(&tid) {
+                Some(task)      => {
+                    if task.pid == 0 {
+                        task.pid = pid
+                    } else {
+                        panic!("Can't migrate to a new process address space.");
+                    }
+                },
+                None            => {}
+            }
+        }
+    }
 }
 
 impl Drop for Task {
@@ -185,9 +203,13 @@ impl Drop for Task {
         for wtid in self.joiners.iter() {
             SCHEDULER.borrow_mut().unblock_task(*wtid);
         }
+        // Notify the process about this task being dropped
+        AddressSpace::task_dropped(self.pid, self.tid);
+        // Free the kernel stack
         pfree_continuous(self.stack_base, self.stack_pages);
         self.state = TaskState::Dropped;
-        dbg!("Dropped task {}\n", self.tid);
+        dbg!("Dropped task {} - Free frames: {}\n",
+                self.tid, pmm_num_free_frames());
     }
 }
 
@@ -435,7 +457,8 @@ impl Scheduler {
                 }
             }
             if TASK_POOL.borrow().len() == 1 && last_pool_size != 1 {
-                klog!("<CPU {} IDLE>", cpuid);
+                klog!("<CPU {} IDLE - Free Frames: {}>", cpuid,
+                        pmm_num_free_frames());
                 loop {
                     // For some reason it ends up emptying the pool if we
                     // leave the interrupts enabled

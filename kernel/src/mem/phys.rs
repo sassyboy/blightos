@@ -109,7 +109,7 @@ pub fn pmm_init(mmap: &[PMMapElement], kernel_start: usize, kernel_end: usize) {
     //    TODO: Make sure there is enough available memory for the bitmap
     bitmap.base = round_up!(kernel_end + 1, PHY_FRAME_SIZE);
     unsafe {
-        raw_memset(bitmap.base, bitmap.size, 0x0);
+        (bitmap.base as *mut u8).write_bytes(0, bitmap.size);
     }
     bitmap.free_frames = 0;
     
@@ -217,6 +217,15 @@ pub fn pmm_mark(addr: usize, used: bool) {
     let bitmap = &mut *(BITMAP.lock());
     if pmm_valid_address_nolock(bitmap, addr) {
         pmm_mark_nolock(bitmap, addr, used);
+    }
+}
+
+pub fn pmm_mark_continuous(addr: usize, num_frames: usize, used: bool) {
+    let bitmap = &mut *(BITMAP.lock());
+    for i in 0..num_frames {
+        if pmm_valid_address_nolock(bitmap, addr) {
+            pmm_mark_nolock(bitmap, addr + (i * PHY_FRAME_SIZE), used);
+        }
     }
 }
 

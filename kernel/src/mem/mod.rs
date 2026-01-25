@@ -4,12 +4,12 @@
 // Memory Management Module
 // 
 
-#[path = "pmm.rs"]
-pub mod physical;
+#[path = "phys.rs"]
+pub mod phys;
+
+#[path = "virt.rs"]
+pub mod virt;
 
 #[path = "heap.rs"]
 pub mod heap;
-
-
-
 

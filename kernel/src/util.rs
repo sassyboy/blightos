@@ -48,29 +48,6 @@ macro_rules! round_down {
     };
 }
 
-//
-// Raw memory manipulation
-//
-#[inline(never)]
-pub unsafe fn raw_memcpy(dst: usize, src: usize, n: usize) {
-    let mut destp : *mut u8 = dst as *mut u8;
-    let mut srcp  : *mut u8 = src as *mut u8;
-
-    for _i in 0..n {
-        *destp = *srcp;
-        destp  = destp.wrapping_add(1);
-        srcp   = srcp.wrapping_add(1); 
-    }
-}
-
-pub unsafe fn raw_memset(addr: usize, len: usize, filler: u8){
-    let mut destp : *mut u8 = addr as *mut u8;
-    for _i in 0..len {
-        *destp = filler;
-        destp  = destp.wrapping_add(1);
-    }
-}
-
 ///
 /// Provides a convenient way of a defining `percpu` global variables, i.e.,
 /// variables of which there is one copy per CPU. Reading/Writing from/to a

@@ -5,7 +5,7 @@
 
 use core::arch::asm;
 use crate::arch::asc::vga::*;
-use crate::mem::physical::{PMMapElement, palloc};
+use crate::mem::phys::*;
 use crate::sched::Task;
 use crate::{Syscall, SyscallHandlerFn, SyscallOpCode, util::*};
 use crate::{dump_memory, kstart};
@@ -334,7 +334,7 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
         kstart(bsp_cpu_id, Some(&mem_map[0..mem_map_count]),
                 Some(crate::RamdiskInfo {
                     start_phy_addr: mod_base,
-                    length: mod_end - mod_base + 1
+                    end_phy_addr: mod_end
                 })
         );
     }
@@ -559,7 +559,9 @@ fn percpu_init_sections() {
         dbg!("PERCPU: VMA {:X} bytes starting @ 0, LMA[{:X} - {:X}], #Copies: {}\n",
             sect_size, pcpu_s, pcpu_e, nsects);
         for s in 1..nsects {
-            raw_memcpy(pcpu_s + s * sect_size, pcpu_s, sect_size);
+            let base = pcpu_s + s * sect_size;
+            (base as *mut u8).copy_from_nonoverlapping(
+                                pcpu_s as *const u8, sect_size);
         }
         
     }
@@ -1507,13 +1509,15 @@ pub fn cpu_trigger_systimer_irq() {
 
 
 //
-// Process Address Space and MMU 
+// Memory Management Unit Abstraction
 //
-
-pub struct Process {
-    pml4_base: usize,
+pub struct MMUMapping {
+    // Virt=Phys address of PML4 Table <-> CR3
+    pml4_base   : usize,
+    // Virt=Phys address of PML4[0] -> PDPT0 Table base (first 512GB)
+    pdpt0_base  : usize,
 }
-impl Process {
+impl MMUMapping {
     // See boot.S for our GDT Entries
     const GDTE_USER_CODE: u16 = 0x18;
     const GDTE_USER_DATA: u16 = 0x20;
@@ -1528,36 +1532,51 @@ impl Process {
     const PGENT_PCD:            u64 = 0x10; // Page-level Cache Disable
     const PGENT_PS:             u64 = 0x80; // Set for large pages
     const PGENT_G:              u64 = 0x100; // Global
+    const PGENT_BASE_MASK:      u64 = 0xFFFFFFF000;
+
+    // 4-Level Mapping - Virtual Address bits
+    //     9 bits       9 bits       9 bits         9 bits         12 bits
+    // [47 pml4e 39][38 pdpte 30][29   pde   21][20   pte   12][11   off   0]
+    //
+    // Virtual memory address range that can be mapped via calls to map_pages
+    pub const MIN_VIRTUAL:      u64 = 0x100000000;     // 4 GBs
+    pub const MAX_VIRTUAL:      u64 = (1 << 39) - 1;   // 256 GBs - only pml4[0]
+    pub const PAGE_SIZE:        usize = 0x1000; // Only 4KB pages in this range
     
     pub const fn new() -> Self {
         Self {
-            pml4_base: 0
+            pml4_base: 0,
+            pdpt0_base: 0
         }
     }
 
     // Creates the initial paging structures for the process that includes
-    // the kernel mappings. The rest should be
+    // the kernel mappings.
+    // VIRTUAL MEM           --> PHYSICAL MEM
+    // 0   - 4GB             --> 0 - 4GB R/W KERNEL MODE
+    // 4GB - 4GB+IMAGE_SIZE  --> IMAGE_START + IMAGE_END
     pub fn init(&mut self) {
         // Allocate and zero out:
         //   1 page for the PML4 table and 1 page for the first PDPT table
         self.pml4_base  = palloc().expect("Out of memory");
-        let pdpt0       = palloc().expect("Out of memory");
+        self.pdpt0_base = palloc().expect("Out of memory");
         unsafe {
-            raw_memset(self.pml4_base, 4096, 0);
-            raw_memset(pdpt0,          4096, 0);
+            (self.pml4_base  as *mut u8).write_bytes(0, 0x1000);
+            (self.pdpt0_base as *mut u8).write_bytes(0, 0x1000);
         }
 
         // Set PML4[0] --> PDPT0 that covers the first 512 GB
-        let pml4e0 = pdpt0 as u64 | Self::PGENT_PRESENT |
+        let pml4e0 = self.pdpt0_base as u64 | Self::PGENT_PRESENT |
                     Self::PGENT_WRITABLE | Self::PGENT_USERMODE;
         Self::write_table_entry(self.pml4_base, 0, pml4e0);
 
         // Set PDPT0[0..=3] to Identity-map the first 4GB as user-mode for now
         let pdpt0e = Self::PGENT_PRESENT | Self::PGENT_WRITABLE |
-                    Self::PGENT_USERMODE | Self::PGENT_PS; // 1GB page
+                        Self::PGENT_PS; // 1GB page
         for i in 0..4 {
             let phys_addr : u64 = i << 30;
-            Self::write_table_entry(pdpt0, i as usize, pdpt0e | phys_addr);
+            Self::write_table_entry(self.pdpt0_base, i as usize, 
+                                    pdpt0e | phys_addr);
         }
 
         // Log everything for testing
@@ -1572,30 +1591,6 @@ impl Process {
         }
     }
 
-    /*
-     * Execution/Segmentation Management methods
-     */
-    ///
-    /// Converts the currently running kernel task into a user-space task as a
-    /// part of this process address space. The calling (kernel) task will not
-    /// return to the next instruction after its call to move_to_userspace.
-    /// The user-space execution must end with an Exit system call, at which
-    /// point the task terminates.
-    /// 
-    pub fn move_to_userspace(&self, entry_point: usize, user_stack: usize) {
-        // Prepare CS, DS, SS for ring 3 transition and then jump to the
-        // entry point address given. x64 doesn't support ljmp, so Iretq it is!
-        // Should save the RSP0 pointer in the TSS for this CPU so that when
-        // the cpu traps in ring-0 again, kernel's stack is recovered
-        let _tss_rsp0: usize = x64_tss_rsp0_addr();
-        dbg!("TSS[0].RSP0 is located at {:X}\n", _tss_rsp0);
-        unsafe {
-            switch_to_userspace(entry_point, user_stack, self.pml4_base,
-                                x64_tss_rsp0_addr());
-        }
-        panic!("Must have been unreachable!\n");
-    }
-
     //
     // Paging structure management methods 
     //
@@ -1604,22 +1599,107 @@ impl Process {
     // Above 4GB       ----> Non-contiguous 4KB physical pages as user access
     //
     //
-    pub fn page_size() -> usize {
-        0x1000
-    }
 
     pub fn addr_to_page_index(addr: usize) -> usize {
         addr >> 12
     }
 
-    // Maps a page (virtual address > 4GB) to a frame (physical address) 
-    pub fn map_pages(_virt_addr: usize, _phys_addr: usize, _num_pages: usize,
-                    _privileged: bool, _writeable: bool, _executable: bool,
-                    _caching: MmuCachingPolicy) {
-        // Todo - Should look at CR3, map the structs into a temporary scratchpad
-        //        space and then add the new map.
-        // Forgot how MTRR registers affect specific memory region caching...
-        // Look it up.
+    // Maps a page (virtual address > 4GB) to a frame (physical address)
+    // The assumption is that the caller has already reserved page_cnt frames
+    // starting from phys_address from the physical memory manager.
+    pub fn map_pages(&self, virt_addr: usize, phys_addr: usize, page_cnt: usize,
+                     privileged: bool, writeable: bool, _executable: bool,
+                    _caching: MmuCachingPolicy) -> bool {
+        // Page-align the given addresses
+        let mut vaddr : u64 = virt_addr as u64 & Self::PGENT_BASE_MASK;
+        let mut paddr : u64 = phys_addr as u64 & Self::PGENT_BASE_MASK;
+        dbg!("map_pages(v:{:X}, p:{:X}, cnt:{}\n", vaddr, paddr, page_cnt);
+        if vaddr < Self::MIN_VIRTUAL || vaddr > Self::MAX_VIRTUAL  {
+            return false;
+        }
+
+        for _i in 0..page_cnt {
+            let pdpt0e_i    = (vaddr >> 30) & 0x1FF; // Index in PDPT[0]
+            let pde_i       = (vaddr >> 21) & 0x1FF; // Index in PD
+            let pte_i       = (vaddr >> 12) & 0x1FF; // Index in PT
+            let pd_base : usize;
+            let pt_base : usize;
+
+            // 1GB Region
+            let mut pdpt0e = Self::read_table_entry(self.pdpt0_base,
+                                                pdpt0e_i as usize);
+            if pdpt0e == 0 {
+                // Allocate a page directory for this PDPT0[pdpt0e_i]
+                pd_base = palloc().expect("Out of memory");
+                unsafe {
+                    (pd_base as *mut u8).write_bytes(0, 0x1000);
+                }
+                pdpt0e = pd_base as u64 | Self::PGENT_PRESENT |
+                           Self::PGENT_USERMODE | Self::PGENT_WRITABLE;
+                Self::write_table_entry(self.pdpt0_base,
+                                        pdpt0e_i as usize, pdpt0e);
+            } else {
+                // Retrieve the page directory's base from PDPT0[pdpt0e_i]
+                pd_base = (pdpt0e & Self::PGENT_BASE_MASK) as usize;
+            }
+
+            // 2 MB Region
+            let mut pde = Self::read_table_entry(pd_base,
+                                            pde_i as usize);
+            if pde == 0 {
+                // Allocate a page table for this PD[pde_i]
+                pt_base = palloc().expect("Out of memory");
+                unsafe {
+                    (pt_base as *mut u8).write_bytes(0, 0x1000);
+                }
+                pde = pt_base as u64 | Self::PGENT_PRESENT |
+                           Self::PGENT_USERMODE | Self::PGENT_WRITABLE;
+                Self::write_table_entry(pd_base, pde_i as usize, pde);
+            } else {
+                // Retrieve the page table's base from ths PD[pde_i]
+                pt_base = (pde & Self::PGENT_BASE_MASK) as usize;
+            }
+
+            // 4KB Region
+            let mut pte : u64 = (paddr & Self::PGENT_BASE_MASK) |
+                                Self::PGENT_PRESENT;
+            if writeable == true {
+                pte |= Self::PGENT_WRITABLE;
+            }
+            if privileged == false {
+                pte |= Self::PGENT_USERMODE;
+            }
+            Self::write_table_entry(pt_base, pte_i as usize, pte);
+
+            vaddr += Self::PAGE_SIZE as u64;
+            paddr += Self::PAGE_SIZE as u64;
+        }
+
+        true
+    }
+
+    pub fn log_mapping(&self, vaddr: usize) {
+        let pdpt0e_i    = (vaddr >> 30) & 0x1FF; // Index in PDPT[0]
+        let pde_i       = (vaddr >> 21) & 0x1FF; // Index in PD
+        let pte_i       = (vaddr >> 12) & 0x1FF; // Index in PT
+
+        
+        klog!("pml4[0] @ {:X} => {:X}\n", self.pml4_base, 
+            Self::read_table_entry(self.pml4_base, 0));
+
+        let pdpte = Self::read_table_entry(self.pdpt0_base, pdpt0e_i);
+        klog!("  pdpt0 @ {:X} elem[{}]=> {:X}\n", self.pdpt0_base, pdpt0e_i,
+            pdpte as usize);
+
+        let pd_base = pdpte & Self::PGENT_BASE_MASK;
+        let pde = Self::read_table_entry(pd_base as usize, pde_i);
+        klog!("    pd @ {:X} elem[{}]=> {:X}\n", pd_base, pde_i, pde);
+        
+        let pt_base = pde & Self::PGENT_BASE_MASK;
+        let pte = Self::read_table_entry(pt_base as usize, pte_i);
+        klog!("      pt @ {:X} elem[{}]=> {:X}\n", pt_base, pte_i, pte);
+        klog!("VADDR {:X} --> PADDR {:X}\n", vaddr, 
+                pte & Self::PGENT_BASE_MASK);
     }
 
     pub fn unmap_pages(_virt_addr: usize, _num_pages: usize) {
@@ -1636,14 +1716,81 @@ impl Process {
     fn read_table_entry(table_virt_base: usize, index: usize) -> u64 {
         unsafe {
             let destp : *mut u64 = table_virt_base as *mut u64;
-            *(destp.wrapping_add(index))
+            destp.wrapping_add(index).read_volatile()
         }
+    }
+
+    /*
+     * Execution/Segmentation Management methods
+     */
+    ///
+    /// Converts the currently running kernel task into a user-space task as a
+    /// part of this process address space. The calling (kernel) task will not
+    /// return to the next instruction after its call to move_to_userspace.
+    /// The user-space execution must end with an Exit system call, at which
+    /// point the task terminates.
+    /// 
+    pub fn move_to_userspace(priv_data: usize, entry_point: usize,
+                            user_stack: usize) {
+        // Prepare CS, DS, SS for ring 3 transition and then jump to the
+        // entry point address given. x64 doesn't support ljmp, so Iretq it is!
+        // Should save the RSP0 pointer in the TSS for this CPU so that when
+        // the cpu traps in ring-0 again, kernel's stack is recovered
+        let _tss_rsp0: usize = x64_tss_rsp0_addr();
+        dbg!("TSS[0].RSP0 is located at {:X}\n", _tss_rsp0);
+        unsafe {
+            switch_to_userspace(entry_point, user_stack, priv_data /*pml4_base*/
+                                , x64_tss_rsp0_addr());
+        }
+        panic!("Must have been unreachable!\n");
+    }
+
+    pub fn copy_priv_data(&self) -> usize {
+        self.pml4_base
     }
 }
 
-impl Drop for Process {
+impl Drop for MMUMapping {
     fn drop(&mut self) {
+        let mut _pg_count = 0;
+        let mut _pg_st_count = 0;
         // Release the paging structures
+        for pdpt0e_i in 0..512 {
+            let pdpt0e = Self::read_table_entry(self.pdpt0_base, pdpt0e_i);
+            if pdpt0e & Self::PGENT_PRESENT > 0 && pdpt0e & Self::PGENT_PS == 0{
+                // Points to a page directory
+                let pde_base = pdpt0e & Self::PGENT_BASE_MASK;
+                for pde_i in 0..512 {
+                    let pde = Self::read_table_entry(pde_base as usize, pde_i);
+                    if pde & Self::PGENT_PRESENT > 0 &&
+                        pde & Self::PGENT_PS == 0 {
+                        // Points to a page table
+                        let pt_base = (pde & Self::PGENT_BASE_MASK) as usize;
+                        for pte_i in 0..512 {
+                            let pte = Self::read_table_entry(pt_base, pte_i);
+                            if pte & Self::PGENT_PRESENT > 0 {
+                                // Release the physical frame itself too
+                                _pg_count += 1;
+                                pfree((pte & Self::PGENT_BASE_MASK) as usize);
+                            }
+                        }
+                        // Release the Page Table
+                        _pg_st_count += 1;
+                        pfree((pde & Self::PGENT_BASE_MASK) as usize);
+                    }
+                }
+                // Release the Page Directory
+                _pg_st_count += 1;
+                pfree(pde_base as usize);
+            }
+        }
+        _pg_st_count += 2;
+        pfree(self.pdpt0_base);
+        pfree(self.pml4_base);
+        dbg!("Released {} user frames and {} paging structure frames - \
+              Free frames: {}\n", _pg_count, _pg_st_count,
+              pmm_num_free_frames());
+
     }
 }
 
@@ -1724,7 +1871,8 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
     unsafe {
         let src_start: usize = &_AP_STARTUP16_ENTRY as *const usize as usize;
         let src_end  : usize = &_AP_STARTUP16_END as *const usize as usize;
-        raw_memcpy(0x8000, src_start, src_end - src_start);
+        (0x8000 as *mut u8).copy_from_nonoverlapping(
+                                src_start as *const u8, src_end - src_start);
     }
     //// 2) Send INIT-SIPI_SIPI for each AP and check the magic# on their stack
     ////    That would indicate the completion of their trampoline code.
