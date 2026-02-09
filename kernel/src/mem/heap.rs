@@ -31,14 +31,11 @@ macro_rules! heapdbg {
     ($($arg:tt)*) => { };
 }
 
-static HEAP_LOCK: Spinlock<usize> = Spinlock::new(0);
-
 unsafe impl GlobalAlloc for Kalloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let lock = HEAP_LOCK.lock();
         let mut addr : *mut u8;
         addr = self.tlsf_alloc(layout);
-        if addr == null_mut() {
+        if addr.is_null() {
             // Request too large for our TLSF allocator -> Allocate from PMM
             let page_count =
                 round_up!(layout.size(), PHY_FRAME_SIZE) / PHY_FRAME_SIZE;
@@ -48,12 +45,10 @@ unsafe impl GlobalAlloc for Kalloc {
             };
             heapdbg!("PALLOC {:p} Pages = {}\n", addr, page_count);
         }
-        drop(lock);
         addr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let lock = HEAP_LOCK.lock();
         if self.tlsf_free(ptr, layout) == false {
             // Must have been allocated from PMM
             let page_count= 
@@ -62,7 +57,6 @@ unsafe impl GlobalAlloc for Kalloc {
             heapdbg!("PFREE {:p} Pages = {}\n", ptr, page_count);
             pfree_continuous(ptr as usize, page_count);
         }
-        drop(lock);
     }
 }
 
@@ -115,20 +109,12 @@ struct KallocClusterDescriptorPage {
     pub _prev:       u64,
     pub _next:       u64
 }
-impl KallocClusterDescriptorPage {
-    pub const fn new() -> Self {
-        Self {
-            descriptors:[KallocClusterDescriptor::new(); 255],
-            _prev: 0,
-            _next: 0
-        }
-    }
-}
 
 pub struct Kalloc {}
 
 const KALLOC_ROOT_ENTRIES: usize = 64;
-static mut KALLOC_ROOT: [usize; KALLOC_ROOT_ENTRIES] = [0; KALLOC_ROOT_ENTRIES];
+static KALLOC_ROOT: Spinlock<[usize; KALLOC_ROOT_ENTRIES]> = 
+                        Spinlock::new([0; KALLOC_ROOT_ENTRIES]);
 impl Kalloc {
     
     pub const fn new() -> Self {
@@ -140,14 +126,14 @@ impl Kalloc {
         let au_index= au / 64;
         heapdbg!("tlsf_alloc({}, {}) au:{}, au_index:{}\n",
             layout.size(), layout.align(), au, au_index);
-
+        let mut root = KALLOC_ROOT.lock();
         if au_index < KALLOC_ROOT_ENTRIES {
             // (Optional) Allocate the first Cluster Descriptor Page for AU
-            if KALLOC_ROOT[au_index] == 0 {
+            if (*root)[au_index] == 0 {
                 match palloc(){
                     Some(cdp_base)  => {
                         Self::desc_page_init(cdp_base);
-                        KALLOC_ROOT[au_index] = cdp_base;
+                        (*root)[au_index] = cdp_base;
                     }
                     None            => {
                         return null_mut();
@@ -155,7 +141,7 @@ impl Kalloc {
                 }
             }
             // Find the location where the data should go
-            return Self::cluster_search_alloc(au_index) as *mut u8;
+            return Self::cluster_search_alloc(&*root, au_index) as *mut u8;
         }
         null_mut() // Request not handled by my TLSF implementation
     }
@@ -167,16 +153,25 @@ impl Kalloc {
             ptr as usize, layout.size(), layout.align(), au, au_index);
 
         if au_index < KALLOC_ROOT_ENTRIES {
-            Self::cluster_search_free(ptr as usize, au_index);
+            let root = KALLOC_ROOT.lock();
+            Self::cluster_search_free(&*root, ptr as usize, au_index);
             return true;
         }
         false // Request not handled by my TLSF implementation
     }
 
-    unsafe fn desc_page_init(base_addr: usize) {
-        let des_pg_ptr: *mut KallocClusterDescriptorPage =
-            base_addr as *mut KallocClusterDescriptorPage;
-        *des_pg_ptr = KallocClusterDescriptorPage::new();
+    fn desc_page_init(base_addr: usize) {
+        let dp;
+        unsafe {
+            let des_pg_ptr: *mut KallocClusterDescriptorPage =
+                base_addr as *mut KallocClusterDescriptorPage;
+            dp = &mut (*des_pg_ptr);
+        }
+        dp._prev = 0;
+        dp._next = 0;
+        for i in 0..255 {
+            dp.descriptors[i] = KallocClusterDescriptor::new()
+        }
     }
     fn cluster_alloc(au_index: usize) -> usize {
         match palloc_continuous(au_index) {
@@ -196,10 +191,10 @@ impl Kalloc {
     }
 
     // Returns the address in which the new object can be written into
-    unsafe fn cluster_search_alloc(au_index: usize) -> usize {
+    unsafe fn cluster_search_alloc(root: &[usize], au_index: usize) -> usize {
         // TODO: Chain more CDPs if this one is out of space
         let des_pg_ptr: *mut KallocClusterDescriptorPage = 
-                KALLOC_ROOT[au_index] as *mut KallocClusterDescriptorPage;
+                root[au_index] as *mut KallocClusterDescriptorPage;
 
         for cd in &mut (*des_pg_ptr).descriptors {
             if cd.au_bitmap > 0 {
@@ -213,18 +208,18 @@ impl Kalloc {
                 let offset    = bit_index as usize * au_index * 64;
                 // Clear the bit
                 cd.au_bitmap &= !(1 << bit_index);
-                heapdbg!("  CLUSTER SEARCH_ALLOC: Base: {:X}, Bitmap: {:X}, Off:{:X}\n",
-                        cd.base_addr, cd.au_bitmap, offset);
+                heapdbg!("  CLUSTER SEARCH_ALLOC: Base: {:X}, Bitmap: {:X}, \
+                        Off:{:X}\n", cd.base_addr, cd.au_bitmap, offset);
                 return cd.base_addr as usize + offset;
             }
         }
         0
     }
 
-    unsafe fn cluster_search_free(addr: usize, au_index: usize) {
+    unsafe fn cluster_search_free(root: &[usize], addr: usize, au_index: usize){
         let cluster_size = au_index * PHY_FRAME_SIZE;
         let des_pg_ptr: *mut KallocClusterDescriptorPage = 
-                KALLOC_ROOT[au_index] as *mut KallocClusterDescriptorPage;
+                root[au_index] as *mut KallocClusterDescriptorPage;
 
         for cd in &mut (*des_pg_ptr).descriptors {
             if cd.base_addr == 0 {

@@ -138,15 +138,25 @@ setup_initial_4lp:
   orl   $0xB, %eax                    /* Present|Writable|Cache-Write-Through */
   movl	%eax, init_pml4_table
 
-/* Level 3) Set pdpte[0] point to the 1st GB, pdpte[1] to the 2nd GB and ...  */
-  movl  $0x8B, %eax/* 0x9B: Present|Writable|Write-Through|No-Cache|HugePage */
-  movl  %eax, init_page_dir_pointer_table+0
-  movl  $0x4000008B, %eax
-  movl  %eax, init_page_dir_pointer_table+8
-  movl  $0x8000008B, %eax
-  movl  %eax, init_page_dir_pointer_table+16
-  movl  $0xC000008B, %eax
-  movl  %eax, init_page_dir_pointer_table+24
+/* Level 3) PDPT[0..7] maps the first 8GBs of virtual address space for kernel*/
+/* Map Virt[0GB..4GB] -> Phys[0..4GB] as 0x83 P/W/S  Kernel's Code/Data       */
+  movl  $0x00000083, %eax
+  movl  %eax, init_page_dir_pointer_table+0*8
+  movl  $0x40000083, %eax
+  movl  %eax, init_page_dir_pointer_table+1*8
+  movl  $0x80000083, %eax
+  movl  %eax, init_page_dir_pointer_table+2*8
+  movl  $0xC0000083, %eax
+  movl  %eax, init_page_dir_pointer_table+3*8
+/* Map Virt[4GB..8GB] -> Phys[0..4GB] as 0x9B P/W/S/NC Kernel's DMA           */
+  movl  $0x0000009B, %eax
+  movl  %eax, init_page_dir_pointer_table+4*8
+  movl  $0x4000009B, %eax
+  movl  %eax, init_page_dir_pointer_table+5*8
+  movl  $0x8000009B, %eax
+  movl  %eax, init_page_dir_pointer_table+6*8
+  movl  $0xC000009B, %eax
+  movl  %eax, init_page_dir_pointer_table+7*8
 
 /* Load base address of PML4 table into cr3 */
 	mov $init_pml4_table, %eax
@@ -162,14 +172,14 @@ setup_initial_4lp:
 /**
  * setup_idt
  *
- * Installs a 49-item IDT table in which all items are Interrupt gates and
+ * Installs a 66-item IDT table in which all items are Interrupt gates and
  * point to various interrupt entry point according to the table idt_vectors
  */
 .code32
 setup_idt:
   pushal
   lea idt_base,%edi
-  mov $49,%ecx
+  mov $66,%ecx
   lea idt_vectors, %ebx
 1:
   movl (%ebx),%edx         /* vector offset[31:0] */
@@ -389,6 +399,69 @@ irq_handler15:
   CALL_KIRQ_HANDLER 15
   iretq
 
+irq_handler16:
+  CALL_KIRQ_HANDLER 16
+  iretq
+
+irq_handler17:
+  CALL_KIRQ_HANDLER 17
+  iretq
+
+irq_handler18:
+  CALL_KIRQ_HANDLER 18
+  iretq
+
+irq_handler19:
+  CALL_KIRQ_HANDLER 19
+  iretq
+
+irq_handler20:
+  CALL_KIRQ_HANDLER 20
+  iretq
+
+irq_handler21:
+  CALL_KIRQ_HANDLER 21
+  iretq
+
+irq_handler22:
+  CALL_KIRQ_HANDLER 22
+  iretq
+
+irq_handler23:
+  CALL_KIRQ_HANDLER 23
+  iretq
+irq_handler24:
+  CALL_KIRQ_HANDLER 24
+  iretq
+
+irq_handler25:
+  CALL_KIRQ_HANDLER 25
+  iretq
+
+irq_handler26:
+  CALL_KIRQ_HANDLER 26
+  iretq
+
+irq_handler27:
+  CALL_KIRQ_HANDLER 27
+  iretq
+
+irq_handler28:
+  CALL_KIRQ_HANDLER 28
+  iretq
+
+irq_handler29:
+  CALL_KIRQ_HANDLER 29
+  iretq
+
+irq_handler30:
+  CALL_KIRQ_HANDLER 30
+  iretq
+
+irq_handler31:
+  CALL_KIRQ_HANDLER 31
+  iretq
+
 /*******************************************************************************
  * Global Descriptor Table
  * See Section 3.4.5 - Segment Descriptors
@@ -417,26 +490,26 @@ gdt64_tssd_base:
   .quad 0x0
   .quad 0x0
   /* 0x38: CPU 1 TSS */
-  .quad 0x20890000000068 
-  .quad tss64_base+(0x68 * 1)
+  .quad 0x0 
+  .quad 0x0
   /* 0x48: CPU 2 TSS */
-  .quad 0x20890000000068 
-  .quad tss64_base+(0x68 * 2)
+  .quad 0x0
+  .quad 0x0
   /* 0x58: CPU 3 TSS */
-  .quad 0x20890000000068 
-  .quad tss64_base+(0x68 * 3)
+  .quad 0x0
+  .quad 0x0
   /* 0x68: CPU 4 TSS */
-  .quad 0x20890000000068 
-  .quad tss64_base+(0x68 * 4)
+  .quad 0x0
+  .quad 0x0
   /* 0x78: CPU 5 TSS */
-  .quad 0x20890000000068 
-  .quad tss64_base+(0x68 * 5)
+  .quad 0x0
+  .quad 0x0
   /* 0x88: CPU 6 TSS */
-  .quad 0x20890000000068 
-  .quad tss64_base+(0x68 * 6)
+  .quad 0x0
+  .quad 0x0
   /* 0x98: CPU 7 TSS */
-  .quad 0x20890000000068 
-  .quad tss64_base+(0x68 * 7)
+  .quad 0x0
+  .quad 0x0
 
 gdt64_pointer:
   .short gdt64_pointer - gdt64_base - 1
@@ -447,8 +520,8 @@ gdt64_pointer:
  ******************************************************************************/
 .globl idt_base
 idt_base:
-  .fill 50,8,0		# idt is uninitialized
-  .fill 50,8,0		# idt is uninitialized
+  .fill 66,8,0		# idt is uninitialized
+  .fill 66,8,0		# idt is uninitialized
 
 .globl idt_pointer
 idt_pointer:
@@ -506,6 +579,22 @@ idt_vectors:
   .quad   irq_handler13
   .quad   irq_handler14
   .quad   irq_handler15
+  .quad   irq_handler16
+  .quad   irq_handler17
+  .quad   irq_handler18
+  .quad   irq_handler19
+  .quad   irq_handler20
+  .quad   irq_handler21
+  .quad   irq_handler22
+  .quad   irq_handler23
+  .quad   irq_handler24
+  .quad   irq_handler25
+  .quad   irq_handler26
+  .quad   irq_handler27
+  .quad   irq_handler28
+  .quad   irq_handler29
+  .quad   irq_handler30
+  .quad   irq_handler31
 
 /******************************************************************************
  * Task State Segment - One per CPU                                           *

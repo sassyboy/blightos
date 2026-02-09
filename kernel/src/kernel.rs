@@ -21,19 +21,39 @@ pub mod arch;
 pub mod mem;
 //// Task Scheduler ////
 pub mod sched;
+//// File System /////
+pub mod fs;
 //// Device Drivers ////
 pub mod drivers;
 
+pub mod test;
+
+use core::cmp::min;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use core::time::Duration;
-use alloc::boxed::Box;
+use alloc::{format, str};
+use alloc::string::String;
 use alloc::vec::Vec;
 use util::*;
 use crate::arch::*;
-use crate::mem::phys::{pmm_num_free_frames};
-use crate::mem::virt::AddressSpace;
-use crate::sched::{SCHEDULER, Scheduler, Task, WaitChannel};
+use crate::drivers::storage::{IOCompletion, num_disks};
+use crate::fs::{DirectoryEntry, MountPoint, enumerate_filesystems};
+use crate::mem::virt::{AddressSpace, FileDescriptor};
+use crate::sched::{SCHEDULER, Scheduler, Task};
+use crate::drivers::kbd::*;
 
+#[cfg(feature="debug_kern")]
+macro_rules! dbg {
+    ($($arg:tt)*) => {
+        let mut debug_console = DebugOut;
+        let _ = write!(&mut debug_console, "[KERN] ");
+        let _ = write!(&mut debug_console, $($arg)*);
+    };
+}
+
+#[cfg(not(feature="debug_kern"))]
+macro_rules! dbg {
+    ($($arg:tt)*) => { };
+}
 
 unsafe extern "C" {
     static _KERNEL_START: usize;
@@ -44,10 +64,6 @@ static BSP_INITIALIZED : AtomicBool = AtomicBool::new(false);
 
 #[global_allocator]
 static ALLOCATOR: mem::heap::Kalloc = mem::heap::Kalloc::new();
-
-static BSP_T1_TID: AtomicUsize = AtomicUsize::new(0);
-static BSP_T2_TID: AtomicUsize = AtomicUsize::new(0);
-static BSP_T3_TID: AtomicUsize = AtomicUsize::new(0);
 
 pub struct RamdiskInfo {
     // Start/End of the physical address where the image is copied
@@ -103,45 +119,40 @@ pub fn kstart(cpuid: usize,
         // Todo: Need an event timer to implement sleep, etc.
 
         // Install the system call handlers
-        arch::syscall_register(SyscallOpCode::Exit,     syscall_exit);
+        arch::syscall_register(SyscallOpCode::TaskCtl,  syscall_task_control);
         arch::syscall_register(SyscallOpCode::Open,     syscall_open);
+        arch::syscall_register(SyscallOpCode::Enum,     syscall_enum);
         arch::syscall_register(SyscallOpCode::Read,     syscall_read);
         arch::syscall_register(SyscallOpCode::Write,    syscall_write);
         arch::syscall_register(SyscallOpCode::Exec,     syscall_exec);
         arch::syscall_register(SyscallOpCode::Close,    syscall_close);
         
-        // End of serialized kernel startup. Let APs start!
-        klog!("[KERNEL SELF-TEST]: Starting...\n");
-        klog!("[TEST] Launching 2 tasks per CPU to compete over the same \
-               counter and screen buffer\n");
-        BSP_INITIALIZED.store(true, Ordering::Relaxed);
+        // BSP initialization finished. Unblock APs, start the scheduler,
+        // and jump to the first task
+        Scheduler::config_round_robin(SysTimerDuration::Microseconds(200));
 
-        // Create the inital task pool for this CPU
-        Scheduler::config_round_robin(SysTimerDuration::Milliseconds(1));
-        // Scheduler::config_first_come_first_served();
-        BSP_T1_TID.store(Task::spawn(task1_exec), Ordering::Relaxed);
-        BSP_T2_TID.store(Task::spawn(task2_exec), Ordering::Relaxed);
-
-        // Spawn the first user-space task from the provided ramdisk if any
+        // Spawn the first process address space from the provided initramdisk
         if let Some((first_addr, last_addr)) = initramdisk {
             let ep_virt;
             unsafe {
                 ep_virt = ((first_addr + 0x18) as *const usize).read_volatile();
             }
             
-            // Create the process address spaceS
+            // Create the process address space
             match AddressSpace::spawn(first_addr, last_addr, ep_virt) {
                 Some(pid)   => {
                     USER_INIT_PID.store(pid, Ordering::Relaxed);
-                    Task::spawn(user_init_exec);
+                    Task::spawn_on_cpu(kinit_task, cpuid,String::from("kInit"));
                 },
                 None        => {
-                    panic!("Could not create a process of INIT");
+                    panic!("Could not create INIT process");
                 }
             }
+        } else {
+            panic!("No ramdiskimg provided. Could not create INIT process!");
         }
-        // Jump to the first task and never come back ;)
-        SCHEDULER.borrow_mut().start_scheduling(BSP_T1_TID.load(Ordering::Relaxed));
+        BSP_INITIALIZED.store(true, Ordering::Relaxed);
+        SCHEDULER.borrow_mut().start_scheduling();
     } else {
         // AP initialization
         // Wait for BSP to perform the serialized portion of
@@ -149,27 +160,15 @@ pub fn kstart(cpuid: usize,
         while BSP_INITIALIZED.load(Ordering::Relaxed) == false {
             core::hint::spin_loop();
         }
-        // Create the inital task pool for this CPU
-        Scheduler::config_round_robin(SysTimerDuration::Milliseconds(1));
-        Task::spawn(task2_exec);
         // Jump to the first task!
-        SCHEDULER.borrow_mut().start_scheduling(Task::spawn(task1_exec));
+        Scheduler::config_round_robin(SysTimerDuration::Microseconds(200));
+        SCHEDULER.borrow_mut().start_scheduling();
     }
     panic!("Reached the end of kstart!");
 }
 
 fn systimer_irq_handler(_cpuid: u16){
     SCHEDULER.borrow_mut().preempt_irq();
-}  
-
-pub fn dump_memory(base: usize, qwords: usize) {
-    unsafe {
-        let mut datap: *mut usize = base as *mut usize;
-        for _ in 0..qwords {
-            klog!("{:X}: {:016X}\n", datap as usize, *datap);
-            datap = datap.wrapping_add(1);
-        }
-    }
 }
 
 #[panic_handler]
@@ -193,148 +192,37 @@ pub fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-static SHARED_VAR : Spinlock<i32> = Spinlock::new(0);
-
-// TESTING...
-fn task1_exec() {
-    let cpuid = *(THIS_CPU_ID.borrow());
-    loop {
-        {
-            let mut shared_var = SHARED_VAR.lock();
-            if *shared_var >= 100 {
-                break;
-            }
-            *shared_var += 1;
-            klog!("<C{}/T{}={}>", cpuid, Task::current(), *shared_var);
-        }
-        Task::sleep(Duration::from_millis(5));
-    }
-}
-
-fn task2_exec() {
-    let cpuid = *(THIS_CPU_ID.borrow());
-    if cpuid == 0 {
-        BSP_T3_TID.store(Task::spawn(task3_exec), Ordering::Relaxed); 
-    }
-    loop {
-        {
-            let mut shared_var = SHARED_VAR.lock();
-            if *shared_var >= 100 {
-                break;
-            }
-            *shared_var += 1;
-            klog!("<C{}/T{}={}>", cpuid, Task::current(), *shared_var);
-        }
-        Task::sleep(Duration::from_millis(5));
-    }
-}
-
-static WC : WaitChannel = WaitChannel::new();
-
-fn task3_exec() {
-    {
-        SHARED_VAR.lock();
-        klog!("<A LONG MESSAGE TO TEST THE CONSOLE PRINT_STR LOCK - TID{}>",
-                Task::current());
-    }
-    // Wait for the first two tasks to finish
-    Task::join(BSP_T1_TID.load(Ordering::Relaxed));
-    Task::join(BSP_T2_TID.load(Ordering::Relaxed));
-    Task::sleep(Duration::from_secs(1)); // Wait for task on other CPUs
-    klog!("\n[Test] Parallel heap allocations - Free frames: {}\n",
-            pmm_num_free_frames());
-
-    let t4 = Task::spawn(|| {
-        klog!("<Task {} allocate/verify/free 1000 i32>\n", Task::current());
-        let mut myvec: Vec<i32> = Vec::new();
-        for i in 0..1000 {
-            myvec.push(i);
-        }
-        for i in 0..1000 {
-            if myvec[i] != i as i32 {
-                klog!("[FAIL] Vector element {} corrupted!\n", i);
-                break;
-            }
-        }
-    });
-    
-    {
-        Task::sleep(Duration::from_millis(20));
-        let _myvar1: Box<usize> = Box::new(1234);
-        let _myvar2: Box<usize> = Box::new(2341);
-        let _myvar3: Box<usize> = Box::new(3412);
-        let _myvar4: Box<usize> = Box::new(4123);
-        let mut myvec: Vec<i32> = Vec::new();
-        klog!("<Task {} allocate/verify/free 1000 i32>\n", Task::current());
-        for i in 0..1000 {
-            myvec.push(i);
-        }
-        klog!("[MIDPOINT] Free frames: {}\n", pmm_num_free_frames());
-        klog!("_myvars: {}, {}, {}, {}\n",
-                    *_myvar1, *_myvar2, *_myvar3, *_myvar4);
-        for i in 0..1000 {
-            if myvec[i] != i as i32 {
-                klog!("[FAIL] Vector element {} corrupted!\n", i);
-                break;
-            }
-        }
-    }
-    Task::join(t4);
-    klog!("Free frames: {}, Cached TLSF Metadata: 5\n", pmm_num_free_frames());
-    klog!("[TEST] Co-op scheduling\n");
-    let t5 = Task::spawn(|| {
-        for _i in 0..10 {
-            klog!("<T5>");
-            Task::preempt();
-        }
-    });
-
-    for _i in 0..10 {
-        klog!("<T3>");
-        Task::preempt();
-    }
-
-    Task::join(t5);
-    klog!("\n[TEST] Shared wait channel...\n");
-    let mut wtid : [usize; 5] = [0; 5];
-    for i in 0..5 {
-        wtid[i] = 
-            Task::spawn(|| {
-                klog!("<New task {} waiting on wc>", Task::current());
-                WC.wait();
-                klog!("<Task {} out of wait>", Task::current());
-            });
-    }
-    Task::sleep(Duration::from_millis(1000));
-    klog!("\n<Task {} Signaling all the waiters>\n", Task::current());
-    WC.signal_all();
-    for i in 0..5 {
-        if wtid[i] > 0 {
-            Task::join(wtid[i]);
-        }
-    }
-    klog!("\n[KERNEL SELF-TEST] Finished - Free frames: {}\n",
-        pmm_num_free_frames());
-}
 
 //////
-/// The initial user-space task (if RAMDISK was provided by the bootloader)
+/// The INIT task
+/// 1) Initializes the drivers' post-enum stage
+/// 2) (Optional) Performs kernel's self-test
+/// 3) Sets up the first address-space and lunches the first user program
 ///
-fn user_init_exec() {
-    // Wait for kernel's self-test to start and finish:
-    while BSP_T3_TID.load(Ordering::Relaxed) == 0 {
-        Task::preempt();
+fn kinit_task() {
+    // Perform the post-enumeration phase of the drivers
+    dbg!("{} (TID {}) started on CPU {}\n",
+            Task::name(), Task::current_tid(), Task::current_cpu());
+    let drvs = drivers::get_builtin_drivers();
+    for d in drvs.iter() {
+        (d.post_enum)();
     }
-    Task::join(BSP_T3_TID.load(Ordering::Relaxed));
+
+    let ndisks = num_disks();
+    for d in 0..ndisks {
+        dbg!("Preparing disk {} out of {}\n", d + 1, ndisks);
+        enumerate_filesystems(d);
+    }
+    
+    // Kernel Self-Test - Moved to an fexec call on the machine: file
+    // klog!("calling test::kself_test\n");
+    // test::kself_test();
 
     // Spawn the initial user-space process and convert this task into a
     // user-space task in the initial process!
-    
-    {
-        SHARED_VAR.lock();
-        klog!("[INIT] Task {} - Switching to the INIT user-space process..\n",
-            Task::current());
-    }
+    dbg!("[INIT] Task {} - Switching to the INIT user-space process.. ({})\n",
+            Task::current_tid(), pmm_num_free_frames());
+    I8046Keyboard::clear_buffer();
     AddressSpace::launch(USER_INIT_PID.load(Ordering::Relaxed));
 }
 
@@ -346,54 +234,279 @@ fn user_init_exec() {
 #[repr(usize)]
 #[derive(PartialEq, PartialOrd)]
 pub enum SyscallOpCode {
-    Exit            = 0,
+    TaskCtl         = 0,
     Open            = 1,
-    Read            = 2,
-    Write           = 3,
-    Exec            = 4,
-    Close           = 5,
-    Max             = 6
+    Enum            = 2,
+    Read            = 3,
+    Write           = 4,
+    Exec            = 5,
+    Close           = 6,
+    Max             = 7
+}
+
+#[repr(usize)]
+#[derive(PartialEq, PartialOrd)]
+pub enum SyscallRsvdFDs {
+    StandardIO      = 0,
+    StandardError   = 1,
+    // Reading from this file returns string name prefixes that can be used to
+    // access mount points and various devices, e.g., disk0.0, uart2, kbd0, etc.
+    SystemResources = 2,
+    Max             = 3,
 }
 pub enum Syscall {
-    Exit{status: usize},
-    Open{path_ptr: usize, mode: usize, ret_ptr: usize},
+    // Task/Process control
+    TaskControl{opcode: usize, args: usize, ret_code: usize},
+
+    // Device/File control
+    Open{path_ptr: usize, path_len: usize, mode: usize, ret_ptr: usize},
+    // Enum returns file/directory/device information
+    Enum{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
     Read{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
     Write{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
-    Exec{fd: usize, cmd_buf_ptr: usize, buf_len: usize, ret_ptr: usize},
+    Exec{fd: usize, cmd_buf_ptr: usize, cmd_buf_len: usize, ret_ptr: usize},
     Close{fd: usize},
 }
 pub type SyscallHandlerFn = fn(usize, usize, usize, usize);
 
-fn syscall_exit(status: usize, _: usize, _: usize, _: usize) {
-    {
-        SHARED_VAR.lock();
-        klog!("\nProgram Exited with status {} - Current TID:{}\n",
-            status, Task::current());
+//
+// Task Control System Call
+//
+#[repr(usize)]
+#[derive(PartialEq, PartialOrd)]
+pub enum TaskControlOpCode {
+    Exit        = 0,
+    Current     = 1,
+    Spawn       = 2,
+    Join        = 3,
+}
+
+#[repr(C, packed)]
+pub struct UserTaskInfo{
+    pub tid:        usize,
+    pub pid:        usize,
+    pub name:       [u8; 64]
+}
+
+fn syscall_task_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
+    if opcode == TaskControlOpCode::Exit as usize {
+        // EXIT
+        klog!("\nProgram ({} - MainTID:{}) Exited with status {}\n",
+                                    Task::name(), Task::current_tid(), args);
+        Task::exit();
+    } else if opcode == TaskControlOpCode::Current as usize {
+        // CURRENT
+        let tinfo: *mut UserTaskInfo = args as *mut UserTaskInfo;
+        let mut tname_out = [0 as u8; 64];
+        let tname = Task::name();
+        let tname_len = min(tname.len(), 63);
+        tname_out[0..tname_len].copy_from_slice(&tname.as_bytes()[0..tname_len]);
+
+        unsafe {
+            tinfo.write(UserTaskInfo {
+                tid: Task::current_tid(),
+                pid: Task::current_pid(),
+                name: tname_out
+            });
+            if ret_ptr != 0 {
+                (ret_ptr as *mut usize).write(size_of::<UserTaskInfo>());
+            }
+        }
+        
+    } else if opcode == TaskControlOpCode::Spawn as usize {
+        // SPAWN (Creates a task in the current process address space)
+        klog!("\nTaskControlOpCode::Spawn syscall not implemented!\n");
+    } else if opcode == TaskControlOpCode::Join as usize {
+        klog!("\nTaskControlOpCode::Join syscall not implemented!\n");
+    } else {
+        klog!("\nInvalid TaskControlOpcode\n");
     }
-    Task::exit();
+    
 }
 
-fn syscall_open(path_ptr: usize, mode: usize, _ret_ptr: usize, _: usize) {
-    SHARED_VAR.lock();
-    klog!("\nSyscall: OPEN({}, {}) by TID:{}\n", 
-                path_ptr, mode, Task::current());
+// ret_code = 0 no error
+fn syscall_read_resources(out_buffer: &mut [u8], _offset: usize) -> usize {
+    let mut out_index = 0;
+    // Always return the disk%d.%d resources back
+    let lst_parts = MountPoint::list_names();
+    for mnt_name in lst_parts {
+        if mnt_name.len() + 1 < out_buffer.len() - out_index {
+            let name_bytes = mnt_name.as_bytes();
+            out_buffer[out_index..(out_index+name_bytes.len())]
+                                                .copy_from_slice(name_bytes);
+            out_index += name_bytes.len();
+            out_buffer[out_index] = b'\n';
+            out_index += 1;
+        }
+    }
+    // Remove the tailing \n if any
+    if out_index > 0 && out_buffer[out_index - 1] == b'\n' {
+        out_buffer[out_index - 1] = 0;
+        out_index -= 1;
+    }
+    out_index
 }
 
-fn syscall_read(fd: usize, buf: usize, len: usize, _ret_ptr: usize) {
-    if fd == 0 && len >= 1 {
+fn syscall_open(path_ptr: usize, path_len: usize, _mode: usize, ret_ptr: usize) {
+    cpu_enable_ints(); // TODO - SWITCH TO TASK GATES/SYSCALL
+
+    let pathb;
+    unsafe {
+        pathb = core::slice::from_raw_parts(path_ptr as *const u8, path_len);
+    }
+    let path = str::from_utf8(pathb).unwrap();
+    if let Some(mnt) = MountPoint::from_path(path) {
+        let fopen_ret = mnt.fopen(path);      
+        match fopen_ret {
+            drivers::storage::IOCompletion::Successful(hnd)  => {
+                // let fd = AddressSpace::add_file_object(pid, f);
+                // klog!("OPEN syscall successful for {} hnd={}\n", path, hnd);
+                let pid = Task::current_pid();
+                let fd_obj = FileDescriptor {
+                                fs_handle: hnd,
+                                mount_name: mnt.name.clone(),
+                                read_off: 0,
+                                write_off: 0,
+                };
+                let fd = AddressSpace::add_fd(pid, fd_obj);
+                if ret_ptr != 0 {
+                    // For now just add 4 to the hnd to obtain an FD
+                   unsafe { (ret_ptr as *mut usize).write(fd); }
+                }
+            },
+            _                   => {
+                dbg!("OPEN syscall failed for {} w\\ {:?}\n", path, fopen_ret);
+                if ret_ptr != 0 {
+                    unsafe { (ret_ptr as *mut usize).write(0); }
+                }
+            }
+        }
+    } else {
+        // Device not found
+        // TODO need a way to pass different error codes
+        if ret_ptr != 0 {
+            unsafe { (ret_ptr as *mut usize).write(0); }
+        }
+    }
+    // klog!("\nSyscall: OPEN({}, {}, {}) by PID:{} TID:{}\n{:?}", 
+    //         path, path_len, mode, Task::current_pid(), Task::current_tid());
+}
+
+fn syscall_read(fd: usize, buf: usize, len: usize, ret_ptr: usize) {
+    cpu_enable_ints(); // TODO - SWITCH TO TASK GATES/SYSCALL
+    if fd == SyscallRsvdFDs::StandardIO as usize && len >= 1 {
         // Standard input - i8046 keyboard
         unsafe {
             // return the last keychar to the user-space
             let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
-            out[0] = drivers::I8046::read_key_ascii();
+            out[0] = I8046Keyboard::read_key_ascii();
                 
+        }
+        return;
+    } else if fd == SyscallRsvdFDs::SystemResources as usize {
+        // Resource Enumeration
+        unsafe {
+            let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
+            let ret_val = syscall_read_resources(out, 0);
+            if ret_ptr != 0 {
+                (ret_ptr as *mut usize).write(ret_val);
+            }
+        }
+        return;
+    }
+    // Normal File Read
+    let pid = Task::current_pid();
+    if let Some(mut fd_obj) = AddressSpace::get_fd(pid, fd) {
+        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
+            unsafe {
+                let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
+                let ioc = mnt.fread(fd_obj.fs_handle, fd_obj.read_off, out);
+                let ret_val;
+                if let IOCompletion::Successful(len) = ioc {
+                    fd_obj.read_off += len;
+                    AddressSpace::update_fd(pid, fd, &fd_obj);
+                    ret_val = len;
+                } else {
+                    ret_val = 0;
+                }
+                if ret_ptr != 0 {
+                    (ret_ptr as *mut usize).write(ret_val);
+                }
+            }
+        } else {
+            // Invalid Mount Point
+            dbg!("READ syscall failed due to invalid Mount Point {}\n", fd);
+            if ret_ptr != 0 {
+                unsafe {(ret_ptr as *mut usize).write(0);}
+            }
+        }
+    } else {
+        // Invalid FD
+        dbg!("READ syscall failed due to invalid FD {}\n", fd);
+        if ret_ptr != 0 {
+            unsafe {(ret_ptr as *mut usize).write(0);}
         }
     }
 }
 
+fn syscall_enum(fd: usize, buf: usize, buf_len: usize, ret_ptr: usize) {
+    cpu_enable_ints(); // TODO - SWITCH TO TASK GATES/SYSCALL
+    if fd <= SyscallRsvdFDs::SystemResources as usize {
+        //Enum not supported on special FDs!
+        unsafe {
+            if ret_ptr != 0 {
+                (ret_ptr as *mut usize).write(0);
+            }
+                
+        }
+        return;
+    }
+
+    let pid = Task::current_pid();
+    if let Some(fd_obj) = AddressSpace::get_fd(pid, fd) {
+        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
+            let mut out_vec: Vec<DirectoryEntry> = Vec::new();
+            let ioc = mnt.fenum(fd_obj.fs_handle, &mut out_vec);
+            if let IOCompletion::Successful(_cnt) = ioc {
+                let mut serialized = String::new();
+                for item in out_vec {
+                    serialized += format!("{}, {}, 0x{:X}\n",
+                                    item.name, item.size, item.flags).as_str();
+                }
+                let len = min(buf_len, serialized.len());
+                unsafe {
+                    let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
+                    out[0..len].copy_from_slice(serialized.as_bytes());
+                }
+                
+                if ret_ptr != 0 {
+                    unsafe {(ret_ptr as *mut usize).write(len);}
+                }    
+            } else {
+                // Enum failed/not-supported
+                if ret_ptr != 0 {
+                    unsafe { (ret_ptr as *mut usize).write(0); }
+                }
+            }
+        } else {
+            // Invalid Mount Point
+            dbg!("ENUM syscall failed due to invalid Mount Point {}\n", fd);
+            if ret_ptr != 0 {
+                unsafe {(ret_ptr as *mut usize).write(0);}
+            }
+        }
+    } else {
+        // Invalid FD
+        dbg!("ENUM syscall failed due to invalid FD {}\n", fd);
+        if ret_ptr != 0 {
+            unsafe {(ret_ptr as *mut usize).write(0);}
+        }
+    }    
+}
+
+
 fn syscall_write(fd: usize, buf: usize, len: usize, _ret_ptr: usize) {
-    SHARED_VAR.lock();
-    if fd == 0 {
+    if fd == SyscallRsvdFDs::StandardIO as usize {
         // Standard output - VGA console
         unsafe {
             kearly_console::print_str(
@@ -404,12 +517,54 @@ fn syscall_write(fd: usize, buf: usize, len: usize, _ret_ptr: usize) {
     
 }
 
-fn syscall_exec(fd: usize, _cmd_ptr: usize, _cmd_len: usize, _ret_ptr: usize) {
-    SHARED_VAR.lock();
-    klog!("\nSyscall: EXEC({}, {}) by TID:{}\n", fd, _cmd_ptr, Task::current());
+fn syscall_exec(fd: usize, cmd_ptr: usize, cmd_len: usize, fr_ptr: usize) {
+    let pid = Task::current_pid();
+    if let Some(fd_obj) = AddressSpace::get_fd(pid, fd) {
+        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
+            let cmd_func;
+            let mut ret_val: usize = 0;
+            unsafe {
+                cmd_func = (fr_ptr as *mut usize).read();
+                let cmd_buf = core::slice::from_raw_parts_mut(cmd_ptr as *mut u8, cmd_len);
+
+                dbg!("syscall_exec called on fd:{}, mnt:{}, func:{}\n",
+                    fd, mnt.name, cmd_func
+                    );
+
+                let ioc = mnt.fexec(fd_obj.fs_handle, cmd_func, cmd_buf);
+                if let IOCompletion::Successful(len) = ioc {
+                    ret_val = len;
+                }
+                if fr_ptr != 0 {
+                    (fr_ptr as *mut usize).write(ret_val);
+                }
+            }
+        } else {
+            // Invalid Mount Point
+            dbg!("EXEC syscall failed due to invalid Mount Point {}\n", fd);
+            if fr_ptr != 0 {
+                unsafe {(fr_ptr as *mut usize).write(0);}
+            }
+        }
+    } else {
+        // Invalid FD
+        dbg!("EXEC syscall failed due to invalid FD {}\n", fd);
+        if fr_ptr != 0 {
+            unsafe {(fr_ptr as *mut usize).write(0);}
+        }
+    }    
 }
 
 fn syscall_close(fd: usize, _: usize, _: usize, _: usize) {
-    SHARED_VAR.lock();
-    klog!("\nSyscall: CLOSE({}) by TID:{}\n", fd, Task::current());
+    let pid = Task::current_pid();
+    let mut closed = false;
+    if let Some(fd_obj) = AddressSpace::get_fd(pid, fd) {
+        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
+            mnt.fclose(fd_obj.fs_handle);
+            closed = true;
+        }
+    }
+    if closed {
+        AddressSpace::rem_file_object(pid, fd);
+    }
 }

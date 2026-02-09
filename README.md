@@ -8,28 +8,34 @@ Install rust and the nightly `x86_64-unknown-none` toolchain, `gcc`,
 debugging information (directed at the default serial port) pertaining to all or
 any combination of components. Available debug options are:
     - `arch` : Architecture-dependent module (arch/x86_64/stub.rs)
+    - `kern` : Kernel's main entry (init, syscall handling, etc in kernel.rs)
     - `pmm`  : Physical memory allocator (mem/pmm.rs)
     - `heap` : Dynamic memory allocator (mem/heap.rs)
     - `sched`: Task scheduler events
-
+    - etc. (See `kernel/Makefile` for more)
 ---
 ## Features
 - Kernel:
     - Architecture: Dual-mode monolithic (Ring3: user-space/ Ring0: kernel-space)
     - H/W Architecture: x86_64 Long Mode (64-bit)
     - Startup: BIOS/UEFI Multiboot2-compatible bootloader required
-    - Minimal ACPI support for SMP enumeration
+    - Minimal ACPI support for SMP enumeration, reboot, etc.
     - Symmetric Multiprocessing (SMP) up to 8 CPUs
-    - Local Round-Robin and FCFS task schedulers
+    - Local Round-Robin scheduling w\ automatic load balancing, task migration, etc.
     - Bitmap physical memory allocator
-    - Flat 4GB PML-4 virtual memory
+    - PML-4 virtual memory manager
     - Simplified TLSF heap allocator
+    - Unix-line Virtual File System
+        - `disk#.#:/` for normal file system access using a `disk.partition:` pattern
+        - `driver-name:/` for accessing a specific driver via VFS. Check out `machine:/` for example
 - Device support:
     - IOAPIC/LAPIC for SMP IRQ routing and per-cpu task preemption
     - Basic VESA Graphics support with built-in bitmap font rendering
     - Basic i8046 PS/2 Keyboard driver
+    - AHCI (SATA) Bus Controller
+    - FAT12/16/32 File System Driver (Read-only)
 - User-space runtime library
-    - Basic formatted std-output and std-readline syscall wrappers
+    - Basic stdio,fileio and syscall wrappers
 
 ---
 ## Screenshot

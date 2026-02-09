@@ -10,7 +10,10 @@ path = "src/kernel.rs"
 
 
 [features]
+debug_kern = []
 debug_arch = []
 debug_pmm  = []
 debug_heap = []
 debug_sched= []
+debug_ahci = []
+debug_pci  = []

@@ -5,9 +5,8 @@
 ///   Use this in the absence of the std library.
 ///
 
-use crate::arch::{kdebug_console, kearly_console};
-use crate::arch::{percpu_borrow, percpu_borrow_mut};
-use crate::sched;
+use crate::arch::*;
+use crate::sched::Preemption;
 pub use core::fmt::Write;
 
 pub struct ConsoleOut;
@@ -26,11 +25,50 @@ impl Write for DebugOut {
     }
 }
 
+pub static KLOG_LOCK: Spinlock<usize> = Spinlock::new(0);
 macro_rules! klog {
     ($($arg:tt)*) => {
+        let kllock = KLOG_LOCK.lock();
         let mut kern_console = ConsoleOut{};
         let _ = write!(&mut kern_console, $($arg)*);
+        drop(kllock);
     };
+}
+
+pub fn dump_memory(base: usize, qwords: usize) {
+    unsafe {
+        let mut datap: *mut usize = base as *mut usize;
+        for _ in 0..qwords {
+            klog!("{:X}: {:016X}\n", datap as usize, *datap);
+            datap = datap.wrapping_add(1);
+        }
+    }
+}
+
+pub fn dump_memory_columns(base: usize, qwords: usize, ncols: usize) {
+    unsafe {
+        let mut datap: *mut usize = base as *mut usize;
+        for i in 0..qwords {
+            if i % ncols == 0 {
+                klog!("{:X}: ", datap as usize);
+            }
+            klog!("{:016X} ", datap.read_volatile());
+            if i % ncols == ncols - 1 {
+                klog!("\n");
+            }
+            datap = datap.wrapping_add(1);
+        }
+        klog!("\n");
+    }
+}
+
+pub fn dump_memory_ascii(base: usize, nbytes: usize) {
+    let ptr = base as *const u8; // Cast to byte pointer
+    // Calculate size and create a slice
+    let byte_array = unsafe {
+        core::slice::from_raw_parts(ptr, nbytes)
+    };
+    klog!("{}\n", str::from_utf8(byte_array).unwrap());
 }
 
 //
@@ -129,7 +167,7 @@ impl<T> PerCpuGlobal<T> {
     pub fn write(&self, val: T) {
         // Scheduling a new task in the middle of accessing a percpu variable
         // can lead to state inconsistencies and undefined behavior
-        let _lock = sched::Preemption::lock();
+        let _lock = Preemption::lock();
         *(percpu_borrow_mut(&(self.var))) = val;
     }
 
@@ -162,12 +200,13 @@ use core::{
 };
 
 pub struct Spinlock<T> {
-    is_locked: AtomicBool,
-    data: UnsafeCell<T>,
+    is_locked:  AtomicBool,
+    data:       UnsafeCell<T>,
 }
 
 pub struct SpinlockCriticalSection<'a, T: 'a> {
-    sl: &'a Spinlock<T>,
+    sl:     &'a Spinlock<T>,
+    ints:   bool,
 }
 
 unsafe impl<T> Send for Spinlock<T> {}
@@ -176,29 +215,35 @@ unsafe impl<T> Sync for Spinlock<T> {}
 impl<T> Spinlock<T> {
     pub const fn new(data: T) -> Self {
         Self {
-            is_locked: AtomicBool::new(false),
-            data: UnsafeCell::new(data),
+            is_locked:  AtomicBool::new(false),
+            data:       UnsafeCell::new(data),
         }
     }
 
     pub fn lock(&self) -> SpinlockCriticalSection<'_, T> {
         loop {
-            if !self.is_locked.swap(true, Ordering::Acquire) {
-                return SpinlockCriticalSection { sl: self };
+            let ie = crate::arch::cpu_ints_enabled();
+            crate::arch::cpu_disable_ints();
+            if self.is_locked.swap(true, Ordering::AcqRel) == false {
+                return SpinlockCriticalSection { sl: self, ints: ie };
             }
+            crate::arch::cpu_restore_ints(ie);
 
-            while self.is_locked.load(Ordering::Relaxed) {
+            while self.is_locked.load(Ordering::Acquire) {
                 core::hint::spin_loop();
             }
         }
     }
 
     pub fn try_lock(&self) -> Option<SpinlockCriticalSection<'_, T>> {
+        let ie = crate::arch::cpu_ints_enabled();
+        crate::arch::cpu_disable_ints();
         if !self.is_locked.swap(true, Ordering::AcqRel) {
             // is_locked was false and now we have atomically swapped it to true,
             // so no one else has access to this data.
-            return Some(SpinlockCriticalSection { sl: self });
+            return Some(SpinlockCriticalSection { sl: self, ints: ie });
         }
+        crate::arch::cpu_restore_ints(ie);
         None
     }
 }
@@ -206,6 +251,7 @@ impl<T> Spinlock<T> {
 impl<'a, T: 'a> Drop for SpinlockCriticalSection<'a, T> {
     fn drop(&mut self) {
         self.sl.is_locked.store(false, Ordering::Release);
+        crate::arch::cpu_restore_ints(self.ints);
     }
 }
 

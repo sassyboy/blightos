@@ -4,10 +4,11 @@
 #![allow(dead_code)]
 
 use core::arch::asm;
+use core::time::Duration;
 use crate::arch::asc::vga::*;
 use crate::mem::phys::*;
 use crate::sched::Task;
-use crate::{Syscall, SyscallHandlerFn, SyscallOpCode, util::*};
+use crate::{SyscallHandlerFn, SyscallOpCode, util::*};
 use crate::{dump_memory, kstart};
 use core::fmt::Write;
 
@@ -177,6 +178,13 @@ percpu_global! {
 //
 #[unsafe(no_mangle)]
 extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
+
+    // Initialize the per-cpu sections
+    let bsp_cpu_id = cpu_id(); // LAPIC ID
+    percpu_init_sections();
+    percpu_init_cpu(bsp_cpu_id);
+    *THIS_CPU_ID.borrow_mut() = bsp_cpu_id;
+
     // Physical Memory Map Buffer
     let mut mem_map: [PMMapElement; 32] = [
         PMMapElement {base: 0, len: 0, avail: false}; 32];
@@ -219,15 +227,17 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
             Mulitboot2TagType::FrameBuffer      => {
                 let mut vesa = VESA_CONTEXT.lock();
                 unsafe{
-                    (*vesa).init_from_mb2(None, 
+                    vesa.init_from_mb2(None, 
                                          Some(&((*tag).tdata.frame_buffer)));
                 }
+                drop(vesa);
             },
             Mulitboot2TagType::VBE              => {
                 let mut vesa = VESA_CONTEXT.lock();
                 unsafe {
-                    (*vesa).init_from_mb2(Some(&((*tag).tdata.vbe_info)), None);
+                    vesa.init_from_mb2(Some(&((*tag).tdata.vbe_info)), None);
                 }
+                drop(vesa);
             },
             Mulitboot2TagType::MemoryMap        => {
                 let ent_size : usize;
@@ -282,23 +292,17 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     let (rows, cols, mode): (u32, u32, u16);
     {
         let mut vesa = VESA_CONTEXT.lock();
-        (*vesa).set_background_rgb((240, 240, 240));
-        (*vesa).set_foreground_rgb((0, 0, 255));
-        (rows, cols) = (*vesa).screen_size();
-        mode = (*vesa).mode_number();
+        vesa.set_background_rgb((240, 240, 240));
+        vesa.set_foreground_rgb((0, 0, 255));
+        (rows, cols) = vesa.screen_size();
+        mode = vesa.mode_number();
     }
     kearly_console::init();
     klog!("VESA Graphics: Mode=0x{:X}, Rows:{}, Columns:{}\n", mode, rows, cols);
 
+    THIS_TSC.borrow_mut().init();
     // Todo - fetch kernel's boot command-line/parameters
     // Todo - Pass a list kernel modules (e.g., ramdisk) Grub loaded for us
-    
-    // Initialize the per-cpu sections
-    let bsp_cpu_id = cpu_id(); // LAPIC ID
-    percpu_init_sections();
-    percpu_init_cpu(bsp_cpu_id);
-    *THIS_CPU_ID.borrow_mut() = bsp_cpu_id;
-    THIS_TSC.borrow_mut().init();
     
     // SMP, LAPIC, IOAPIC, HiRes Event Timer, etc. are found in ACPI tables
 
@@ -626,57 +630,57 @@ mod x86_pic {
         let (mask1, mask2): (u8, u8);
 
         // Save IRQ masks
-        mask1 = x86_ioport_read(PIC1_PORT_DAT);
-        mask2 = x86_ioport_read(PIC2_PORT_DAT);
+        mask1 = x86_ioport_read::<u8>(PIC1_PORT_DAT);
+        mask2 = x86_ioport_read::<u8>(PIC2_PORT_DAT);
 
         // Send the initialization command and data sequence 
-        x86_ioport_write(PIC1_PORT_CMD, PIC_CMD_INIT);
-        x86_ioport_write(PIC2_PORT_CMD, PIC_CMD_INIT);
+        x86_ioport_write::<u8>(PIC1_PORT_CMD, PIC_CMD_INIT);
+        x86_ioport_write::<u8>(PIC2_PORT_CMD, PIC_CMD_INIT);
         // Set the vector offests
-        x86_ioport_write(PIC1_PORT_DAT, idt_vector_offset);
-        x86_ioport_write(PIC2_PORT_DAT, idt_vector_offset + 8);
+        x86_ioport_write::<u8>(PIC1_PORT_DAT, idt_vector_offset);
+        x86_ioport_write::<u8>(PIC2_PORT_DAT, idt_vector_offset + 8);
         // IRQ2 on the master PIC is connected to the slave (PIC2)
-        x86_ioport_write(PIC1_PORT_DAT, 4);
+        x86_ioport_write::<u8>(PIC1_PORT_DAT, 4);
         // Cascade ID of the slave
-        x86_ioport_write(PIC2_PORT_DAT, 2);
+        x86_ioport_write::<u8>(PIC2_PORT_DAT, 2);
         // Set the mode of both PICs to 8086
-        x86_ioport_write(PIC1_PORT_DAT, 1);
-        x86_ioport_write(PIC2_PORT_DAT, 1);
+        x86_ioport_write::<u8>(PIC1_PORT_DAT, 1);
+        x86_ioport_write::<u8>(PIC2_PORT_DAT, 1);
 
         // Restore the IRQ masks
-        x86_ioport_write(PIC1_PORT_DAT, mask1);
-        x86_ioport_write(PIC2_PORT_DAT, mask2);
+        x86_ioport_write::<u8>(PIC1_PORT_DAT, mask1);
+        x86_ioport_write::<u8>(PIC2_PORT_DAT, mask2);
     }
 
     pub fn send_eoi(irq: u8) {
         if irq >= 8 {
-            x86_ioport_write(PIC2_PORT_CMD, PIC_CMD_EOI);
+            x86_ioport_write::<u8>(PIC2_PORT_CMD, PIC_CMD_EOI);
         }
-        x86_ioport_write(PIC1_PORT_CMD, PIC_CMD_EOI);
+        x86_ioport_write::<u8>(PIC1_PORT_CMD, PIC_CMD_EOI);
     }
 
     pub fn mask_irq(irq: u8) {
         if irq < 8 {
-            x86_ioport_write(PIC1_PORT_DAT, 
-                x86_ioport_read(PIC1_PORT_DAT) | (1 << irq));
+            x86_ioport_write::<u8>(PIC1_PORT_DAT, 
+                x86_ioport_read::<u8>(PIC1_PORT_DAT) | (1 << irq));
         } else {
-            x86_ioport_write(PIC2_PORT_DAT, 
-                x86_ioport_read(PIC2_PORT_DAT) | (1 << (irq - 8)));
+            x86_ioport_write::<u8>(PIC2_PORT_DAT, 
+                x86_ioport_read::<u8>(PIC2_PORT_DAT) | (1 << (irq - 8)));
         }
     }
 
     pub fn mask_all() {
-        x86_ioport_write(PIC1_PORT_DAT, 0xFF);
-        x86_ioport_write(PIC2_PORT_DAT, 0xFF);
+        x86_ioport_write::<u8>(PIC1_PORT_DAT, 0xFF);
+        x86_ioport_write::<u8>(PIC2_PORT_DAT, 0xFF);
     }
 
     pub fn unmask_irq(irq: u8) {
         if irq < 8 {
-            x86_ioport_write(PIC1_PORT_DAT, 
-                x86_ioport_read(PIC1_PORT_DAT) & !(1 << irq));
+            x86_ioport_write::<u8>(PIC1_PORT_DAT, 
+                x86_ioport_read::<u8>(PIC1_PORT_DAT) & !(1 << irq));
         } else {
-            x86_ioport_write(PIC2_PORT_DAT, 
-                x86_ioport_read(PIC2_PORT_DAT) & !(1 << (irq - 8)));
+            x86_ioport_write::<u8>(PIC2_PORT_DAT, 
+                x86_ioport_read::<u8>(PIC2_PORT_DAT) & !(1 << (irq - 8)));
         }
     }
 }
@@ -709,9 +713,9 @@ mod x86_pit {
     pub fn config_periodic_irq(hz: u16) {
         let reload : u16 = (PIT_FREQ_HZ / hz as u32) as u16;
         let cmd = make_cmd(0, PIT_ACCESS_LOW_HI, PIT_OPMODE_RATEGEN);
-        x86_ioport_write(PIT_PORT_CMD, cmd);
-        x86_ioport_write(PIT_PORT_CH0, (reload & 0xFF) as u8);
-        x86_ioport_write(PIT_PORT_CH0, (reload >> 8)   as u8);
+        x86_ioport_write::<u8>(PIT_PORT_CMD, cmd);
+        x86_ioport_write::<u8>(PIT_PORT_CH0, (reload & 0xFF) as u8);
+        x86_ioport_write::<u8>(PIT_PORT_CH0, (reload >> 8)   as u8);
     }
 
     pub fn config_oneshot_count(ms: u32) {
@@ -719,28 +723,28 @@ mod x86_pit {
         
         // Since CH2 is wired to the PC speaker, the gated-output of the speaker
         // should be disabled first (see bits 0-1 of port 0x61, SysControlPortB)
-        let sys_ctl_b: u8 = x86_ioport_read(0x61);
-        x86_ioport_write(0x61, sys_ctl_b & 0xFC);
+        let sys_ctl_b: u8 = x86_ioport_read::<u8>(0x61);
+        x86_ioport_write::<u8>(0x61, sys_ctl_b & 0xFC);
         // 
         let reload : u16 = (PIT_FREQ_KHZ * ms as f64) as u16;
         let cmd = make_cmd(2, PIT_ACCESS_LOW_HI, PIT_OPMODE_ONESHOT);
-        x86_ioport_write(PIT_PORT_CMD, cmd);
-        x86_ioport_write(PIT_PORT_CH0, (reload & 0xFF) as u8);
-        x86_ioport_write(PIT_PORT_CH0, (reload >> 8)   as u8);
+        x86_ioport_write::<u8>(PIT_PORT_CMD, cmd);
+        x86_ioport_write::<u8>(PIT_PORT_CH0, (reload & 0xFF) as u8);
+        x86_ioport_write::<u8>(PIT_PORT_CH0, (reload >> 8)   as u8);
     }
 
     // Should be called after config_oneshot_sleep is called
     pub fn start_oneshot_count(){
         // Clear and then reset bit 0 of IO port 0x61, after modifying the
         // reload value, hence, start counting down.
-        let sys_ctl_b: u8 = x86_ioport_read(0x61);
-        x86_ioport_write(0x61, sys_ctl_b & 0xFE); // Clear bit 0
-        x86_ioport_write(0x61, sys_ctl_b | 0x01); // Set bit 0
+        let sys_ctl_b: u8 = x86_ioport_read::<u8>(0x61);
+        x86_ioport_write::<u8>(0x61, sys_ctl_b & 0xFE); // Clear bit 0
+        x86_ioport_write::<u8>(0x61, sys_ctl_b | 0x01); // Set bit 0
     }
 
     pub fn wait_for_oneshot_count() {
         // bit 5 of port 0x61 will go high once the counter hits zero
-        while x86_ioport_read(0x61) & 0x20 == 0 {
+        while x86_ioport_read::<u8>(0x61) & 0x20 == 0 {
         }
     }
 }
@@ -952,10 +956,13 @@ impl X86IoApic {
     {
         let entry_index = gsi - self.gsi_base;
         if gsi < self.max_irqs as u32 {
-            let (mut high, low) : (u32, u32);
+            let high:   u32;
+            let mut low:u32;
+
             low = (isr_vector as u32) | priority | pin_polarity | pin_trigger;
+            if masked {low |= 0x10000;}  
             high = (dest_cpu_acpi_id_mask as u32) << 24;
-            if masked {high |= 1;}  
+
             self.write_reg((entry_index * 2 + 0x10) as u8, low);
             self.write_reg((entry_index * 2 + 0x11) as u8, high);
         }
@@ -965,12 +972,12 @@ impl X86IoApic {
     pub fn set_irq_mask(&mut self, gsi: u32, masked: bool) {
         let entry_index = gsi - self.gsi_base;
         if gsi < self.max_irqs as u32 {
-            let mut high = self.read_reg((entry_index * 2 + 0x11) as u8);
-            high = match masked {
-                true  => high | 0x1,
-                false => high & 0xFFFFFFFE
+            let mut low = self.read_reg((entry_index * 2 + 0x10) as u8);
+            low = match masked {
+                true  => low | 0x10000,
+                false => low & 0x0FFFF
             };
-            self.write_reg((entry_index * 2 + 0x11) as u8, high);
+            self.write_reg((entry_index * 2 + 0x10) as u8, low);
         }
     }
 }
@@ -1088,7 +1095,7 @@ impl X86LocalApic {
         self.write_reg(Self::REG_ERROR_STATUS, 0);
         // Send SIPI
         self.send_ipi(dest_lapic_id, 0x600 | entry_point_pg as u32);
-		cpu_busywait_us(200);
+		cpu_busywait(Duration::from_micros(200));
 		self.wait_ipi_send();
     }
 
@@ -1136,9 +1143,40 @@ impl X86LocalApic {
 //----------------------------------------------------------------------------//
 percpu_global!{
     pub THIS_CPU_ID: usize = 0; // To avoid issuing cpuid every time
-    pub THIS_CPU_SYSTIMER:  SystemTimer = SystemTimer::new();
+    pub THIS_CPU_SYSTIMER:          SystemTimer = SystemTimer::new();
+    pub THIS_CPU_IDLE_TSC_TICKS:    usize = 0;
 }
 
+
+pub fn machine_reboot() {
+    let reboot_port;
+    let reboot_val;    
+    {
+        let this_machine = THIS_MACHINE.lock();
+        reboot_port = (*this_machine).acpi_info.reboot_reg;
+        reboot_val  = (*this_machine).acpi_info.reboot_val;
+    }
+    
+    match reboot_port {
+        AcpiGenericAddress::IOPort { port_num }     => {
+            x86_ioport_write(port_num, reboot_val);    
+        },
+        AcpiGenericAddress::Memory { addr }         => {
+            if addr < (1 << 32) {
+                unsafe {
+                    (addr as *mut u64).write_volatile(reboot_val as u64);
+                }
+            }
+        },
+        _   => {
+            klog!("Reboot method not supported\n");
+        }
+    }
+    // klog!("FADT_sig:{:X}, reboot_port = {},{},{},{},{:X}, reboot_val = {:X}\n",
+    //         fadt_sig, addr_space, bit_width, bit_off, access_sz, reboot_port,
+    //         reboot_val);
+    // //
+}
 
 //
 // Assembly Wrapper functions
@@ -1153,6 +1191,13 @@ pub fn cpu_disable_ints() {
         asm!("cli");
     }
 }
+pub fn cpu_restore_ints(enabled: bool) {
+    if enabled {
+        cpu_enable_ints();
+    } else {
+        cpu_disable_ints();
+    }
+}
 pub fn cpu_ints_enabled() -> bool {
     let rflg = x64_read_rflags();
     rflg & 0x200 > 0
@@ -1160,12 +1205,25 @@ pub fn cpu_ints_enabled() -> bool {
 pub fn cpu_unmask_irq(irq: u32) {
     THIS_IOAPIC.borrow_mut().set_irq_mask(irq, false);
 }
-
+pub fn cpu_mask_irq(irq: u32) {
+    THIS_IOAPIC.borrow_mut().set_irq_mask(irq, true);
+}
 
 pub fn cpu_halt() {
     unsafe {
         asm!("hlt");
     }
+}
+
+pub fn cpu_stack_pointer() -> usize{
+    let sp: usize;
+    unsafe {
+        asm!(
+            "mov {sp}, rsp",
+            sp = out(reg)sp
+        );
+    }
+    sp
 }
 
 pub fn cpu_count() -> usize {
@@ -1214,29 +1272,54 @@ pub fn cpu_read_timestamp() -> u64 {
     }
     (upper << 32) | lower
 }
-pub fn cpu_busywait_us(delay_us: u64) {
-    let tsc = THIS_TSC.borrow_mut();
-    let mut freq_hz = 1_500_000_000; // Default to 1.5GHz by default
-    if tsc.enabled {
-        freq_hz = tsc.freq_hz;
-    }
-    let delay_tsc = freq_hz / 1_000_000 * delay_us;
-    let target_tsc = cpu_read_timestamp() + delay_tsc;
+pub fn cpu_busywait(delay: Duration) {
+    let target_tsc = cpu_read_timestamp() + 
+                        SystemTimer::duration_to_timestamp_ticks(delay);
     while cpu_read_timestamp() < target_tsc {
         core::hint::spin_loop();
     }
 }
-pub fn x86_ioport_read(port: u16) -> u8 {
-    let data: u8;
-    unsafe {
-        asm!("in al, dx", out("al") data, in("dx") port);
-    }
-    data
+
+pub trait X86IOPortAccess {
+    fn x86_ioport_read(port: u16) -> Self;
+    fn x86_ioport_write(port: u16, val: Self);
 }
-pub fn x86_ioport_write(port: u16, data: u8) {
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") data);
+
+impl X86IOPortAccess for u8 {
+    fn x86_ioport_read(port: u16) -> Self {
+        let data: u8;
+        unsafe {
+            asm!("in al, dx", out("al") data, in("dx") port);
+        }
+        data
     }
+    fn x86_ioport_write(port: u16, data: Self) {
+        unsafe {
+            asm!("out dx, al", in("dx") port, in("al") data);
+        }
+    }
+}
+
+impl X86IOPortAccess for u32 {
+    fn x86_ioport_read(port: u16) -> Self {
+        let data: u32;
+        unsafe {
+            asm!("in eax, dx", out("eax") data, in("dx") port);
+        }
+        data
+    }
+    fn x86_ioport_write(port: u16, data: Self) {
+        unsafe {
+            asm!("out dx, eax", in("dx") port, in("eax") data);
+        }
+    }
+}
+
+pub fn x86_ioport_read<T: X86IOPortAccess>(port: u16) -> T {
+    T::x86_ioport_read(port)
+}
+pub fn x86_ioport_write<T: X86IOPortAccess>(port: u16, data: T) {
+    T::x86_ioport_write(port, data);
 }
 
 pub fn x64_read_rflags() -> u64 {
@@ -1294,24 +1377,33 @@ impl PortBasedUART {
     }
 
     pub fn config(&mut self) {
-        x86_ioport_write(self.port + 1, 0x00);    // Disable all interrupts
-        x86_ioport_write(self.port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
-        x86_ioport_write(self.port + 0, 0x03);    // Set divisor to 3 (lo byte) 38400 baud
-        x86_ioport_write(self.port + 1, 0x00);    //                  (hi byte)
-        x86_ioport_write(self.port + 3, 0x03);    // 8 bits, no parity, one stop bit
-        x86_ioport_write(self.port + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
-        x86_ioport_write(self.port + 4, 0x0B);    // IRQs enabled, RTS/DSR set
-        x86_ioport_write(self.port + 4, 0x1E);    // Set in loopback mode, test the serial chip
-        x86_ioport_write(self.port + 0, 0xAE);    // Test serial chip (send byte 0xAE and check if serial returns same byte)
+        // Disable all interrupts
+        x86_ioport_write::<u8>(self.port + 1, 0x00);
+        // Enable DLAB (set baud rate divisor)
+        x86_ioport_write::<u8>(self.port + 3, 0x80);
+        // Set divisor to 3 (lo byte) 38400 baud
+        x86_ioport_write::<u8>(self.port + 0, 0x03); 
+        // Set divisor to 3 (hi byte) 38400 baud
+        x86_ioport_write::<u8>(self.port + 1, 0x00);
+        // 8 bits, no parity, one stop bit
+        x86_ioport_write::<u8>(self.port + 3, 0x03);
+        // Enable FIFO, clear them, with 14-byte threshold
+        x86_ioport_write::<u8>(self.port + 2, 0xC7);
+        // IRQs enabled, RTS/DSR set
+        x86_ioport_write::<u8>(self.port + 4, 0x0B);
+        // Set in loopback mode, test the serial chip
+        x86_ioport_write::<u8>(self.port + 4, 0x1E);
+        // Test serial chip (send byte 0xAE and check if serial returns same byte)
+        x86_ioport_write::<u8>(self.port + 0, 0xAE);
         // If serial is not faulty set it in normal operation mode
         // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
-        x86_ioport_write(self.port + 4, 0x0F);
+        x86_ioport_write::<u8>(self.port + 4, 0x0F);
 
 
     }
 
     pub fn putc(&self, c: u8) {
-        while x86_ioport_read(self.port + 5) & 0x20 == 0 {
+        while x86_ioport_read::<u8>(self.port + 5) & 0x20 == 0 {
             core::hint::spin_loop();
         }
         x86_ioport_write(self.port, c);
@@ -1348,7 +1440,11 @@ pub mod kearly_console {
 
     pub fn init() {
         let mut vesa = VESA_CONTEXT.lock();
-        (*vesa).clean_screen();
+        vesa.clean_screen();
+        let mut cursor = CURSOR.lock();
+        cursor.0 = 0;
+        cursor.1 = 0;
+        
     }
 
 
@@ -1357,8 +1453,8 @@ pub mod kearly_console {
         let (fh, fw) : (u32, u32);
         {
             let vesa = VESA_CONTEXT.lock();
-            (sh, sw) = (*vesa).screen_size();
-            (fh, fw) = (*vesa).font_size();
+            (sh, sw) = vesa.screen_size();
+            (fh, fw) = vesa.font_size();
         }
         let (rows, cols) = (sh / fh, sw / fw);
         let mut cursor = CURSOR.lock();
@@ -1366,10 +1462,16 @@ pub mod kearly_console {
             if c == b'\n' {
                 (*cursor).0 = ((*cursor).0 + 1) % rows;
                 (*cursor).1 = 0;
+            } else if c == 0x8 { // Backspace
+                if (*cursor).1 > 0 {
+                    (*cursor).1  -= 1;
+                    let mut vesa = VESA_CONTEXT.lock();
+                    vesa.putc(b' ', (*cursor).0, (*cursor).1);
+                }
             } else {
                 {
                     let mut vesa = VESA_CONTEXT.lock();
-                    (*vesa).putc(c, (*cursor).0, (*cursor).1);
+                    vesa.putc(c, (*cursor).0, (*cursor).1);
                 }
                 (*cursor).1 = (*cursor).1 + 1;
                 if (*cursor).1 == cols {
@@ -1474,6 +1576,30 @@ impl SystemTimer {
     fn arm_periodic(&self, _p: SysTimerDuration) {
         panic!("Not implemented yet!\n");
     }
+
+    //
+    // Timestamp Interface
+    //
+    pub fn current_timestamp() -> u64 {
+        cpu_read_timestamp()
+    }
+
+    pub fn duration_to_timestamp_ticks(d: Duration) -> u64 {
+        let tsc = THIS_TSC.borrow_mut();
+        ((d.as_nanos() as f64 / 1_000_000_000.0) * tsc.freq_hz as f64) as u64
+    }
+
+    pub fn timestamp_to_duration(t: u64) -> Duration {
+        let tsc = THIS_TSC.borrow_mut();
+        Duration::from_nanos((t as f64 / 
+                                (tsc.freq_hz as f64 / 1_000_000_000.0)) as u64)
+    }
+
+    pub fn current_timestamp_as_duration() -> Duration {
+        let tsc = THIS_TSC.borrow_mut();
+        Duration::from_nanos( (cpu_read_timestamp() as f64 / 
+                                (tsc.freq_hz as f64 / 1_000_000_000.0)) as u64)
+    }
 }
 
 
@@ -1485,18 +1611,32 @@ type IsrHandlerFn = fn(u16);
 
 fn isr_default_imp(_: u16) { }
 static mut X86_LAPIC_TIMER_HANDLER: IsrHandlerFn = isr_default_imp;
-static mut X86_ISR_HANDLER: [IsrHandlerFn; 16] = [isr_default_imp; 16];
+static mut X86_ISR_HANDLER: [IsrHandlerFn; 24] = [isr_default_imp; 24];
 
 pub fn irq_controller_init() {
     x86_pic::init(32);
 }
 
 pub fn isr_register(irq: u16, handler_fn: IsrHandlerFn) {
-    if irq < 16 {
+    if irq < 32 { /* Last IRQ handler in boot.S is irq_handler31 */
         unsafe {
             X86_ISR_HANDLER[irq as usize] = handler_fn;
         }
     }
+}
+
+pub fn irq_reroute(gsi: u32, vector: u8, edge_triggered: bool) {
+    let ioapic0 = THIS_IOAPIC.borrow_mut();
+    // really bad code - fix the types and prototye
+    let trig;
+    if edge_triggered {
+        trig = X86IoApic::TRIGGER_EDGE;
+    } else {
+        trig = X86IoApic::TRIGGER_LEVEL;
+    }
+    ioapic0.register_isr(gsi, vector + 34,
+                X86IoApic::PRIORITY_FIXED,
+                X86IoApic::POLARITY_HIGH , trig, false , 0);
 }
 
 pub fn cpu_trigger_systimer_irq() {
@@ -1539,7 +1679,7 @@ impl MMUMapping {
     // [47 pml4e 39][38 pdpte 30][29   pde   21][20   pte   12][11   off   0]
     //
     // Virtual memory address range that can be mapped via calls to map_pages
-    pub const MIN_VIRTUAL:      u64 = 0x100000000;     // 4 GBs
+    pub const MIN_VIRTUAL:      u64 = 0x200000000;     // 8 GBs
     pub const MAX_VIRTUAL:      u64 = (1 << 39) - 1;   // 256 GBs - only pml4[0]
     pub const PAGE_SIZE:        usize = 0x1000; // Only 4KB pages in this range
     
@@ -1570,11 +1710,21 @@ impl MMUMapping {
                     Self::PGENT_WRITABLE | Self::PGENT_USERMODE;
         Self::write_table_entry(self.pml4_base, 0, pml4e0);
 
-        // Set PDPT0[0..=3] to Identity-map the first 4GB as user-mode for now
+        // Kernel's code/data 
+        // Set PDPT0[0..=3] --> PHYS[0GB to 4GB] as writable+cachable
         let pdpt0e = Self::PGENT_PRESENT | Self::PGENT_WRITABLE |
                         Self::PGENT_PS; // 1GB page
         for i in 0..4 {
             let phys_addr : u64 = i << 30;
+            Self::write_table_entry(self.pdpt0_base, i as usize, 
+                                    pdpt0e | phys_addr);
+        }
+        // Kernel's DMA access
+        // Set PDPT0[4..=7] --> PHYS[0GB to 4GB] as writable+non-cachable
+        let pdpt0e = Self::PGENT_PRESENT | Self::PGENT_WRITABLE |
+                        Self::PGENT_PCD | Self::PGENT_PS; // 1GB page
+        for i in 4..8 {
+            let phys_addr : u64 = (i - 4) << 30;
             Self::write_table_entry(self.pdpt0_base, i as usize, 
                                     pdpt0e | phys_addr);
         }
@@ -1584,10 +1734,10 @@ impl MMUMapping {
             self.pml4_base,
             Self::read_table_entry(self.pml4_base, 0)
         );
-        dbg!("PDPT0 Base: {:X}\n", pdpt0);
-        for _i in 0..4 {
+        dbg!("PDPT0 Base: {:X}\n", self.pdpt0_base);
+        for _i in 0..8 {
             dbg!("    PDPT0[{}] : {:X}\n", _i,
-                    Self::read_table_entry(pdpt0, _i));
+                    Self::read_table_entry(self.pdpt0_base, _i));
         }
     }
 
@@ -1748,6 +1898,13 @@ impl MMUMapping {
     pub fn copy_priv_data(&self) -> usize {
         self.pml4_base
     }
+
+    /*
+     * DMA
+     */
+    pub fn dma_from_kernel_phys(phys_addr: usize) -> usize{
+        phys_addr | ((1 as usize) << 32)
+    }
 }
 
 impl Drop for MMUMapping {
@@ -1890,9 +2047,9 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
             let current_cpu_cnt = cpu_count();
             dbg!("Senging INIT-SIPI to LAPIC[{}]\n", lapic_id);
             lapic0.send_init_ipi(lapic_id);
-            cpu_busywait_us(10_000); // Wait for the cpu to initialize (~10ms)
+            cpu_busywait(Duration::from_millis(10)); // Wait for the cpu to initialize (~10ms)
             lapic0.send_startup_ipi(lapic_id, 0x8); 
-            cpu_busywait_us(1_000); // Wait for the AP to initialize
+            cpu_busywait(Duration::from_millis(1)); // Wait for the AP to initialize
             if cpu_count() == current_cpu_cnt {
                 // Send another SIPI
                 dbg!("Sending another SIPI to LAPIC[{}]\n", lapic_id);
@@ -1900,7 +2057,7 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
             }
            
             loop {
-                cpu_busywait_us(1_000);
+                cpu_busywait(Duration::from_millis(1));
                 if cpu_count() > current_cpu_cnt {break;}
             }
         }
@@ -1931,10 +2088,6 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
                 true, 0
             );
         }
-        // TEMP: Register the keyboard interrupt
-        ioapic0.register_isr(1, 35, X86IoApic::PRIORITY_FIXED,
-               X86IoApic::POLARITY_HIGH , X86IoApic::TRIGGER_EDGE,
-               false , 0);
     }
     //// TODO Route NMIs
 
@@ -1945,6 +2098,13 @@ fn start_smp(bsp_cpu_id: usize, max_cpus: usize) {
 //
 pub const MAX_CPU_COUNT: usize = 8;
 pub const MAX_IRQ_COUNT: usize = 16;
+
+#[derive(Clone, Copy)]
+enum AcpiGenericAddress{
+    Memory{addr: usize},
+    IOPort{port_num: u16},
+    Unsupported,
+}
 
 struct AcpiInfo {
     madt_base:  u32,
@@ -1958,6 +2118,8 @@ struct AcpiInfo {
     irq_map:    [AcpiIRQMapping; MAX_IRQ_COUNT],
     nmi_map_cnt:u32,
     nmi_map:    [AcpiNmiMapping; MAX_CPU_COUNT], // At most: 1 NMI-mapping/CPU
+    reboot_reg: AcpiGenericAddress,
+    reboot_val: u8,
 }
 impl AcpiInfo {
     pub const fn new() -> Self {
@@ -1972,7 +2134,9 @@ impl AcpiInfo {
             lapic_mmio: 0,
             madt_base:  0,
             nmi_map:    [AcpiNmiMapping::new(); MAX_CPU_COUNT],
-            nmi_map_cnt: 0
+            nmi_map_cnt: 0,
+            reboot_reg: AcpiGenericAddress::Unsupported,
+            reboot_val: 0
         }
     }
 }
@@ -2212,6 +2376,37 @@ fn x86_acpi_parse_madt(acpi: &mut AcpiInfo, madt_addr: u32) {
 fn x86_acpi_parse_facp(acpi: &mut AcpiInfo, addr: u32) {
     acpi.fadt_base = addr;
     // Todo - Extract useful stuff such as reset vector, power ports, etc.
+
+    // RESET REGISTER is located at 116 in the FADT with the following format:
+    //   uint8_t AddressSpace; // 0:Memory, 1:System I/O, 2:PCI BUS 0
+    //   uint8_t BitWidth;     // Must be 8
+    //   uint8_t BitOffset;    // Must be 0
+    //   uint8_t AccessSize;
+    //   uint64_t Address; <-- Port number
+    // 
+    // RESET VALUE is located at 128
+    let addr_space: u8;
+    // let bit_width:  u8;
+    // let bit_off:    u8;
+    // let access_sz:  u8;
+    let reboot_port:usize;
+
+    unsafe {
+        addr_space = ((addr + 116 + 0) as *mut u8).read_volatile();
+        // bit_width  = ((addr + 116 + 1) as *mut u8).read_volatile();
+        // bit_off    = ((addr + 116 + 2) as *mut u8).read_volatile();
+        // access_sz  = ((addr + 116 + 3) as *mut u8).read_volatile();
+        reboot_port= ((addr + 116 + 4) as *mut usize).read_volatile();
+        acpi.reboot_val = ((addr + 128) as *mut u8).read_volatile();
+    }
+    if addr_space == 0 {
+        acpi.reboot_reg = AcpiGenericAddress::Memory { addr: reboot_port };
+    } else if addr_space == 1 {
+        acpi.reboot_reg = AcpiGenericAddress::IOPort { 
+                                                port_num: reboot_port as u16 };
+    } else {
+        acpi.reboot_reg = AcpiGenericAddress::Unsupported;
+    }
 }
 
 fn x86_acpi_parse_hpet(acpi: &mut AcpiInfo, addr: u32) {
@@ -2352,33 +2547,6 @@ pub fn syscall_register(opcode: SyscallOpCode, handler: SyscallHandlerFn) -> boo
         return true;
     }
     false
-}
-
-pub fn syscall(params: Syscall) {
-    match params {
-        Syscall::Exit { status }                                        => {
-            syscall_trigger_int(SyscallOpCode::Exit as usize, status, 0, 0, 0)
-        },
-        Syscall::Open { path_ptr, mode, ret_ptr }                       => {
-            syscall_trigger_int(SyscallOpCode::Open as usize,
-                                path_ptr, mode, ret_ptr, 0)
-        },
-        Syscall::Read { fd, buf_ptr, buf_len, ret_ptr }                 => {
-            syscall_trigger_int(SyscallOpCode::Read as usize,
-                                fd, buf_ptr, buf_len, ret_ptr)
-        },
-        Syscall::Write { fd, buf_ptr, buf_len, ret_ptr }                => {
-            syscall_trigger_int(SyscallOpCode::Write as usize,
-                                fd, buf_ptr, buf_len, ret_ptr);
-        },
-        Syscall::Exec { fd, cmd_buf_ptr, buf_len, ret_ptr }               => {
-            syscall_trigger_int(SyscallOpCode::Exec as usize,
-                                fd, cmd_buf_ptr, buf_len, ret_ptr);
-        },
-        Syscall::Close { fd }                                           => {
-            syscall_trigger_int(SyscallOpCode::Close as usize , fd, 0, 0, 0);
-        }
-    }
 }
 
 fn syscall_trigger_int(opcode: usize,

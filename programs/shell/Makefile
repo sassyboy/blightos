@@ -16,6 +16,13 @@ LFLAGS=
 
 
 RTLIB_OBJS=../rtlib/$(ARCH)-stub.o
+RTLIB_RS_SRC= \
+		../rtlib/src/lib.rs \
+		../rtlib/src/syscall.rs \
+		../rtlib/src/stdio.rs \
+		../rtlib/src/fileio.rs \
+		../rtlib/src/fileio.rs 
+
 RTLIB_LINK=../rtlib/$(ARCH).ld
 BUILDDIR=../../build/
 PROGRAM_RST=../../target/$(TARGET)/$(PROFILE)/lib$(PROGRAM).a
@@ -24,9 +31,9 @@ PROGRAM_ELF=$(BUILDDIR)$(PROGRAM).elf
 
 all: $(PROGRAM_ELF)
 
-$(PROGRAM_ELF): $(RTLIB_OBJS) $(PROGRAM_RST)
+$(PROGRAM_ELF): $(RTLIB_OBJS) $(PROGRAM_RST) $(RTLIB_RS_SRC)
 	@mkdir -p $(BUILDDIR)
-	$(LD) -T $(RTLIB_LINK) $(LFLAGS) -o $@ $^
+	$(LD) -T $(RTLIB_LINK) $(LFLAGS) -o $@ $(RTLIB_OBJS) $(PROGRAM_RST)
 
 $(PROGRAM_RST): main.rs
 	$(RC) --$(PROFILE) --target="$(TARGET)"

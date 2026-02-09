@@ -5,12 +5,19 @@
 //
 //
 
-use core::sync::atomic::AtomicU8;
 use core::sync::atomic::Ordering::Relaxed;
-use core::sync::atomic::AtomicBool;
-
 use alloc::{vec, vec::*};
-use crate::arch;
+use crate::drivers::machine::Machine;
+use crate::{arch, drivers::pci::PCIBus};
+use crate::drivers::storage::ahci::AHCIBus;
+use crate::drivers::kbd::I8046Keyboard;
+use crate::util::*;
+
+pub mod machine;
+pub mod pci;
+pub mod kbd;
+pub mod storage;
+
 
 pub struct DriverInfo {
     pub name:       &'static str,
@@ -18,18 +25,44 @@ pub struct DriverInfo {
     // of devices. Called by CPU0 without IRQs enabled
     pub enumerate:  fn() -> usize,
 
+    // Called after multiprocessing and scheduling is enabled in the kernel by
+    // the init task.
+    // Things like spawing tasks (workers) should be done in this phase
+    pub post_enum:  fn(),
+
     // Release the device (and corresponding resources) corresponding to the
     // specified index.
     pub release:    fn(usize),
 
 }
 
+fn noop() {}
+
 pub fn get_builtin_drivers() -> Vec<DriverInfo> {
     vec![
         DriverInfo {
+            name: "Machine",
+            enumerate:  Machine::enumerate,
+            post_enum:  Machine::post_enum,
+            release:    Machine::release
+        },
+        DriverInfo {
+            name: "PCI Bus",
+            enumerate: PCIBus::enumerate,
+            post_enum: noop,
+            release: PCIBus::release
+        },
+        DriverInfo {
             name: "i8046 PS/2 Controller",
-            enumerate: I8046::enumerate,
-            release: I8046::release
+            enumerate: I8046Keyboard::enumerate,
+            post_enum: noop,
+            release: I8046Keyboard::release
+        },
+        DriverInfo {
+            name: "AHCI/SATA Bus",
+            enumerate: AHCIBus::enumerate,
+            post_enum: AHCIBus::post_enum,
+            release: AHCIBus::release
         },
 
         #[cfg(target_arch = "arm")]
@@ -41,101 +74,14 @@ pub fn get_builtin_drivers() -> Vec<DriverInfo> {
     ]
 }
 
-// Todo - need a standard device struct + methods to register/discover available
-// devices with callbacks to do open/devcall/close for the userspace<->driver
-// interactions.
 
-
-pub struct I8046 {
-    
-}
-
-static I8046_LSHIFT: AtomicBool = AtomicBool::new(false);
-static I8046_RSHIFT: AtomicBool = AtomicBool::new(false);
-static I8046_LAST_ASCII: AtomicU8 = AtomicU8::new(0);
-
-impl I8046 {
-    
-    pub const fn new() -> Self {
-        Self {}
-    }
-
-    fn enumerate() -> usize {
-        arch::isr_register(1, Self::kdb_irq);
-        // arch::cpu_unmask_irq(1);
-        1
-    }
-
-    fn release( _device: usize) {
-        
-    }
-
-    pub fn read_key_ascii() -> u8 {
-        let ret = I8046_LAST_ASCII.load(Relaxed);
-        I8046_LAST_ASCII.store(0, Relaxed);
-        return ret;
-    }
-
-    const KEY_RELEASED:     u8 = 0x80;
-    const LSHIFT_PRESSED:   u8 = 0x2A;
-    const RSHIFT_PRESSED:   u8 = 0x36;
-
-
-    fn keyboard_to_ascii(key: u8) -> u8 {
-        if I8046_LSHIFT.load(Relaxed) == true ||
-           I8046_RSHIFT.load(Relaxed) == true  {
-            match key {
-                0x02..0x0E  => b"!@#$%^&*()_+"[key as usize - 0x02],
-                0x0E        => b' ', // Backspace
-                0x0F        => b' ', // Tab
-                0x10..0x1C  => b"QWERTYUIOP{}"[key as usize - 0x10],
-                0x1C        => b'\n',
-                0x1E..0x29  => b"ASDFGHJKL:\""[key as usize - 0x1E],
-                0x29        => b'~',
-                0x2B        => b'|',
-                0x2C..0x36  => b"ZXCVBNM<>?"[key as usize - 0x2C],
-                0x39        => b' ',
-                _           => 0
-            }
-        } else {
-            match key {
-                0x02..0x0E  => b"1234567890-="[key as usize - 0x02],
-                0x0E        => b' ', // Backspace
-                0x0F        => b' ', // Tab
-                0x10..0x1C  => b"qwertyuiop[]"[key as usize - 0x10],
-                0x1C        => b'\n',
-                0x1E..0x29  => b"asdfghjkl;'"[key as usize - 0x1E],
-                0x29        => b'`',
-                0x2B        => b'\\',
-                0x2C..0x36  => b"zxcvbnm,./"[key as usize - 0x2C],
-                0x39        => b' ',
-                _           => 0
-            }
-        }
-
-    }
-
-    fn kdb_irq(_irq: u16) {
-        let keycode = arch::x86_ioport_read(0x60);
-        // klog!("<{:X}>", keycode);
-        if keycode & Self::KEY_RELEASED > 0
-        {
-            match keycode & 0x7F {
-                Self::LSHIFT_PRESSED    => {I8046_LSHIFT.store(false, Relaxed);},
-                Self::RSHIFT_PRESSED    => {I8046_RSHIFT.store(false, Relaxed);},
-                _                       => ()
-            }
-        } else {
-            // Key press
-            match keycode & 0x7F {
-                Self::LSHIFT_PRESSED    => {I8046_LSHIFT.store(true, Relaxed);},
-                Self::RSHIFT_PRESSED    => {I8046_RSHIFT.store(true, Relaxed);},
-                _                       => {
-                    I8046_LAST_ASCII.store(
-                        Self::keyboard_to_ascii(keycode), Relaxed);
-                }
-            }
-            
-        }
-    }
+//
+// Structures that have to be encodeded/decoded to/from a packed/specific format
+// in the memory for/by devices controllers implement this trait.
+// Similar to #[repr(C, packed)] structures with .read/write_volatile, but with
+// more freedom in how the structure fields are defined and named
+//
+pub trait DeviceStruct {
+    fn encode(&self, dest_addr: usize);
+    fn decode(&mut self, src_addr: usize);
 }

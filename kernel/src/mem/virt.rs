@@ -1,7 +1,8 @@
 
 use core::sync::atomic::AtomicUsize;
-
 use alloc::collections::btree_map::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::arch::MMUMapping;
 use crate::mem::phys::*;
@@ -17,6 +18,14 @@ static PROCESSES: Spinlock<BTreeMap<usize, AddressSpace>> =
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
+#[derive(Clone)]
+pub struct FileDescriptor{
+    pub mount_name:     String,
+    pub fs_handle:      usize,
+    pub read_off:       usize,
+    pub write_off:      usize,
+}
+
 pub struct AddressSpace {
     pid:            usize,
     // Architecture-dependent address-space object
@@ -31,7 +40,8 @@ pub struct AddressSpace {
     usr_stk_pages:  usize,
     // Virtual address of the stack pointer
     usr_stk_vptr:   usize,
-
+    // File Descriptor -> File objects
+    files:          Vec<FileDescriptor>,
 }
 
 impl AddressSpace {
@@ -44,7 +54,8 @@ impl AddressSpace {
             usr_stk_pages: 0,
             usr_stk_base: 0,
             usr_stk_vptr: 0,
-            root_tid: 0
+            root_tid: 0,
+            files: Vec::new()
         }
     }
 
@@ -121,7 +132,7 @@ impl AddressSpace {
                 );
                 // Set the main/root task ID
                 if p.root_tid == 0 {
-                    p.root_tid = Task::current();
+                    p.root_tid = Task::current_tid();
                 }
                 ep_vaddr        = p.ep_vaddr;
                 usr_stk_vptr    = p.usr_stk_vptr;
@@ -155,6 +166,40 @@ impl AddressSpace {
             }
             None    => {}
         }
+    }
+
+    //
+    // File descriptor management
+    //
+    pub fn add_fd(pid: usize, fd_obj: FileDescriptor) -> usize {
+        let mut proc_map = PROCESSES.lock();
+        let proc = proc_map.get_mut(&pid).expect("Process not found!");
+        proc.files.push(fd_obj);
+        proc.files.len() - 1 + crate::SyscallRsvdFDs::Max as usize
+    }
+    pub fn get_fd(pid: usize, fd: usize) -> Option<FileDescriptor> {
+        let fd_index = fd - crate::SyscallRsvdFDs::Max as usize;
+        let mut proc_map = PROCESSES.lock();
+        let proc = proc_map.get_mut(&pid).expect("Process not found!");
+        if fd_index < proc.files.len() {
+            return Some(proc.files[fd_index].clone());
+        }
+        None
+    }
+    pub fn update_fd(pid: usize, fd: usize, new_fd_data: &FileDescriptor) {
+        let fd_index = fd - crate::SyscallRsvdFDs::Max as usize;
+        let mut proc_map = PROCESSES.lock();
+        let proc = proc_map.get_mut(&pid).expect("Process not found!");
+        if fd_index < proc.files.len() {
+            proc.files[fd_index].read_off = new_fd_data.read_off;
+            proc.files[fd_index].write_off= new_fd_data.write_off
+        }
+    }
+    pub fn rem_file_object(pid: usize, fd: usize) {
+        let fd_index = fd - crate::SyscallRsvdFDs::Max as usize;
+        let mut proc_map = PROCESSES.lock();
+        let proc = proc_map.get_mut(&pid).expect("Process not found!");
+        proc.files.remove(fd_index);
     }
 }
 
