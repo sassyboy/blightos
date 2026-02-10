@@ -143,6 +143,7 @@ pub struct MachineContext {
     cpu_count:  usize,
     acpi_info:  AcpiInfo,
     ioapic:     X86IoApic,
+    hpet:       X86HPET,
 }
 
 impl MachineContext {
@@ -151,6 +152,7 @@ impl MachineContext {
             cpu_count:  1, // There's at least one cpu (BSP), lol!
             acpi_info:  AcpiInfo::new(),
             ioapic:     X86IoApic::new(),
+            hpet:       X86HPET::new()
         }
     }
 }
@@ -300,7 +302,6 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     kearly_console::init();
     klog!("VESA Graphics: Mode=0x{:X}, Rows:{}, Columns:{}\n", mode, rows, cols);
 
-    THIS_TSC.borrow_mut().init();
     // Todo - fetch kernel's boot command-line/parameters
     // Todo - Pass a list kernel modules (e.g., ramdisk) Grub loaded for us
     
@@ -320,6 +321,10 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
             dbg!("No ACPI information found. Multiprocessing disabled.\n");
         }
     };
+
+    // TSC frequency calculation may require HPET to be functional, which
+    // in turn depends on ACPI enumeration.
+    THIS_TSC.borrow_mut().init();
 
     // Fix the syscall interrupt entry (0x20) in IDT to accept calls from Ring3
     extern "C" {
@@ -749,6 +754,137 @@ mod x86_pit {
     }
 }
 
+#[derive(Debug)]
+struct X86HPET {
+    valid:          bool,
+    comp_count:     u8,
+    comp_size:      u8,
+    hpet_num:       u8,
+    min_prd_tick:   u16,
+    irq:            u8,
+    mmio_base:      usize,
+    period_ns:        u32,
+}
+
+impl X86HPET {
+    pub const fn new() -> Self {
+        Self {
+            valid:          false,
+            comp_count:     0,
+            comp_size:      0,
+            hpet_num:       0,
+            min_prd_tick:   0,
+            irq:            0,
+            mmio_base:      0,
+            period_ns:      0
+        }
+    }
+
+    const REG_GEN_CAP:          usize = 0x000;
+    const REG_GEN_CONFIG:       usize = 0x010;
+    const REG_MAIN_COUNTER_VAL: usize = 0x0F0;
+
+
+    const REG_TIM0_CONFIG:      usize = 0x100;
+    const REG_TIM0_COMP_VAL:    usize = 0x108;
+    const REG_TIM0_FSB_INT_ROUT:usize = 0x110;
+
+    pub fn init(&mut self, acpi_hpet_base: usize) {
+        // Relevant HPET fields
+        // Offset (size)
+        // 36     (4)    :Event Timer Block ID
+        //                [31:16] PCI Vendor ID of 1st Timer Block
+        //                [15]    Legacy Replacement IRQ routing Capable
+        //                [13]    COUNT_SIZE_CAP (0: 32-bit, 1: 64-bit)
+        //                [12:8]  # of comparators in 1st Timer Block
+        //                [7:0]   Hardware Rev ID
+        //
+        // 40     (12)    MMIO Base Address in the form of ACPIGenericAddress,
+        //                1KB region, regardless of the # of comparators
+        // 52     (1)     HPET sequence number: 0 = 1st, 1 = 2nd, etc.
+        // 53     (2)     Main Counter Minimum Clock Tick in periodic mode
+
+        // Fetch mmio_base
+        let gen_addr = AcpiGenericAddress::from_acpi_entry(acpi_hpet_base + 40);
+        match gen_addr {
+            AcpiGenericAddress::Memory { addr }     => {
+                self.mmio_base = MMUMapping::dma_from_kernel_phys(addr) ;
+            },
+            _ => {
+                self.valid = false;
+                return;
+            }
+        }
+
+        // Fetch comp_count and comp_size
+        let blk_id: u32;
+        let u32ptr = (acpi_hpet_base + 36) as *const u32;
+        unsafe {
+            blk_id = u32ptr.read_volatile();
+        }
+        self.comp_count = ((blk_id >> 8) & 0x1F) as u8 + 1;
+        if blk_id & 0x2000 > 0 {
+            self.comp_size = 64;
+        } else {
+            self.comp_size = 32;
+        }
+        // TODO look at bld_id & 0x8000 if IRQ support is needed
+
+        // Fetch min_prd_tick
+        let u16ptr = (acpi_hpet_base + 53) as *const u16;
+        unsafe {
+            self.min_prd_tick = u16ptr.read_volatile();
+        }
+        // Fetch hpet_num
+        let u8ptr = (acpi_hpet_base + 52) as *const u8;
+        unsafe {
+            self.hpet_num = u8ptr.read_volatile();
+        }
+
+        // TODO - Make sure none of the timers generate interrupts
+        self.disable_counting();
+        self.reset_current_count();
+        self.valid = true;
+        self.period_ns = round_up!(
+                        (self.read_reg(Self::REG_GEN_CAP) >> 32) as u32,
+                        1_000_000) / 1_000_000;
+    }
+
+    fn read_reg(&self, reg_no: usize) -> u64 {
+        unsafe {
+            return((self.mmio_base + reg_no) as *const u64).read_volatile()
+        }
+    }
+    fn write_reg(&self, reg_no: usize, val: u64) {
+        unsafe {
+            ((self.mmio_base + reg_no) as *mut u64).write_volatile(val);
+        }
+    }
+
+    fn current_count(&self) -> u64 {
+        self.read_reg(Self::REG_MAIN_COUNTER_VAL)
+    }
+
+    fn reset_current_count(&self) {
+        self.write_reg(Self::REG_MAIN_COUNTER_VAL, 0);
+    }
+
+    fn enable_counting(&self) {
+        let gen_config_val = self.read_reg(Self::REG_GEN_CONFIG);
+        self.write_reg(Self::REG_GEN_CONFIG, gen_config_val | 1);
+    }
+
+    fn disable_counting(&self) {
+        let gen_config_val = self.read_reg(Self::REG_GEN_CONFIG);
+        self.write_reg(Self::REG_GEN_CONFIG, gen_config_val & !(1 as u64));
+    }
+
+    fn duration_to_ticks(&self, d: Duration) -> u64 {
+        (d.as_nanos() / self.period_ns as u128) as u64
+    }
+    
+
+}
 
 // For newer CPUs that support Invariant TSCs, this is going to be used
 // for time-keeping and preemption interrupts
@@ -826,29 +962,55 @@ impl X86TimeStampCounter {
                     // TSC is supported, has a constant frequency, which is
                     // enumerated here!
                     self.enabled = true;
-                    dbg!("INVARIANT TSC FREQ: {} - EAX: {} EBX {} ECX: {}\n",
+                    dbg!("Invariant TSC Freq: {} - EAX: {} EBX {} ECX: {}\n",
                             self.freq_hz, eax, ebx, ecx);
-
-                    // Also approximate it:
-                    // x86_pit::config_oneshot_count(100); // 100 ms count-down
-                    // x86_pit::start_oneshot_count();
-                    // let start_tsc = cpu_read_timestamp();
-                    // x86_pit::wait_for_oneshot_count();
-                    // let end_tsc = cpu_read_timestamp();
-                    // let tsc_overhead1 = cpu_read_timestamp();
-                    // log!("INVARIANT TSC FREQ APPROX ~ {} HZ\n", 
-                    //     (end_tsc - start_tsc - (tsc_overhead1-end_tsc)*2) * 10);
                 } else {
-                    // Use PIT to approximate it
-                    x86_pit::config_oneshot_count(100); // 100 ms count-down
-                    x86_pit::start_oneshot_count();
-                    let start_tsc = cpu_read_timestamp();
-                    x86_pit::wait_for_oneshot_count();
-                    let end_tsc = cpu_read_timestamp();
-                    let tsc_overhead1 = cpu_read_timestamp();
-                    self.freq_hz = (end_tsc - start_tsc - (tsc_overhead1-end_tsc)*2) * 10;
-                    self.enabled = true;
-                    dbg!("INVARIANT TSC FREQ APPROX: {} HZ\n", self.freq_hz);
+                    // Approximate it
+                    // Not the most precise method, but yields < 0.1% error
+                    // Good enough!
+                    let tm = THIS_MACHINE.lock();
+                    if tm.hpet.valid {
+                        tm.hpet.disable_counting();
+                        tm.hpet.reset_current_count();
+                        let target = tm.hpet.duration_to_ticks(Duration::from_millis(10)); 
+                        let mut hpt1 = 0;
+                        let tsc0 = cpu_read_timestamp();
+                        tm.hpet.enable_counting();
+                        while hpt1 < target {
+                            hpt1 = tm.hpet.current_count();
+                        }
+                        // let tsc1 = cpu_read_timestamp();
+                        tm.hpet.current_count();
+                        tm.hpet.disable_counting();
+                        let tsc1 = cpu_read_timestamp();
+
+                        let hpet_freq = 1_000_000_000 as f64 / (tm.hpet.period_ns) as f64;
+                        self.freq_hz = ( ((tsc1-tsc0) as f64 / hpt1 as f64) *
+                                                            hpet_freq) as u64;
+                        // Log for testing purposes
+                        dbg!("Invariant TSC - HPET-Approximated Freq: {} KHz\n"
+                                ,self.freq_hz / 1000);
+                        // let hzdelta = core::cmp::max(self.freq_hz, approx) - 
+                        //             core::cmp::min(self.freq_hz, approx);
+                        // klog!("Invariant TSC {} HPET-Approximated: {} HZ, \
+                        //        d, delta%:{:.4}, num: {}, den: {}, hpet_T: {}\n",
+                        //         self.freq_hz, approx,
+                        //         hzdelta as f64 / self.freq_hz as f64 * 100.0,
+                        //         tsc1-tsc0, hpt1, tm.hpet.period_ns
+                        //     );
+                    } else {
+                        // Resort to PIT
+                        x86_pit::config_oneshot_count(100); // 100 ms count-down
+                        x86_pit::start_oneshot_count();
+                        let start_tsc = cpu_read_timestamp();
+                        x86_pit::wait_for_oneshot_count();
+                        let end_tsc = cpu_read_timestamp();
+                        let tsc_overhead1 = cpu_read_timestamp();
+                        self.freq_hz = (end_tsc - start_tsc - 
+                                          (tsc_overhead1-end_tsc)*2) * 10;
+                        dbg!("INVARIANT TSC PIT FREQ APPROX: {} HZ\n",
+                                self.freq_hz);
+                    }
                 }
             } else {
                 panic!("Processor too old - Invariant TSC not supported\n");
@@ -2105,6 +2267,35 @@ enum AcpiGenericAddress{
     IOPort{port_num: u16},
     Unsupported,
 }
+impl AcpiGenericAddress {
+    pub fn from_acpi_entry(entry_mem_addr: usize) -> Self {
+        // Format:
+        //   uint8_t AddressSpace; // 0:Memory, 1:System I/O, 2:PCI BUS 0
+        //   uint8_t BitWidth;     // Must be 8
+        //   uint8_t BitOffset;    // Must be 0
+        //   uint8_t AccessSize;
+        //   uint64_t Address; <-- Port number/MMIO_BASE
+        let addr_space: u8;
+        // let bit_width:  u8;
+        // let bit_off:    u8;
+        // let access_sz:  u8;
+        let addr: u64;
+        unsafe {
+            addr_space = ((entry_mem_addr + 0) as *mut u8).read_volatile();
+            // bit_width  = ((addr + 116 + 1) as *mut u8).read_volatile();
+            // bit_off    = ((addr + 116 + 2) as *mut u8).read_volatile();
+            // access_sz  = ((addr + 116 + 3) as *mut u8).read_volatile();
+            addr = ((entry_mem_addr + 4) as *mut u64).read_volatile();
+        }
+        if addr_space == 0 {
+            return AcpiGenericAddress::Memory { addr: addr as usize };
+        } else if addr_space == 1 {
+            return AcpiGenericAddress::IOPort { port_num: addr as u16 };
+        } else {
+           return AcpiGenericAddress::Unsupported;
+        }
+    }
+}
 
 struct AcpiInfo {
     madt_base:  u32,
@@ -2411,7 +2602,8 @@ fn x86_acpi_parse_facp(acpi: &mut AcpiInfo, addr: u32) {
 
 fn x86_acpi_parse_hpet(acpi: &mut AcpiInfo, addr: u32) {
     acpi.hpet_base = addr;
-    // Todo - Extract HPET's info to use as the kernel's ticker instead of PIT
+    let mut m = THIS_MACHINE.lock();
+    m.hpet.init(addr as usize);
 }
 
 //
@@ -2506,7 +2698,7 @@ fn empty_task() {
 
 }
 
-extern "C" {
+unsafe extern "C" {
     fn start_first_thread(task_p: usize);
     fn switch_context(old_p: usize,  new_p: usize);
 }
