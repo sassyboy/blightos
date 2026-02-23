@@ -4,7 +4,8 @@
 // Round-Robin Task Scheduler
 //
 use alloc::collections::LinkedList;
-use crate::{arch::{SysTimerDuration, THIS_CPU_SYSTIMER}, sched::*};
+use crate::arch::SystemTimer;
+use crate::sched::*;
 
 
 //
@@ -43,23 +44,22 @@ impl FcfsScheduler {
 
 #[derive(Debug)]
 pub struct RoundRobinScheduler{
-    quantum_us : SysTimerDuration,
-    run_queue:   LinkedList<usize>
+    quantum :   Duration,
+    run_queue:  LinkedList<usize>
 }
 
 impl RoundRobinScheduler {
     pub const fn new() -> Self{
         Self {
-            quantum_us: SysTimerDuration::Ticks(0),
-            run_queue: LinkedList::new()
+            quantum:    Duration::from_micros(0),
+            run_queue:  LinkedList::new()
         }
     }
 
-    pub fn init(&mut self, q_us: SysTimerDuration){
-        self.quantum_us = q_us;
-        let systimer = THIS_CPU_SYSTIMER.borrow_mut();
-        systimer.set_mode(arch::SysTimerMode::OneShot);
-        systimer.arm(self.quantum_us);
+    pub fn init(&mut self, quantum: Duration){
+        self.quantum = quantum;
+        SystemTimer::set_mode(arch::SysTimerMode::OneShot);
+        SystemTimer::arm(self.quantum);
     }
     
     pub fn add_task(&mut self, tid: usize) {
@@ -76,7 +76,7 @@ impl RoundRobinScheduler {
         match self.run_queue.pop_front() {
             Some(tid)       => {
                 self.run_queue.push_back(tid);
-                THIS_CPU_SYSTIMER.borrow().arm(self.quantum_us);
+                SystemTimer::arm(self.quantum);
                 Some(tid)
             }
             None            => None

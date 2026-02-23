@@ -16,9 +16,13 @@ any combination of components. Available debug options are:
 ---
 ## Features
 - Kernel:
-    - Architecture: Dual-mode monolithic (Ring3: user-space/ Ring0: kernel-space)
-    - H/W Architecture: x86_64 Long Mode (64-bit)
-    - Startup: BIOS/UEFI Multiboot2-compatible bootloader required
+    - Architecture: Dual-mode monolithic
+    - H/W Architecture (selectd in `config.mk`):
+        - x86_64 Long Mode (64-bit) - Tested on QEMU and real hardware
+        - Aarch64 (ARMv8) - Only tested on QEMU (raspi3)
+    - Startup:
+        - x86_64: BIOS/UEFI Multiboot2-compatible bootloader required
+        - Aarch64:Linux-capable loader + device tree blob
     - Minimal ACPI support for SMP enumeration, reboot, etc.
     - Symmetric Multiprocessing (SMP) up to 8 CPUs
     - Local Round-Robin scheduling w\ automatic load balancing, task migration, etc.
@@ -28,11 +32,16 @@ any combination of components. Available debug options are:
     - Unix-line Virtual File System
         - `disk#.#:/` for normal file system access using a `disk.partition:` pattern
         - `driver-name:/` for accessing a specific driver via VFS. Check out `machine:/` for example
+    - ELFBinary loader
+        - The first supported partition (FAT) that presents the path `/blightos/shell.elf` would be considered root.
 - Device support:
     - IOAPIC/LAPIC for SMP IRQ routing and per-cpu task preemption
-    - Basic VESA Graphics support with built-in bitmap font rendering
+    - Graphics (minimal fb support + built-in bmp font):
+        - x86_64: Basic VESA Graphics
+        - Aarch64: Broadcom VideoCore IV (BCM2835)
     - Basic i8046 PS/2 Keyboard driver
-    - AHCI (SATA) Bus Controller
+    - AHCI (SATA) Bus Controller (Read-only)
+    - eMMC (SDCard) Controller (Read-only)
     - FAT12/16/32 File System Driver (Read-only)
 - User-space runtime library
     - Basic stdio,fileio and syscall wrappers
@@ -53,6 +62,10 @@ any combination of components. Available debug options are:
 rustup target add x86_64-unknown-none
 rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly-x86_64-unknown-none
+```
+- Add the AArch64 bare-metal target `aarch64-unknown-none`:
+```
+rustup target add aarch64-unknown-none
 ```
 - Boot disk image creation tools:
 `sudo apt install grub-pc-bin xorriso`

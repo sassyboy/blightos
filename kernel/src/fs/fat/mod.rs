@@ -329,7 +329,7 @@ impl FATFile {
             return (0, IOCompletion::OutOfBoundIO);
         }
         // Adjust the length if the request hits EOF
-        let len: usize;
+        let mut len: usize;
         if self.is_directory() == false &&
             file_offset + num_bytes > self.size_bytes() {
             len = self.size_bytes() - file_offset;
@@ -341,7 +341,9 @@ impl FATFile {
         let cluster_index = file_offset / self.cluster_size as usize;
         let cluster_offset= file_offset % self.cluster_size as usize;
         if cluster_offset + len > self.cluster_size as usize {
-            panic!("fat::File::read doesn't support cross cluster reads!");
+            // panic!("fat::File::read doesn't support cross cluster reads!");
+            // Adjust the length to align to cluster boundary
+            len = self.cluster_size as usize - cluster_offset;
         }
         let first_sector_index: u64;
         match &(self.au_map) {

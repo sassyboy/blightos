@@ -1,6 +1,10 @@
-ARCH=x86_64
+include ../config.mk
 TARGET=$(ARCH)-unknown-none
 PROFILE=release
+
+# Add the platform-dependent ASM/LD toolchain, object files, etc.
+include src/arch/$(ARCH)/include.mk
+
 #
 # rustc options:
 # -O: optimizes for --release and avoids some debug calls/instrumentations
@@ -42,26 +46,24 @@ ifdef FEATURES
 else
 	RCFEATS=
 endif
-CC=$(TOOLCHAIN_PREFIX)gcc
-LD=$(TOOLCHAIN_PREFIX)ld
-OBJCPY=$(TOOLCHAIN_PREFIX)objcopy
+CC=$(C_TOOLCHAIN_PREFIX)gcc
+LD=$(C_TOOLCHAIN_PREFIX)ld
+OBJCPY=$(C_TOOLCHAIN_PREFIX)objcopy
 
 # Prepare the list of the object files to compile into the kernel:
-# 1) Add the platform-dependent object files are already added by the
-# corresponding include.mk
-include src/arch/$(ARCH)/include.mk
+# 1) 
+
 # 2) Add the platform-agnostic parts of the kernel
 
 
 BUILDDIR=../build/
 KERN_RST=../target/$(TARGET)/$(PROFILE)/libkernel.a
 KERN_ELF=$(BUILDDIR)kernel.elf
+KERN_BIN=$(BUILDDIR)kernel.bin
 KERN_RST_SRC= \
 		src/kernel.rs \
 		src/test.rs \
 		src/util.rs	\
-		src/arch/x86_64/stub.rs \
-		src/arch//x86_64/vga.rs	\
 		src/arch/mod.rs	\
 		src/mem/mod.rs	\
 		src/mem/phys.rs	\
@@ -75,17 +77,26 @@ KERN_RST_SRC= \
 		src/drivers/mod.rs \
 		src/drivers/machine.rs \
 		src/drivers/pci.rs \
-		src/drivers/kbd.rs \
+		src/drivers/input/mod.rs \
+		src/drivers/input/i8046.rs \
+		src/drivers/input/uartkbd.rs \
 		src/drivers/storage/mod.rs \
 		src/drivers/storage/ahci.rs \
+		src/drivers/storage/emmc.rs \
+		src/drivers/video/mod.rs \
+		src/drivers/video/framebuffer.rs
 
-all: $(KERN_ELF)
+all: $(KERN_BIN)
 
 $(KERN_ELF): $(OBJFILES) $(KERN_RST)
 	@mkdir -p $(BUILDDIR)
 	$(LD) -T src/arch/$(ARCH)/link.ld $(LFLAGS) -o $@ $^
 
-$(KERN_RST): $(KERN_RST_SRC)
+$(KERN_BIN): $(KERN_ELF)
+	$(OBJCPY) $< -O binary $@
+
+
+$(KERN_RST): $(KERN_RST_SRC) $(ARCH_RST_SRC)
 	$(RC) --$(PROFILE) --target="$(TARGET)" $(RCFEATS)
 
 %.o: %.S
@@ -93,4 +104,4 @@ $(KERN_RST): $(KERN_RST_SRC)
 
 clean:
 	cargo clean
-	rm -rf $(OBJFILES) $(KERN_ELF) $(BOOT_IMG)
+	rm -rf $(OBJFILES) $(KERN_ELF) $(KERN_BIN) $(BOOT_IMG)

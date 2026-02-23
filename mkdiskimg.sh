@@ -67,6 +67,8 @@ if [ $? -ne 0 ]; then echo "Error: mount failed"; cleanup; exit 1; fi
 echo "Copying contents of $SOURCE_DIR into the image..."
 if [ -d "$SOURCE_DIR" ]; then
     sudo cp -r "$SOURCE_DIR"/* "$MOUNT_POINT"/
+    sudo mkdir "$MOUNT_POINT"/blightos
+    sudo cp -r build/*.elf "$MOUNT_POINT"/blightos/
     if [ $? -ne 0 ]; then echo "Error: cp failed"; cleanup; exit 1; fi
 else
     echo "Warning: Source directory $SOURCE_DIR does not exist. Skipping file copy."

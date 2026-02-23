@@ -145,7 +145,8 @@ impl MountPoint {
     // To be used by the system call interface and the parts that issue the
     // fops requests (Not the handlers)
     //
-
+    // TODO: Make a type that encapsulates a file handle, which is ref-counted
+    // and closes the file (and releases the memory) when dropped.
     pub fn fopen(&self, path: &str) -> IOCompletion {
         (self.fops)(FileOperation::Open { path: path })
     }

@@ -1,17 +1,32 @@
-
+//
+// BlightOS Kernel
+//
+// Process Address Space Management
+//
 use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::arch::MMUMapping;
-use crate::mem::phys::*;
-//
-// Process Address Space (Generic code)
-//
-use crate::util::*;
 use crate::{arch, sched::Task};
-use core::sync::atomic::Ordering;
+use crate::mem::phys::*;
+use crate::util::*;
+
+#[cfg(feature="debug_virt")]
+macro_rules! dbg {
+    ($($arg:tt)*) => {
+        let mut debug_console = DebugOut;
+        let _ = write!(&mut debug_console, "[VIRT] ");
+        let _ = write!(&mut debug_console, $($arg)*);
+    };
+}
+#[cfg(not(feature="debug_virt"))]
+macro_rules! dbg{
+    ($($arg:tt)*) => { };
+}
+
 
 static PROCESSES: Spinlock<BTreeMap<usize, AddressSpace>> = 
         Spinlock::new(BTreeMap::new());
@@ -42,6 +57,14 @@ pub struct AddressSpace {
     usr_stk_vptr:   usize,
     // File Descriptor -> File objects
     files:          Vec<FileDescriptor>,
+    // TODOs: 
+    //   Heap start/end, brk pointer, etc.
+    //   Number of pages allocated for the program image, stack, heap, etc.
+    //   Process VFS entry to report various status info (memory usage, open
+    //     files, etc.)
+    //   FORK and EXEC system call support
+    //   SIGNALS and IPC
+    //   Shared memory management (between processes and with the kernel)
 }
 
 impl AddressSpace {
@@ -93,16 +116,50 @@ impl AddressSpace {
     //
     // Loads a program image in the memory from a given ELF image and calls
     // spawn
-    pub fn spawn_from_elf() -> usize {
-        panic!("Not supported!");
+    pub fn spawn_from_elf(elf: &ELFBinary) -> Option<usize> {
+        let mut mem_sz = 0;
+        for seg in elf.segments.iter() {
+            if seg.p_type == ELFSegment::P_TYPE_LOAD {
+                mem_sz += seg.p_memsz;
+            }
+        }
+        let frame_count = div_round_up!(mem_sz, PHY_FRAME_SIZE);
+        let mut xfer_len = 0;
+        // TODO - Allocate at a 4KB granularity instead of continuously
+        let alloc = palloc_continuous(frame_count);
+        if let Some(phys_base) = alloc {
+            dbg!("spawn_from_elf: Size: {} bytes, needs {} frames - \
+                    start: {:X}, end: {:X}\n",
+                    mem_sz, frame_count, phys_base,
+                    phys_base + (frame_count * PHY_FRAME_SIZE) - 1);
+            // Go over the sections and copy them over
+            for i in 0..elf.segments.len() {
+                if elf.segments[i].p_type == ELFSegment::P_TYPE_LOAD {
+                    xfer_len += 
+                    elf.load_segment(i, phys_base + elf.segments[i].p_offset);
+                }
+            }
+        } else {
+            klog!("spawn_from_elf - Couldn't allocate {} frames", frame_count);
+            return None;
+        }
+        if xfer_len != mem_sz {
+            klog!("spawn_from_elf transferred {} bytes < {}\n", xfer_len,
+                        mem_sz);
+            // Release the memory
+            pfree_continuous(alloc.unwrap(), frame_count);
+        }
+        return Self::spawn(alloc.unwrap(), 
+                        alloc.unwrap() + (frame_count * PHY_FRAME_SIZE) - 1, 
+                        elf.elf_entry);
     }
 
     // Must be called from the context of the kernel thread that is going to
     // be converted to the main thread of this user process.
     // It also migrates the task to the new process
-    pub fn launch(pid: usize) {
+    pub fn launch(pid: usize) -> bool {
         if pid == 0 {
-            return;
+            return false;
         }
         let ep_vaddr;
         let usr_stk_vptr;
@@ -112,13 +169,18 @@ impl AddressSpace {
             let proc = proc_map.get_mut(&pid);
             match proc {
             Some(p) => {
+                // Map the initial user-spaec addresses
+                let pg_count = div_round_up!(p.img_paddr.1 - p.img_paddr.0, 
+                                                        MMUMapping::PAGE_SIZE);
+                if pg_count < 1 {
+                    return false;
+                }
                 // Initialize the Arch-dependent PAS object (maps the kernel)
                 p.vmap.init();
-                // Map the initial user-spaec addresses
+                
                 p.vmap.map_pages(
                     MMUMapping::MIN_VIRTUAL as usize,
-                    p.img_paddr.0, 
-                    (p.img_paddr.1 - p.img_paddr.0) / MMUMapping::PAGE_SIZE,
+                    p.img_paddr.0, pg_count,
                     false, true, true, arch::MmuCachingPolicy::WriteBack
                 );
                 // Allocate and map a 4-page user-stack at the end of the VAS range
@@ -130,6 +192,7 @@ impl AddressSpace {
                     p.usr_stk_base,
                     4, false, true, false, arch::MmuCachingPolicy::WriteBack
                 );
+                // p.vmap.log_mapping(p.ep_vaddr);
                 // Set the main/root task ID
                 if p.root_tid == 0 {
                     p.root_tid = Task::current_tid();
@@ -139,7 +202,7 @@ impl AddressSpace {
                 adp_priv        = p.vmap.copy_priv_data();
             }
             None    => {
-                return;
+                return false;
             }
             }
         } // ProcessPool unlocked
@@ -208,5 +271,6 @@ impl Drop for AddressSpace {
         // self.vmap.drop will be called after this drop(), which releases the
         // paging structs and any physical frames (program image, stack, etc.)
         // pointed to by those structs
+        // TODO: Close any open files that the user failed to close
     }
 }

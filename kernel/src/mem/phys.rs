@@ -26,11 +26,20 @@ macro_rules! dbg {
 //---------------------------------------------------------------------------//
 // Public Data Types and Globals                                             //
 //---------------------------------------------------------------------------//
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct PMMapElement {
     pub base: usize,
     pub len:  usize,
     pub avail:bool,
+}
+impl PMMapElement {
+    pub const fn new() -> Self {
+        Self {
+            base:   0,
+            len:    0,
+            avail:  false
+        }
+    }
 }
 
 //---------------------------------------------------------------------------//
@@ -138,7 +147,21 @@ pub fn pmm_init(mmap: &[PMMapElement], kernel_start: usize, kernel_end: usize,
         }
     }
 
-    // 4) Mark the kernel load address and bitmap itself as used and redzone it
+    // 4) Mark any unavailable memory that overlaps the free memory as used
+    for entry in mmap {
+        match entry.avail {
+            false    => {
+                let start = round_up!(entry.base, PHY_FRAME_SIZE);
+                let end = round_down!(start + entry.len, PHY_FRAME_SIZE) -1;
+                if start < bitmap.last_phys_addr {
+                    pmm_mark_continuous_nolock(bitmap, start, end, true);
+                } 
+            },
+            true   => {}
+        }
+    }
+
+    // 5) Mark the kernel load address and bitmap itself as used and redzone it
     bitmap.red_zone_start= round_down!(kernel_start, PHY_FRAME_SIZE);
     bitmap.red_zone_end  = bitmap.base + bitmap.size;
     bitmap.red_zone_end  = round_up!(bitmap.red_zone_end, PHY_FRAME_SIZE) - 1;

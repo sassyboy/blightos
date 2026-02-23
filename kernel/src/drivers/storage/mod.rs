@@ -9,7 +9,11 @@ use core::sync::atomic::Ordering::Relaxed;
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use crate::{mem::phys::{palloc, pfree}, util::Spinlock};
 
+#[cfg(target_arch = "x86_64")]
 pub mod ahci;
+
+#[cfg(target_arch = "aarch64")]
+pub mod emmc;
 
 // Drivers register their enumerated disk drives by adding a Disk object to
 // this Vector.
@@ -34,6 +38,7 @@ pub struct Disk {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusType {
     AHCI,
+    EMMC,
     None
 }
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +100,7 @@ pub enum IOCompletion {
     InvalidHandle,
     InvalidBuffer,
     OutOfBoundIO,
+    IOError
 }
 
 ///

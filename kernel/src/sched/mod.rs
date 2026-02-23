@@ -10,8 +10,8 @@
 //     Add a name field to each task/process
 //     Support for mutexes
 //     Support for RWLocks
-use crate::arch::{self, SysTimerDuration, SystemTimer, cpu_count, cpu_ints_enabled};
-use crate::arch::THIS_CPU_ID;
+use crate::arch::{self, SystemTimer, SystemTimerTrait};
+use crate::arch::{cpu_count, cpu_ints_enabled, cpu_id};
 use crate::mem::phys::*;
 use crate::mem::virt::AddressSpace;
 use crate::sched::sched_rr::FcfsScheduler;
@@ -55,7 +55,7 @@ percpu_global! {
     pub SCHEDULER:  Scheduler = Scheduler::new();
 }
 
-static DEFAULT_STACK_SIZE:  AtomicUsize = AtomicUsize::new(PHY_FRAME_SIZE * 2);
+static DEFAULT_STACK_SIZE:  AtomicUsize = AtomicUsize::new(PHY_FRAME_SIZE * 4);
 static NEXT_TASK_ID:        AtomicUsize = AtomicUsize::new(0);
 static MSG_QUEUE:           Spinlock<LinkedList<InterProcessorMessage>> = 
                                     Spinlock::new(LinkedList::new());
@@ -221,7 +221,7 @@ impl Task {
     }
 
     pub fn current_cpu() -> usize {
-        *(THIS_CPU_ID.borrow())
+        cpu_id()
     }
 
     pub fn set_default_stack_size(size_bytes: usize) {
@@ -356,7 +356,9 @@ impl Task {
 
     pub fn block() {
         if cpu_ints_enabled() == false {
-            klog!("Blocking TID{} with IRQs disabled!\n", Self::current_tid());
+            // We are most probably executing a syscall.
+            // TODO - Make sure the process is not holding spinlocks!!
+            arch::cpu_enable_ints();
         }
         SCHEDULER.borrow_mut().block_task(Self::current_tid());
     }
@@ -388,7 +390,7 @@ impl Task {
     // Moves the current task to a different CPU
     //
     pub fn migrate_to_cpu(new_cpu: usize) {
-        let cpuid = *(THIS_CPU_ID.borrow());
+        let cpuid = cpu_id();
         if new_cpu == cpuid || new_cpu >= cpu_count() {
             return; // Nothing to do
         }
@@ -489,7 +491,7 @@ impl Scheduler {
         lb.add_cpu(Task::current_cpu());
     }
 
-    pub fn config_round_robin(quantum: SysTimerDuration) {
+    pub fn config_round_robin(quantum: Duration) {
         let sched = SCHEDULER.borrow_mut();
         sched.ops = SchedulerOps::RoundRobin(RoundRobinScheduler::new());
         if let SchedulerOps::RoundRobin(rr) = &mut sched.ops {
@@ -507,9 +509,9 @@ impl Scheduler {
     // worker task for the CPU as the first task
     // Swithing to the first tast will also enable interrupts on the CPU
     pub fn start_scheduling(&mut self) {
-        let cpuid = *(THIS_CPU_ID.borrow());
+        let cpuid = cpu_id();
         // Add the percpu worker scheduler task
-        let pcpuw_tid = self.create_task(Self::percpu_sched_worker, 1,
+        let pcpuw_tid = self.create_task(Self::percpu_sched_worker, 2,
                             format!("CPU{}-WORKER", cpuid));
         let pcpuw_task = TASK_POOL.borrow_mut().get_mut(&pcpuw_tid)
                 .expect("Cannot start the scheduler without a starting task");
@@ -526,7 +528,7 @@ impl Scheduler {
         let _ = Preemption::lock();
         // Changing the per-cpu pool -> Disable Preemption
         if let Some(stack) = self.stack_alloc(stack_pgs) {
-            let cpuid = *(THIS_CPU_ID.borrow());
+            let cpuid = cpu_id();
             let tid   = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
             let tpool = TASK_POOL.borrow_mut();
             let new_task;
@@ -745,7 +747,7 @@ impl Scheduler {
     //
     // This task performs IPI message processing, dead task cleanup, etc
     fn percpu_sched_worker(){
-        let cpuid       = *(THIS_CPU_ID.borrow());
+        let cpuid       = cpu_id();
         let worker_tid  = *(CURR_TID.borrow());
         let mut last_pool_size;
         dbg!("{} started on cpu {}\n", Task::name(), cpuid);
@@ -820,7 +822,7 @@ impl Scheduler {
                 if last_pool_size != 1 {
                     // Log in the iteration when the last task gets dropped
                     if cpuid == 0 {
-                        dbg!("<{} - Free Frames: {}>", Task::name(),
+                        klog!("<{} - Free Frames: {}>", Task::name(),
                                 pmm_num_free_frames());
                     } else {
                         dbg!("<{} IDLE>\n", Task::name());
@@ -996,7 +998,7 @@ impl WaitChannel {
         }
     }
 
-    pub fn wait_timeout(&self, _timeout: Option<SysTimerDuration>) {
+    pub fn wait_timeout(&self, _timeout: Option<Duration>) {
         panic!("Not implemented - Implement sleep first")
     }
 

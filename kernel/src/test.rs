@@ -16,7 +16,9 @@ use crate::arch::*;
 use crate::drivers::storage::*;
 use crate::mem::phys::{pfree, pmm_num_free_frames};
 use crate::sched::{Task, WaitChannel};
-use crate::drivers::kbd::*;
+use crate::fs::{DirectoryEntry, MountPoint};
+use crate::drivers::storage::IOCompletion;
+use crate::drivers::input::{Keyboard, KeyboardEvent};
 
 
 static BSP_T1_TID: AtomicUsize = AtomicUsize::new(0);
@@ -57,7 +59,7 @@ pub fn kself_test() {
 }
 
 fn task1_exec() {
-    let cpuid = *(THIS_CPU_ID.borrow());
+    let cpuid = Task::current_cpu();
     // Wait for all the test tasks to spawn before racing over the counter
     TEST_TASKS_STARTED.fetch_add(1, Ordering::Relaxed);
     while TEST_TASKS_STARTED.load(Ordering::Relaxed) < cpu_count() * 2 {
@@ -77,7 +79,7 @@ fn task1_exec() {
 }
 
 fn task2_exec() {
-    let cpuid = *(THIS_CPU_ID.borrow());
+    let cpuid = Task::current_cpu();
     // Wait for all the test tasks to spawn before racing over the counter
     TEST_TASKS_STARTED.fetch_add(1, Ordering::Relaxed);
     while TEST_TASKS_STARTED.load(Ordering::Relaxed) < cpu_count() * 2 {
@@ -267,7 +269,7 @@ fn task3_exec() {
     }
 
     klog!("\nPress any key to contiue the testing...\n");
-    I8046Keyboard::wait_for_event(KeyboardEvent::KeyReleased);
+    Keyboard::wait_for_event(KeyboardEvent::KeyReleased);
     crate::kearly_console::init();
     // TEST - DISK OPERATIONS --------------------------------------------------
     klog!("\n[TEST] Disk Drive Testing... Detected disks are:\n");
@@ -326,6 +328,22 @@ fn task3_exec() {
             }
             dump_memory_columns(buf, 20 , 5);       
             pfree(buf);
+        }
+    }
+    // List available mount points
+    // Always return the disk%d.%d resources back
+    klog!("Available mount-points: {:?}\n", MountPoint::list_names());
+    // Root directory of disk0.0
+    if let Some(mnt) = MountPoint::from_path("disk0.0:/") {
+        klog!("disk0.0: Root directory content:\n");
+        if let IOCompletion::Successful(hnd) = mnt.fopen("disk0.0:/") {
+            let mut out_vec: Vec<DirectoryEntry> = Vec::new();
+            let ioc = mnt.fenum(hnd, &mut out_vec);
+            if let IOCompletion::Successful(_cnt) = ioc {
+                for item in out_vec {
+                    klog!("{}, {}, 0x{:X}\n", item.name, item.size, item.flags);
+                }  
+            }
         }
     }
     // FINISHED TESTING --------------------------------------------------------

@@ -5,19 +5,16 @@
 //
 //
 
-use core::sync::atomic::Ordering::Relaxed;
+pub mod machine;
+#[cfg(target_arch = "x86_64")]
+pub mod pci;
+pub mod input;
+pub mod storage;
+pub mod video;
+
 use alloc::{vec, vec::*};
 use crate::drivers::machine::Machine;
-use crate::{arch, drivers::pci::PCIBus};
-use crate::drivers::storage::ahci::AHCIBus;
-use crate::drivers::kbd::I8046Keyboard;
-use crate::util::*;
-
-pub mod machine;
-pub mod pci;
-pub mod kbd;
-pub mod storage;
-
+use crate::drivers::video::framebuffer::FrameBuffer;
 
 pub struct DriverInfo {
     pub name:       &'static str,
@@ -40,6 +37,7 @@ fn noop() {}
 
 pub fn get_builtin_drivers() -> Vec<DriverInfo> {
     vec![
+        // Common Drivers
         DriverInfo {
             name: "Machine",
             enumerate:  Machine::enumerate,
@@ -47,30 +45,48 @@ pub fn get_builtin_drivers() -> Vec<DriverInfo> {
             release:    Machine::release
         },
         DriverInfo {
-            name: "PCI Bus",
-            enumerate: PCIBus::enumerate,
-            post_enum: noop,
-            release: PCIBus::release
+            name: "FrameBuffer",
+            enumerate:  FrameBuffer::enumerate,
+            post_enum:  FrameBuffer::post_enum,
+            release:    FrameBuffer::release
         },
+        // X64-64 only support
+        #[cfg(target_arch = "x86_64")]
+        DriverInfo {
+            name: "PCI Bus",
+            enumerate: crate::drivers::pci::PCIBus::enumerate,
+            post_enum: noop,
+            release: crate::drivers::pci::PCIBus::release
+        },
+        #[cfg(target_arch = "x86_64")]
         DriverInfo {
             name: "i8046 PS/2 Controller",
-            enumerate: I8046Keyboard::enumerate,
+            enumerate: crate::drivers::input::i8046::I8046Keyboard::enumerate,
             post_enum: noop,
-            release: I8046Keyboard::release
+            release: crate::drivers::input::i8046::I8046Keyboard::release
         },
+        #[cfg(target_arch = "x86_64")]
         DriverInfo {
             name: "AHCI/SATA Bus",
-            enumerate: AHCIBus::enumerate,
-            post_enum: AHCIBus::post_enum,
-            release: AHCIBus::release
+            enumerate: crate::drivers::storage::ahci::AHCIBus::enumerate,
+            post_enum: crate::drivers::storage::ahci::AHCIBus::post_enum,
+            release: crate::drivers::storage::ahci::AHCIBus::release
         },
-
-        #[cfg(target_arch = "arm")]
+        // AARCH64 only support
+        #[cfg(target_arch = "aarch64")]
         DriverInfo {
-            name: "ARM-UART",
-            enumerate: I8046::enumerate,
-            release: I8046::release
-        }
+            name: "UART Keyboard",
+            enumerate: crate::drivers::input::uartkbd::UARTKeyboard::enumerate,
+            post_enum: crate::drivers::input::uartkbd::UARTKeyboard::post_enum,
+            release: crate::drivers::input::uartkbd::UARTKeyboard::release
+        },
+        #[cfg(target_arch = "aarch64")]
+        DriverInfo {
+            name: "eMMC Controller",
+            enumerate: crate::drivers::storage::emmc::BCM2835SDHost::enumerate,
+            post_enum: crate::drivers::storage::emmc::BCM2835SDHost::post_enum,
+            release: crate::drivers::storage::emmc::BCM2835SDHost::release
+        },
     ]
 }
 

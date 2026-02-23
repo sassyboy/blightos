@@ -11,15 +11,17 @@
 use core::hint::spin_loop;
 use core::ptr::null_mut;
 use core::sync::atomic::AtomicU8;
+use core::sync::atomic::Ordering::Relaxed;
 use core::time::Duration;
 use alloc::collections::linked_list::LinkedList;
 use alloc::{format, vec::*};
-use crate::arch::{SystemTimer};
+use crate::arch::{self, SystemTimer, SystemTimerTrait};
 use crate::drivers::storage::{BusType, DISK_LIST, Disk, IOCompletion, IOOperation, IORequest};
 use crate::drivers::*;
 use crate::drivers::pci::*;
 use crate::mem::phys::*;
 use crate::sched::Task;
+use crate::util::*;
 
 pub static AHCI_BUS: Spinlock<AHCIBus> = Spinlock::new(AHCIBus::new());
 static DRIVE_WORKER_INDEX: AtomicU8 = AtomicU8::new(0);

@@ -30,6 +30,7 @@ pub mod test;
 
 use core::cmp::min;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::time::Duration;
 use alloc::{format, str};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -39,7 +40,7 @@ use crate::drivers::storage::{IOCompletion, num_disks};
 use crate::fs::{DirectoryEntry, MountPoint, enumerate_filesystems};
 use crate::mem::virt::{AddressSpace, FileDescriptor};
 use crate::sched::{SCHEDULER, Scheduler, Task};
-use crate::drivers::kbd::*;
+use crate::drivers::input::Keyboard;
 
 #[cfg(feature="debug_kern")]
 macro_rules! dbg {
@@ -77,19 +78,11 @@ static USER_INIT_PID: AtomicUsize = AtomicUsize::new(0);
 // order, albeit only after all onlined CPUs have reported to the arch-specific
 // stub code so that the generic code has the correct CPU count (e.g., for 
 // resource allocation purposes).
-pub fn kstart(cpuid: usize,
-                mmap_opt: Option<&[mem::phys::PMMapElement]>,
-                ramdisk: Option<RamdiskInfo>)
+pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
 {
     if cpuid == 0 {
         // BSP-only initialization
         klog!("BlightOS - Number of CPUs online: {}\n", cpu_count());
-        let initramdisk : Option<(usize, usize)>;
-        if let Some(initelf) = ramdisk {
-            initramdisk = Some((initelf.start_phy_addr, initelf.end_phy_addr));
-        } else {
-            initramdisk = None;
-        }
 
         match mmap_opt {
             Some(mmap) => {
@@ -100,8 +93,8 @@ pub fn kstart(cpuid: usize,
                     kernel_end = &_KERNEL_END as *const usize as usize;
                 }
                 // Initialize the physical memory manager. Also marks the kernel
-                // and the initramdisk (if any) as used
-                mem::phys::pmm_init(mmap, kernel_start, kernel_end, initramdisk);
+                // and the initramdisk (if any) as used - No ramdisk anymore
+                mem::phys::pmm_init(mmap, kernel_start, kernel_end, None);
             },
             _ => {panic!("No memory map was sent to the BSP!")}
         }
@@ -129,28 +122,13 @@ pub fn kstart(cpuid: usize,
         
         // BSP initialization finished. Unblock APs, start the scheduler,
         // and jump to the first task
-        Scheduler::config_round_robin(SysTimerDuration::Microseconds(200));
+        Scheduler::config_round_robin(Duration::from_micros(200));
+        // Scheduler::config_round_robin(Duration::from_millis(1000));
 
-        // Spawn the first process address space from the provided initramdisk
-        if let Some((first_addr, last_addr)) = initramdisk {
-            let ep_virt;
-            unsafe {
-                ep_virt = ((first_addr + 0x18) as *const usize).read_volatile();
-            }
-            
-            // Create the process address space
-            match AddressSpace::spawn(first_addr, last_addr, ep_virt) {
-                Some(pid)   => {
-                    USER_INIT_PID.store(pid, Ordering::Relaxed);
-                    Task::spawn_on_cpu(kinit_task, cpuid,String::from("kInit"));
-                },
-                None        => {
-                    panic!("Could not create INIT process");
-                }
-            }
-        } else {
-            panic!("No ramdiskimg provided. Could not create INIT process!");
-        }
+        // Spawn the first process address space from shell.elf.
+        // Scans the enumerated partitions for the following path:
+        // /blightos/shell.elf
+        Task::spawn_on_cpu(kinit_task, cpuid,String::from("kInit"));
         BSP_INITIALIZED.store(true, Ordering::Relaxed);
         SCHEDULER.borrow_mut().start_scheduling();
     } else {
@@ -161,7 +139,7 @@ pub fn kstart(cpuid: usize,
             core::hint::spin_loop();
         }
         // Jump to the first task!
-        Scheduler::config_round_robin(SysTimerDuration::Microseconds(200));
+        Scheduler::config_round_robin(Duration::from_micros(200));
         SCHEDULER.borrow_mut().start_scheduling();
     }
     panic!("Reached the end of kstart!");
@@ -201,8 +179,9 @@ pub fn panic(_info: &core::panic::PanicInfo) -> ! {
 ///
 fn kinit_task() {
     // Perform the post-enumeration phase of the drivers
-    dbg!("{} (TID {}) started on CPU {}\n",
-            Task::name(), Task::current_tid(), Task::current_cpu());
+    dbg!("[{}({})] started on CPU {} (Free frames: {})\n", 
+            Task::name(), Task::current_tid(),Task::current_cpu(),
+            crate::mem::phys::pmm_num_free_frames());
     let drvs = drivers::get_builtin_drivers();
     for d in drvs.iter() {
         (d.post_enum)();
@@ -218,11 +197,40 @@ fn kinit_task() {
     // klog!("calling test::kself_test\n");
     // test::kself_test();
 
+    // Find the initial binary (disk%d.0:/blightos/shell.elf) to load
+    for d in 0..ndisks {
+        let path = format!("disk{}.0:/blightos/shell.elf", d);
+        // Open the file (if exists)
+        if let Some(mnt) = MountPoint::from_path(path.as_str()) {
+            let fopen_ret = mnt.fopen(path.as_str());
+            if let drivers::storage::IOCompletion::Successful(hnd) = fopen_ret {
+                dbg!("  Found INIT program at {} on disk {} (hnd {})\
+                        (Free frames: {})\n", 
+                        path, d, hnd, crate::mem::phys::pmm_num_free_frames());
+                if let Some(elf) = ELFBinary::from_file(mnt.clone(), hnd) {
+                    // elf.log_header();
+                    // klog!("Segments:\n");
+                    // for i in 0..elf.segments.len() {
+                    //     klog!("  {:X?}\n", elf.segments[i]);
+                    // }
+                    if let Some(pid) = AddressSpace::spawn_from_elf(&elf) {
+                        USER_INIT_PID.store(pid, Ordering::Relaxed);
+                        dbg!("  Launching {} (Free frames: {})\n", path,
+                                    crate::mem::phys::pmm_num_free_frames());
+                    }
+                }
+                // ELFBinary goes out of scope and releases closes the file
+            }
+        }
+    }
+
     // Spawn the initial user-space process and convert this task into a
     // user-space task in the initial process!
-    dbg!("[INIT] Task {} - Switching to the INIT user-space process.. ({})\n",
-            Task::current_tid(), pmm_num_free_frames());
-    I8046Keyboard::clear_buffer();
+    dbg!("  Switching to the INIT user-space process.. {}({}) \
+            (Free frames: {})\n",
+            Task::name(), Task::current_tid(),
+            crate::mem::phys::pmm_num_free_frames());
+    Keyboard::clear_buffer();
     AddressSpace::launch(USER_INIT_PID.load(Ordering::Relaxed));
 }
 
@@ -348,8 +356,6 @@ fn syscall_read_resources(out_buffer: &mut [u8], _offset: usize) -> usize {
 }
 
 fn syscall_open(path_ptr: usize, path_len: usize, _mode: usize, ret_ptr: usize) {
-    cpu_enable_ints(); // TODO - SWITCH TO TASK GATES/SYSCALL
-
     let pathb;
     unsafe {
         pathb = core::slice::from_raw_parts(path_ptr as *const u8, path_len);
@@ -393,13 +399,12 @@ fn syscall_open(path_ptr: usize, path_len: usize, _mode: usize, ret_ptr: usize) 
 }
 
 fn syscall_read(fd: usize, buf: usize, len: usize, ret_ptr: usize) {
-    cpu_enable_ints(); // TODO - SWITCH TO TASK GATES/SYSCALL
     if fd == SyscallRsvdFDs::StandardIO as usize && len >= 1 {
-        // Standard input - i8046 keyboard
+        // Standard input - keyboard
         unsafe {
             // return the last keychar to the user-space
             let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
-            out[0] = I8046Keyboard::read_key_ascii();
+            out[0] = Keyboard::pop_ascii();
                 
         }
         return;
@@ -450,7 +455,6 @@ fn syscall_read(fd: usize, buf: usize, len: usize, ret_ptr: usize) {
 }
 
 fn syscall_enum(fd: usize, buf: usize, buf_len: usize, ret_ptr: usize) {
-    cpu_enable_ints(); // TODO - SWITCH TO TASK GATES/SYSCALL
     if fd <= SyscallRsvdFDs::SystemResources as usize {
         //Enum not supported on special FDs!
         unsafe {

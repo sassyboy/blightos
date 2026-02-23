@@ -97,6 +97,7 @@ pub fn syscall(params: Syscall) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn syscall_trigger_int(opcode: usize,
                         arg0: usize, arg1: usize, arg2: usize, arg3: usize) {
     unsafe{
@@ -107,6 +108,21 @@ fn syscall_trigger_int(opcode: usize,
             in("rsi") arg1,
             in("rdx") arg2,
             in("rcx") arg3,
+        );
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+fn syscall_trigger_int(opcode: usize,
+                       arg0: usize, arg1: usize, arg2: usize, arg3: usize) {
+    unsafe{
+        asm!(
+            "svc #1000", // See boot.S
+            in("x0") opcode,
+            in("x1") arg0,
+            in("x2") arg1,
+            in("x3") arg2,
+            in("x4") arg3,
         );
     };
 }

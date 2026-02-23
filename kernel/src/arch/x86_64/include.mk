@@ -2,6 +2,12 @@
 OBJFILES= \
 src/arch/x86_64/boot.o
 
+# RUST SOURCE LIST #############################################################
+ARCH_RST_SRC= \
+src/arch/x86_64/stub.rs \
+src/arch/x86_64/mmu.rs \
+src/arch/x86_64/systimer.rs 
+
 # GCC OPTIMIZATION LEVEL #######################################################
 CFLAGS += -o2
 # CFLAGS += -g

@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg(not(test))]
 
 pub mod syscall;
 pub mod stdio;

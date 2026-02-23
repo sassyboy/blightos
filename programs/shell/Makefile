@@ -1,4 +1,5 @@
-ARCH=x86_64
+include ../../config.mk
+
 TARGET=$(ARCH)-unknown-none
 PROFILE=release
 PROGRAM=shell
@@ -10,8 +11,8 @@ ifdef FEATURES
 else
 	RCFEATS=
 endif
-CC=$(TOOLCHAIN_PREFIX)gcc
-LD=$(TOOLCHAIN_PREFIX)ld
+CC=$(C_TOOLCHAIN_PREFIX)gcc
+LD=$(C_TOOLCHAIN_PREFIX)ld
 LFLAGS=
 
 

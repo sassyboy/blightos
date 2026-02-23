@@ -1,18 +1,26 @@
 // 
-// Rust stub for the x86_64 architecture
+// BlightOS Kernel
+// 
+// Support module for the x86_64 architecture
 //
 #![allow(dead_code)]
 
 use core::arch::asm;
 use core::time::Duration;
-use crate::arch::asc::vga::*;
+use crate::arch::*;
 use crate::mem::phys::*;
 use crate::sched::Task;
 use crate::{SyscallHandlerFn, SyscallOpCode, util::*};
 use crate::{dump_memory, kstart};
+use crate::drivers::video::framebuffer::*;
 use core::fmt::Write;
 
-mod vga;
+mod systimer;
+mod mmu;
+
+// Re-export the following modules under crate::arch::
+pub use self::systimer::*;
+pub use self::mmu::*;
 
 //
 // Debugging macros
@@ -157,15 +165,13 @@ impl MachineContext {
     }
 }
 
-static THIS_MACHINE: Spinlock<MachineContext> = 
-    Spinlock::new(MachineContext::new());
-static VESA_CONTEXT: Spinlock<VESAContext> = Spinlock::new(VESAContext::new());
+pub static THIS_MACHINE: Spinlock<MachineContext> = 
+                                        Spinlock::new(MachineContext::new());
 
 percpu_global! {
     THIS_PERCPU_BASE: usize = 0; // To avoid rdmsr(IA32_GS_BASE) every time
-    THIS_LAPIC:  X86LocalApic = X86LocalApic::new();
-    THIS_IOAPIC: X86IoApic    = X86IoApic::new();
-    THIS_TSC:    X86TimeStampCounter = X86TimeStampCounter::new();
+    pub THIS_LAPIC:  X86LocalApic = X86LocalApic::new();
+    pub THIS_IOAPIC: X86IoApic    = X86IoApic::new();
 }
 
 //----------------------------------------------------------------------------//
@@ -182,10 +188,10 @@ percpu_global! {
 extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
 
     // Initialize the per-cpu sections
-    let bsp_cpu_id = cpu_id(); // LAPIC ID
+    let bsp_cpu_id = cpu_lapic_id(); // LAPIC ID
     percpu_init_sections();
     percpu_init_cpu(bsp_cpu_id);
-    *THIS_CPU_ID.borrow_mut() = bsp_cpu_id;
+    THIS_CPU_ID.write(bsp_cpu_id);
 
     // Physical Memory Map Buffer
     let mut mem_map: [PMMapElement; 32] = [
@@ -193,9 +199,6 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     let mut mem_map_count = 0;
     let mut acpi_rsdp: Option<usize> = None;
 
-    // Init user program (module) addr:
-    let mut mod_base: usize = 0;
-    let mut mod_end: usize = 0;
     // Enumerate Muliboot 2 tags
     // Use the default serial port for debugging since VESA is not yet enabled
     PortBasedUART::new(0x3F8).config();
@@ -227,19 +230,12 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
                 acpi_rsdp = Some((tag as usize) + 8);
             }
             Mulitboot2TagType::FrameBuffer      => {
-                let mut vesa = VESA_CONTEXT.lock();
-                unsafe{
-                    vesa.init_from_mb2(None, 
-                                         Some(&((*tag).tdata.frame_buffer)));
+                unsafe {
+                    init_framebuffer_from_mb2(&((*tag).tdata.frame_buffer));
                 }
-                drop(vesa);
             },
             Mulitboot2TagType::VBE              => {
-                let mut vesa = VESA_CONTEXT.lock();
-                unsafe {
-                    vesa.init_from_mb2(Some(&((*tag).tdata.vbe_info)), None);
-                }
-                drop(vesa);
+                // Nothing to do
             },
             Mulitboot2TagType::MemoryMap        => {
                 let ent_size : usize;
@@ -272,13 +268,7 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
 
             }
             Mulitboot2TagType::Module           => {
-                unsafe {
-                    mod_base    = (*tag).tdata.module.mod_start as usize;
-                    mod_end     = (*tag).tdata.module.mod_end as usize;
-                    dbg!("Init Program loaded @ {:X} to {:X}\n",
-                        mod_base, mod_end);
-                }
-                
+                // Not needed anymore
             }
             Mulitboot2TagType::End              => {
                 break;
@@ -291,16 +281,9 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     
     // Set a default video mode, and 
     // Initialize the early-stage standard output (clears the screen too)
-    let (rows, cols, mode): (u32, u32, u16);
-    {
-        let mut vesa = VESA_CONTEXT.lock();
-        vesa.set_background_rgb((240, 240, 240));
-        vesa.set_foreground_rgb((0, 0, 255));
-        (rows, cols) = vesa.screen_size();
-        mode = vesa.mode_number();
-    }
+    let (rows, cols) = FrameBuffer::screen_size();
     kearly_console::init();
-    klog!("VESA Graphics: Mode=0x{:X}, Rows:{}, Columns:{}\n", mode, rows, cols);
+    klog!("VESA Graphics: {} x {}\n", cols, rows);
 
     // Todo - fetch kernel's boot command-line/parameters
     // Todo - Pass a list kernel modules (e.g., ramdisk) Grub loaded for us
@@ -336,23 +319,15 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     }
 
     // Start the kernel.
-    if mod_base == 0 {
-        // No RAMDISK
-        kstart(bsp_cpu_id, Some(&mem_map[0..mem_map_count]), None );
-    } else {
-        kstart(bsp_cpu_id, Some(&mem_map[0..mem_map_count]),
-                Some(crate::RamdiskInfo {
-                    start_phy_addr: mod_base,
-                    end_phy_addr: mod_end
-                })
-        );
-    }
-    panic!(); // kstart shouldn't really return but if does, we should panic
+    kstart(bsp_cpu_id, Some(&mem_map[0..mem_map_count]));
+
+    // kstart shouldn't really return but if does, we should panic
+    panic!(); 
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_x864_entry_ap(_arg: usize) {
-    let cpuid = cpu_id();
+    let cpuid = cpu_lapic_id();
     percpu_init_cpu(cpuid);
     THIS_CPU_ID.write(cpuid);
     THIS_TSC.borrow_mut().init();
@@ -373,7 +348,27 @@ extern "C" fn rust_x864_entry_ap(_arg: usize) {
     // Initialize the LAPIC for the current CPU
 
     // Start the kernel for this AP
-    kstart(cpuid as usize, None, None);
+    kstart(cpuid as usize, None);
+}
+
+pub fn init_framebuffer_from_mb2(inp: &Multiboot2FrameBuffer) {
+	let mut fb = FrameBuffer::new();
+    fb.base_address         = inp.addr as usize;
+    fb.pitch                = inp.pitch;
+    fb.width                = inp.width;
+    fb.height               = inp.height;
+    fb.bpp                  = inp.bpp;
+    fb.red_field_position   = inp.color_info[0];
+    fb.red_mask_size        = inp.color_info[1];
+    fb.green_field_position = inp.color_info[2];
+    fb.green_mask_size      = inp.color_info[3];
+    fb.blue_field_position  = inp.color_info[4];
+    fb.blue_mask_size       = inp.color_info[5];
+    fb.background_rgb       = (240, 240, 240);
+    fb.foreground_rgb       = (0, 0, 255);
+    // Map the buffer memory
+    // Register the framebuffer
+    FrameBuffer::register(&fb);
 }
 
 //
@@ -467,9 +462,7 @@ extern "C" fn kexcep_simd_fp() {
 extern "C" fn kirq_lvt_timer() {
     THIS_LAPIC.borrow_mut().send_eoi();
     // Set TSC_DEADLINE if periodic mode is selected
-    unsafe {
-        X86_LAPIC_TIMER_HANDLER(*THIS_CPU_ID.borrow() as u16);
-    }
+    SystemTimer::exec_handler();
 }
 
 #[unsafe(no_mangle)]
@@ -505,7 +498,7 @@ fn x86_decode_exception_frame(exframe: usize, error_code: bool) ->
 X86ExceptionInfo {
     unsafe {
         let (cpu, cr2, cr4): (usize, usize, usize);
-        cpu = cpu_id();
+        cpu = cpu_lapic_id();
         asm!("mov rax, cr2", out("rax")cr2);
         asm!("mov rax, cr4", out("rax")cr4);
         if error_code {
@@ -690,69 +683,7 @@ mod x86_pic {
     }
 }
 
-mod x86_pit {
-    #![allow(dead_code)]
-    use crate::arch::{x86_ioport_read, x86_ioport_write};
 
-    // I/O Ports
-    const PIT_PORT_CH0: u16 = 0x40;
-    const PIT_PORT_CH1: u16 = 0x41;
-    const PIT_PORT_CH2: u16 = 0x42;
-    const PIT_PORT_CMD: u16 = 0x43;
-    // Command Fields
-    const PIT_ACCESS_LOW_BYTE: u8 = 0x1;
-    const PIT_ACCESS_HI_BYTE : u8 = 0x2;
-    const PIT_ACCESS_LOW_HI  : u8 = PIT_ACCESS_LOW_BYTE | PIT_ACCESS_HI_BYTE;
-    const PIT_OPMODE_ONESHOT : u8 = 0x1;
-    const PIT_OPMODE_RATEGEN : u8 = 0x2;
-    // Other constants
-    const PIT_FREQ_HZ:  u32 = 1193182;
-    const PIT_FREQ_KHZ: f64 = 1193.182;
-
-    fn make_cmd(channel: u8, access: u8, opmode: u8) -> u8 {
-        ((channel & 0x3) << 6 ) | 
-        ((access  & 0x3) << 4 ) |
-        ((opmode  & 0x7) << 1 )
-    }
-
-    pub fn config_periodic_irq(hz: u16) {
-        let reload : u16 = (PIT_FREQ_HZ / hz as u32) as u16;
-        let cmd = make_cmd(0, PIT_ACCESS_LOW_HI, PIT_OPMODE_RATEGEN);
-        x86_ioport_write::<u8>(PIT_PORT_CMD, cmd);
-        x86_ioport_write::<u8>(PIT_PORT_CH0, (reload & 0xFF) as u8);
-        x86_ioport_write::<u8>(PIT_PORT_CH0, (reload >> 8)   as u8);
-    }
-
-    pub fn config_oneshot_count(ms: u32) {
-        // Use Channel 2 in One-Shot mode to count down to zero
-        
-        // Since CH2 is wired to the PC speaker, the gated-output of the speaker
-        // should be disabled first (see bits 0-1 of port 0x61, SysControlPortB)
-        let sys_ctl_b: u8 = x86_ioport_read::<u8>(0x61);
-        x86_ioport_write::<u8>(0x61, sys_ctl_b & 0xFC);
-        // 
-        let reload : u16 = (PIT_FREQ_KHZ * ms as f64) as u16;
-        let cmd = make_cmd(2, PIT_ACCESS_LOW_HI, PIT_OPMODE_ONESHOT);
-        x86_ioport_write::<u8>(PIT_PORT_CMD, cmd);
-        x86_ioport_write::<u8>(PIT_PORT_CH0, (reload & 0xFF) as u8);
-        x86_ioport_write::<u8>(PIT_PORT_CH0, (reload >> 8)   as u8);
-    }
-
-    // Should be called after config_oneshot_sleep is called
-    pub fn start_oneshot_count(){
-        // Clear and then reset bit 0 of IO port 0x61, after modifying the
-        // reload value, hence, start counting down.
-        let sys_ctl_b: u8 = x86_ioport_read::<u8>(0x61);
-        x86_ioport_write::<u8>(0x61, sys_ctl_b & 0xFE); // Clear bit 0
-        x86_ioport_write::<u8>(0x61, sys_ctl_b | 0x01); // Set bit 0
-    }
-
-    pub fn wait_for_oneshot_count() {
-        // bit 5 of port 0x61 will go high once the counter hits zero
-        while x86_ioport_read::<u8>(0x61) & 0x20 == 0 {
-        }
-    }
-}
 
 #[derive(Debug)]
 struct X86HPET {
@@ -886,158 +817,8 @@ impl X86HPET {
 
 }
 
-// For newer CPUs that support Invariant TSCs, this is going to be used
-// for time-keeping and preemption interrupts
-// TODO: fallback to PIT (or HPET) in case the system doesn't support this
-struct X86TimeStampCounter {
-    freq_hz:        u64,
-    enabled:        bool,   // True: Can be used in the kernel: freq_hz is valid
-                            //       and the frequency is invariant
-    tsc_deadline:   bool,   // LAPICs can use the TSC_DEADLINE mode
-}
-impl X86TimeStampCounter {
-    pub const fn new() -> Self {
-        Self {
-            freq_hz:        0,
-            enabled:        false,
-            tsc_deadline:   false,
-        }
-    }
-    pub fn init(&mut self) {
-        let (mut eax, ebx, mut ecx, mut edx) : (u32, u32, u32, u32);
-        let (cpu_family, mut cpu_model) : (u8, u8);
-        self.enabled = false;
-        // Is TSC supported? CPUID.01H -> EDX[4]
-        // Is TSC_DEADLINE supported? CPUID1.01H -> ECX[24]
-        (eax, _, ecx, edx) = x86_cpuid_inst(0x1, 0);
-        if edx & 0x10 == 0 {
-            panic!("Processor too old. TSC not supported.");
-        }
-        if ecx & (1 << 24) == 0 {
-            panic!("Processor too old. TSC_DEADLINE not supported.");
-        }
-        cpu_model      = ((eax & 0xF0)  >> 4) as u8;
-        cpu_family     = ((eax & 0xF00) >> 8) as u8;
-        if cpu_family == 0x06 || cpu_family ==  0x0F {
-            // Extended model (EAX[19:16]) prepended
-            cpu_model |= ((eax & 0xF0000) >> 12) as u8;
-        }
 
-        // Is the rate invariant CPUID.80000007H -> EDX.bit8 (TSC_INVARIANT)
-        if x86_cpuid_max_extended_leaf() >= 0x80000007 {
-            (_, _, _, edx) = x86_cpuid_inst(0x80000007, 0);
-            if edx & 0x100 > 0 {
-                // Derive the TSC frequency:
-                // CPUID.15H: Time Stamp Counter and Nominal Core Crystal Clock
-                // EAX -> Denominator
-                // EBX -> Numerator
-                // ECX -> Core Crysctal Freq (Could be Zero)
-                // TSC_frequency = ECX * EBX/EAX
-                (eax, ebx, ecx, _) = x86_cpuid_inst(0x15, 0);
-                dbg!("CPUID.15H - EAX: {} EBX {} ECX: {}\n", eax, ebx, ecx);
-                if ecx == 0 && cpu_family == 0x6 {
-                    // Core Crystal Clock Freq is not enumerated, but we can
-                    // look it up base on the model. According to Intel's SDM:
-                    // Table 21-95. Nominal Core Crystal Clock Frequency
-                    // 25MHz: Intel Xeon Scalable Processor Family(CPUID 06_55H)
-                    // 24MHz: 6th and 7th gen Intel Core and Intel Xeon W.
-                    // 19.2MHz: Next Generation Intel Atom processors based on
-                    //          Goldmont Microarchitecture with CPUID signature
-                    //          06_5CH (does not include Intel Xeon processors).
-                    // See Tabel 2-1.
-                    // CPUID Signature Values of DisplayFamily_DisplayModel
-                    // For a complete list
-                    // CPUID.01H -> EAX[7:4] model, EAX[11:8] family
-                    ecx = match cpu_model{
-                        0x55 => 25000000,
-                        0x4E => 24000000,
-                        0x8E => 24000000,
-                        0x5C => 19200000,
-                        _    => 0
-                    };
-                }
-                if eax > 0 && ebx > 0 && ecx > 0 {
-                    self.freq_hz = ((ecx as f64) * (ebx as f64/ eax as f64))
-                                    as u64;
-                    // TSC is supported, has a constant frequency, which is
-                    // enumerated here!
-                    self.enabled = true;
-                    dbg!("Invariant TSC Freq: {} - EAX: {} EBX {} ECX: {}\n",
-                            self.freq_hz, eax, ebx, ecx);
-                } else {
-                    // Approximate it
-                    // Not the most precise method, but yields < 0.1% error
-                    // Good enough!
-                    let tm = THIS_MACHINE.lock();
-                    if tm.hpet.valid {
-                        tm.hpet.disable_counting();
-                        tm.hpet.reset_current_count();
-                        let target = tm.hpet.duration_to_ticks(Duration::from_millis(10)); 
-                        let mut hpt1 = 0;
-                        let tsc0 = cpu_read_timestamp();
-                        tm.hpet.enable_counting();
-                        while hpt1 < target {
-                            hpt1 = tm.hpet.current_count();
-                        }
-                        // let tsc1 = cpu_read_timestamp();
-                        tm.hpet.current_count();
-                        tm.hpet.disable_counting();
-                        let tsc1 = cpu_read_timestamp();
-
-                        let hpet_freq = 1_000_000_000 as f64 / (tm.hpet.period_ns) as f64;
-                        self.freq_hz = ( ((tsc1-tsc0) as f64 / hpt1 as f64) *
-                                                            hpet_freq) as u64;
-                        // Log for testing purposes
-                        dbg!("Invariant TSC - HPET-Approximated Freq: {} KHz\n"
-                                ,self.freq_hz / 1000);
-                        // let hzdelta = core::cmp::max(self.freq_hz, approx) - 
-                        //             core::cmp::min(self.freq_hz, approx);
-                        // klog!("Invariant TSC {} HPET-Approximated: {} HZ, \
-                        //        d, delta%:{:.4}, num: {}, den: {}, hpet_T: {}\n",
-                        //         self.freq_hz, approx,
-                        //         hzdelta as f64 / self.freq_hz as f64 * 100.0,
-                        //         tsc1-tsc0, hpt1, tm.hpet.period_ns
-                        //     );
-                    } else {
-                        // Resort to PIT
-                        x86_pit::config_oneshot_count(100); // 100 ms count-down
-                        x86_pit::start_oneshot_count();
-                        let start_tsc = cpu_read_timestamp();
-                        x86_pit::wait_for_oneshot_count();
-                        let end_tsc = cpu_read_timestamp();
-                        let tsc_overhead1 = cpu_read_timestamp();
-                        self.freq_hz = (end_tsc - start_tsc - 
-                                          (tsc_overhead1-end_tsc)*2) * 10;
-                        dbg!("INVARIANT TSC PIT FREQ APPROX: {} HZ\n",
-                                self.freq_hz);
-                    }
-                }
-            } else {
-                panic!("Processor too old - Invariant TSC not supported\n");
-            }
-        } else {
-            panic!("Processor too old - x86_cpuid_max_extended_leaf:{:X}\n",
-                x86_cpuid_max_extended_leaf()
-            );
-        }
-    }
-    pub fn read(&self) -> u64 {
-        let (upper, lower): (u64, u64);
-        unsafe {
-            asm!("rdtsc", out("rdx")upper, out("rax")lower);
-        }
-        (upper << 32) | lower
-    }
-    pub fn freq_hz(&self) -> u64 {
-        self.freq_hz
-    }
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
-
-struct X86IoApic{
+pub struct X86IoApic{
     acpi_id:        u8,
     version:        u8,
     max_irqs:       u8,
@@ -1094,7 +875,7 @@ impl X86IoApic {
         }
     }
 
-    pub fn init(&mut self, ioapic: &AcpiIOApic) {
+    fn init(&mut self, ioapic: &AcpiIOApic) {
         // TODO identity-map mmio_base with caching disabled
         // The MMIO is usually toward the end of the 4GB boundary. Don't accept
         // an MMIO mapping under 1MB.
@@ -1144,7 +925,7 @@ impl X86IoApic {
     }
 }
 
-struct X86LocalApic {
+pub struct X86LocalApic {
     lapic_id:   u8,
     cpu_acpi_id:u8,
     mmio_base:  u32,
@@ -1195,7 +976,7 @@ impl X86LocalApic {
         }
     }
 
-    pub fn init(&mut self, lapic: &AcpiLocalApic, lapic_mmio: u32) {
+    fn init(&mut self, lapic: &AcpiLocalApic, lapic_mmio: u32) {
         // TODO identity-map mmio_base with caching disabled
         // The MMIO is usually toward the end of the 4GB boundary. Don't accept
         // an MMIO mapping under 1MB.
@@ -1304,8 +1085,7 @@ impl X86LocalApic {
 // External interface exposed to kernel's general code                        //
 //----------------------------------------------------------------------------//
 percpu_global!{
-    pub THIS_CPU_ID: usize = 0; // To avoid issuing cpuid every time
-    pub THIS_CPU_SYSTIMER:          SystemTimer = SystemTimer::new();
+    THIS_CPU_ID: usize = 0; // To avoid issuing cpuid every time in cpu_id()
     pub THIS_CPU_IDLE_TSC_TICKS:    usize = 0;
 }
 
@@ -1394,10 +1174,14 @@ pub fn cpu_count() -> usize {
 
 // Returns LAPIC CPU ID of the current CPU calling the routine using the
 // CPUID instruction with Extended Topology Leaf (0BH)
-pub fn cpu_id() -> usize {
+pub fn cpu_lapic_id() -> usize {
     let apic_cpu_id: u32;
     (_, _, _, apic_cpu_id) = x86_cpuid_inst(0xB, 0x0);
     apic_cpu_id as usize
+}
+
+pub fn cpu_id() -> usize {
+    *THIS_CPU_ID.borrow_mut()
 }
 
 pub fn x86_cpuid_inst(in_eax: u32, in_ecx: u32) -> (u32, u32, u32, u32) {
@@ -1594,15 +1378,14 @@ pub mod kdebug_console {
 // print_str is implemented in a synchronizing manner
 //
 pub mod kearly_console {
-    use crate::arch::asc::*;
+    use crate::drivers::video::framebuffer::*;
     use crate::util::Spinlock;
 
     static CURSOR : Spinlock<(u32, u32)> = Spinlock::new((0,0));
     // CURSOR.0 -> row, .1 -> column
 
     pub fn init() {
-        let mut vesa = VESA_CONTEXT.lock();
-        vesa.clean_screen();
+        FrameBuffer::clean_screen();
         let mut cursor = CURSOR.lock();
         cursor.0 = 0;
         cursor.1 = 0;
@@ -1611,13 +1394,8 @@ pub mod kearly_console {
 
 
     pub fn print_str(msg: &[u8]) {
-        let (sh, sw) : (u32, u32);
-        let (fh, fw) : (u32, u32);
-        {
-            let vesa = VESA_CONTEXT.lock();
-            (sh, sw) = vesa.screen_size();
-            (fh, fw) = vesa.font_size();
-        }
+        let (sh, sw) : (u32, u32) = FrameBuffer::screen_size();
+        let (fh, fw) : (u32, u32) = FrameBuffer::font_size();
         let (rows, cols) = (sh / fh, sw / fw);
         let mut cursor = CURSOR.lock();
         for &c in msg {
@@ -1627,14 +1405,10 @@ pub mod kearly_console {
             } else if c == 0x8 { // Backspace
                 if (*cursor).1 > 0 {
                     (*cursor).1  -= 1;
-                    let mut vesa = VESA_CONTEXT.lock();
-                    vesa.putc(b' ', (*cursor).0, (*cursor).1);
+                    FrameBuffer::putc(b' ', (*cursor).0, (*cursor).1);
                 }
             } else {
-                {
-                    let mut vesa = VESA_CONTEXT.lock();
-                    vesa.putc(c, (*cursor).0, (*cursor).1);
-                }
+                FrameBuffer::putc(c, (*cursor).0, (*cursor).1);
                 (*cursor).1 = (*cursor).1 + 1;
                 if (*cursor).1 == cols {
                     (*cursor).1 = 0;
@@ -1645,126 +1419,6 @@ pub mod kearly_console {
     }
 }
 
-//
-// System Timer(s)
-//
-#[derive(Clone, Copy, Debug)]
-pub enum SysTimerDuration {
-    Seconds(u64),
-    Milliseconds(u64),
-    Microseconds(u64),
-    Nanoseconds(u64),
-    Ticks(u64)
-}
-
-pub enum SysTimerMode {
-    OneShot,
-    Periodic,
-    Disabled
-}
-
-// System-wide - Every core runs the same IRQ handler function
-
-
-pub struct SystemTimer {
-    mode: SysTimerMode
-}
-impl SystemTimer {
-    pub const fn new() -> Self {
-        Self{
-            mode: SysTimerMode::Disabled
-        }
-    }
-
-    // To be called once during kernel's serialized initialization to install a
-    // single IRQ handler. Every core will execute the same handler code, even
-    // though each having an individual timer (and set of events)
-    pub fn global_init(isr_callback: IsrHandlerFn) {
-        unsafe {
-            X86_LAPIC_TIMER_HANDLER = isr_callback;
-        }
-    }
-
-    // Per-CPU - Each CPU can configure a different mode for its timer
-    pub fn set_mode(&mut self, mode: SysTimerMode){
-        match mode {
-            SysTimerMode::OneShot   => {
-                THIS_LAPIC.borrow_mut().config_timer(33, false);
-            }
-            SysTimerMode::Periodic  => {
-                panic!("The SystemTimer doesn't support a periodic mode yet.");
-            }
-            SysTimerMode::Disabled  => {
-                THIS_LAPIC.borrow_mut().config_timer(33, true);
-            }
-        }
-        self.mode = mode;   
-    }
-
-    // Per-CPU - Sets the period of IRQs or the next IRQ to generate depending
-    // on the mode set for the timer.
-    pub fn arm(&self, duration: SysTimerDuration) {
-        match self.mode {
-            SysTimerMode::Disabled      => {},
-            SysTimerMode::OneShot       => {self.arm_one_shot(duration);}
-            SysTimerMode::Periodic      => {self.arm_periodic(duration);}
-        }
-    }
-
-    //
-    fn arm_one_shot(&self, d: SysTimerDuration) {
-        let tsc = THIS_TSC.borrow_mut();
-        let duration_tsc = match d {
-            SysTimerDuration::Ticks(t)          => {
-                t
-            },
-            SysTimerDuration::Seconds(s)        => {
-                s * tsc.freq_hz
-            },
-            SysTimerDuration::Milliseconds(ms)  => {
-                ((ms as f64 / 1_000.0) * tsc.freq_hz as f64) as u64
-            },
-            SysTimerDuration::Microseconds(us)  => {
-                ((us as f64 / 1_000_000.0) * tsc.freq_hz as f64) as u64
-            },
-            SysTimerDuration::Nanoseconds(ns)   => {
-                ((ns as f64 / 1_000_000_000.0) * tsc.freq_hz as f64) as u64
-            },
-        };
-        let target = tsc.read() + duration_tsc;
-        THIS_LAPIC.borrow_mut().set_timer(target);
-    }
-
-    fn arm_periodic(&self, _p: SysTimerDuration) {
-        panic!("Not implemented yet!\n");
-    }
-
-    //
-    // Timestamp Interface
-    //
-    pub fn current_timestamp() -> u64 {
-        cpu_read_timestamp()
-    }
-
-    pub fn duration_to_timestamp_ticks(d: Duration) -> u64 {
-        let tsc = THIS_TSC.borrow_mut();
-        ((d.as_nanos() as f64 / 1_000_000_000.0) * tsc.freq_hz as f64) as u64
-    }
-
-    pub fn timestamp_to_duration(t: u64) -> Duration {
-        let tsc = THIS_TSC.borrow_mut();
-        Duration::from_nanos((t as f64 / 
-                                (tsc.freq_hz as f64 / 1_000_000_000.0)) as u64)
-    }
-
-    pub fn current_timestamp_as_duration() -> Duration {
-        let tsc = THIS_TSC.borrow_mut();
-        Duration::from_nanos( (cpu_read_timestamp() as f64 / 
-                                (tsc.freq_hz as f64 / 1_000_000_000.0)) as u64)
-    }
-}
-
-
 
 //
 // IRQ Interface
@@ -1772,7 +1426,6 @@ impl SystemTimer {
 type IsrHandlerFn = fn(u16);
 
 fn isr_default_imp(_: u16) { }
-static mut X86_LAPIC_TIMER_HANDLER: IsrHandlerFn = isr_default_imp;
 static mut X86_ISR_HANDLER: [IsrHandlerFn; 24] = [isr_default_imp; 24];
 
 pub fn irq_controller_init() {
@@ -1810,319 +1463,6 @@ pub fn cpu_trigger_systimer_irq() {
 }
 
 
-//
-// Memory Management Unit Abstraction
-//
-pub struct MMUMapping {
-    // Virt=Phys address of PML4 Table <-> CR3
-    pml4_base   : usize,
-    // Virt=Phys address of PML4[0] -> PDPT0 Table base (first 512GB)
-    pdpt0_base  : usize,
-}
-impl MMUMapping {
-    // See boot.S for our GDT Entries
-    const GDTE_USER_CODE: u16 = 0x18;
-    const GDTE_USER_DATA: u16 = 0x20;
-    // Segment Selector Values: See Section 3.4.2 - Segment Selectors
-    const SEGSEL_USER_CODE: u16 = Self::GDTE_USER_CODE | 0x3; // CPL: Ring 3
-    const SEGSEL_USER_DATA: u16 = Self::GDTE_USER_DATA | 0x3; // CPL: Ring 3
-    // Paging Structure Entry Definitions
-    const PGENT_PRESENT:        u64 = 0x1;
-    const PGENT_WRITABLE:       u64 = 0x2;
-    const PGENT_USERMODE:       u64 = 0x4;
-    const PGENT_PWT:            u64 = 0x8;  // Page-level Write-throuhg
-    const PGENT_PCD:            u64 = 0x10; // Page-level Cache Disable
-    const PGENT_PS:             u64 = 0x80; // Set for large pages
-    const PGENT_G:              u64 = 0x100; // Global
-    const PGENT_BASE_MASK:      u64 = 0xFFFFFFF000;
-
-    // 4-Level Mapping - Virtual Address bits
-    //     9 bits       9 bits       9 bits         9 bits         12 bits
-    // [47 pml4e 39][38 pdpte 30][29   pde   21][20   pte   12][11   off   0]
-    //
-    // Virtual memory address range that can be mapped via calls to map_pages
-    pub const MIN_VIRTUAL:      u64 = 0x200000000;     // 8 GBs
-    pub const MAX_VIRTUAL:      u64 = (1 << 39) - 1;   // 256 GBs - only pml4[0]
-    pub const PAGE_SIZE:        usize = 0x1000; // Only 4KB pages in this range
-    
-    pub const fn new() -> Self {
-        Self {
-            pml4_base: 0,
-            pdpt0_base: 0
-        }
-    }
-
-    // Creates the initial paging structures for the process that includes
-    // the kernel mappings.
-    // VIRTUAL MEM           --> PHYSICAL MEM
-    // 0   - 4GB             --> 0 - 4GB R/W KERNEL MODE
-    // 4GB - 4GB+IMAGE_SIZE  --> IMAGE_START + IMAGE_END
-    pub fn init(&mut self) {
-        // Allocate and zero out:
-        //   1 page for the PML4 table and 1 page for the first PDPT table
-        self.pml4_base  = palloc().expect("Out of memory");
-        self.pdpt0_base = palloc().expect("Out of memory");
-        unsafe {
-            (self.pml4_base  as *mut u8).write_bytes(0, 0x1000);
-            (self.pdpt0_base as *mut u8).write_bytes(0, 0x1000);
-        }
-
-        // Set PML4[0] --> PDPT0 that covers the first 512 GB
-        let pml4e0 = self.pdpt0_base as u64 | Self::PGENT_PRESENT |
-                    Self::PGENT_WRITABLE | Self::PGENT_USERMODE;
-        Self::write_table_entry(self.pml4_base, 0, pml4e0);
-
-        // Kernel's code/data 
-        // Set PDPT0[0..=3] --> PHYS[0GB to 4GB] as writable+cachable
-        let pdpt0e = Self::PGENT_PRESENT | Self::PGENT_WRITABLE |
-                        Self::PGENT_PS; // 1GB page
-        for i in 0..4 {
-            let phys_addr : u64 = i << 30;
-            Self::write_table_entry(self.pdpt0_base, i as usize, 
-                                    pdpt0e | phys_addr);
-        }
-        // Kernel's DMA access
-        // Set PDPT0[4..=7] --> PHYS[0GB to 4GB] as writable+non-cachable
-        let pdpt0e = Self::PGENT_PRESENT | Self::PGENT_WRITABLE |
-                        Self::PGENT_PCD | Self::PGENT_PS; // 1GB page
-        for i in 4..8 {
-            let phys_addr : u64 = (i - 4) << 30;
-            Self::write_table_entry(self.pdpt0_base, i as usize, 
-                                    pdpt0e | phys_addr);
-        }
-
-        // Log everything for testing
-        dbg!("PML4 Base: {:X}, PML4E0: {:X}\n",
-            self.pml4_base,
-            Self::read_table_entry(self.pml4_base, 0)
-        );
-        dbg!("PDPT0 Base: {:X}\n", self.pdpt0_base);
-        for _i in 0..8 {
-            dbg!("    PDPT0[{}] : {:X}\n", _i,
-                    Self::read_table_entry(self.pdpt0_base, _i));
-        }
-    }
-
-    //
-    // Paging structure management methods 
-    //
-    // Virtual Address ----> Physical Address translation
-    // 4GB - 0         ----> 4GB - 0 as four 1GB pages as supervisor access
-    // Above 4GB       ----> Non-contiguous 4KB physical pages as user access
-    //
-    //
-
-    pub fn addr_to_page_index(addr: usize) -> usize {
-        addr >> 12
-    }
-
-    // Maps a page (virtual address > 4GB) to a frame (physical address)
-    // The assumption is that the caller has already reserved page_cnt frames
-    // starting from phys_address from the physical memory manager.
-    pub fn map_pages(&self, virt_addr: usize, phys_addr: usize, page_cnt: usize,
-                     privileged: bool, writeable: bool, _executable: bool,
-                    _caching: MmuCachingPolicy) -> bool {
-        // Page-align the given addresses
-        let mut vaddr : u64 = virt_addr as u64 & Self::PGENT_BASE_MASK;
-        let mut paddr : u64 = phys_addr as u64 & Self::PGENT_BASE_MASK;
-        dbg!("map_pages(v:{:X}, p:{:X}, cnt:{}\n", vaddr, paddr, page_cnt);
-        if vaddr < Self::MIN_VIRTUAL || vaddr > Self::MAX_VIRTUAL  {
-            return false;
-        }
-
-        for _i in 0..page_cnt {
-            let pdpt0e_i    = (vaddr >> 30) & 0x1FF; // Index in PDPT[0]
-            let pde_i       = (vaddr >> 21) & 0x1FF; // Index in PD
-            let pte_i       = (vaddr >> 12) & 0x1FF; // Index in PT
-            let pd_base : usize;
-            let pt_base : usize;
-
-            // 1GB Region
-            let mut pdpt0e = Self::read_table_entry(self.pdpt0_base,
-                                                pdpt0e_i as usize);
-            if pdpt0e == 0 {
-                // Allocate a page directory for this PDPT0[pdpt0e_i]
-                pd_base = palloc().expect("Out of memory");
-                unsafe {
-                    (pd_base as *mut u8).write_bytes(0, 0x1000);
-                }
-                pdpt0e = pd_base as u64 | Self::PGENT_PRESENT |
-                           Self::PGENT_USERMODE | Self::PGENT_WRITABLE;
-                Self::write_table_entry(self.pdpt0_base,
-                                        pdpt0e_i as usize, pdpt0e);
-            } else {
-                // Retrieve the page directory's base from PDPT0[pdpt0e_i]
-                pd_base = (pdpt0e & Self::PGENT_BASE_MASK) as usize;
-            }
-
-            // 2 MB Region
-            let mut pde = Self::read_table_entry(pd_base,
-                                            pde_i as usize);
-            if pde == 0 {
-                // Allocate a page table for this PD[pde_i]
-                pt_base = palloc().expect("Out of memory");
-                unsafe {
-                    (pt_base as *mut u8).write_bytes(0, 0x1000);
-                }
-                pde = pt_base as u64 | Self::PGENT_PRESENT |
-                           Self::PGENT_USERMODE | Self::PGENT_WRITABLE;
-                Self::write_table_entry(pd_base, pde_i as usize, pde);
-            } else {
-                // Retrieve the page table's base from ths PD[pde_i]
-                pt_base = (pde & Self::PGENT_BASE_MASK) as usize;
-            }
-
-            // 4KB Region
-            let mut pte : u64 = (paddr & Self::PGENT_BASE_MASK) |
-                                Self::PGENT_PRESENT;
-            if writeable == true {
-                pte |= Self::PGENT_WRITABLE;
-            }
-            if privileged == false {
-                pte |= Self::PGENT_USERMODE;
-            }
-            Self::write_table_entry(pt_base, pte_i as usize, pte);
-
-            vaddr += Self::PAGE_SIZE as u64;
-            paddr += Self::PAGE_SIZE as u64;
-        }
-
-        true
-    }
-
-    pub fn log_mapping(&self, vaddr: usize) {
-        let pdpt0e_i    = (vaddr >> 30) & 0x1FF; // Index in PDPT[0]
-        let pde_i       = (vaddr >> 21) & 0x1FF; // Index in PD
-        let pte_i       = (vaddr >> 12) & 0x1FF; // Index in PT
-
-        
-        klog!("pml4[0] @ {:X} => {:X}\n", self.pml4_base, 
-            Self::read_table_entry(self.pml4_base, 0));
-
-        let pdpte = Self::read_table_entry(self.pdpt0_base, pdpt0e_i);
-        klog!("  pdpt0 @ {:X} elem[{}]=> {:X}\n", self.pdpt0_base, pdpt0e_i,
-            pdpte as usize);
-
-        let pd_base = pdpte & Self::PGENT_BASE_MASK;
-        let pde = Self::read_table_entry(pd_base as usize, pde_i);
-        klog!("    pd @ {:X} elem[{}]=> {:X}\n", pd_base, pde_i, pde);
-        
-        let pt_base = pde & Self::PGENT_BASE_MASK;
-        let pte = Self::read_table_entry(pt_base as usize, pte_i);
-        klog!("      pt @ {:X} elem[{}]=> {:X}\n", pt_base, pte_i, pte);
-        klog!("VADDR {:X} --> PADDR {:X}\n", vaddr, 
-                pte & Self::PGENT_BASE_MASK);
-    }
-
-    pub fn unmap_pages(_virt_addr: usize, _num_pages: usize) {
-
-    }
-
-    fn write_table_entry(table_virt_base: usize, index: usize, value: u64) {
-        unsafe {
-            let destp : *mut u64 = table_virt_base as *mut u64;
-            *(destp.wrapping_add(index)) = value;
-        }
-    }
-
-    fn read_table_entry(table_virt_base: usize, index: usize) -> u64 {
-        unsafe {
-            let destp : *mut u64 = table_virt_base as *mut u64;
-            destp.wrapping_add(index).read_volatile()
-        }
-    }
-
-    /*
-     * Execution/Segmentation Management methods
-     */
-    ///
-    /// Converts the currently running kernel task into a user-space task as a
-    /// part of this process address space. The calling (kernel) task will not
-    /// return to the next instruction after its call to move_to_userspace.
-    /// The user-space execution must end with an Exit system call, at which
-    /// point the task terminates.
-    /// 
-    pub fn move_to_userspace(priv_data: usize, entry_point: usize,
-                            user_stack: usize) {
-        // Prepare CS, DS, SS for ring 3 transition and then jump to the
-        // entry point address given. x64 doesn't support ljmp, so Iretq it is!
-        // Should save the RSP0 pointer in the TSS for this CPU so that when
-        // the cpu traps in ring-0 again, kernel's stack is recovered
-        let _tss_rsp0: usize = x64_tss_rsp0_addr();
-        dbg!("TSS[0].RSP0 is located at {:X}\n", _tss_rsp0);
-        unsafe {
-            switch_to_userspace(entry_point, user_stack, priv_data /*pml4_base*/
-                                , x64_tss_rsp0_addr());
-        }
-        panic!("Must have been unreachable!\n");
-    }
-
-    pub fn copy_priv_data(&self) -> usize {
-        self.pml4_base
-    }
-
-    /*
-     * DMA
-     */
-    pub fn dma_from_kernel_phys(phys_addr: usize) -> usize{
-        phys_addr | ((1 as usize) << 32)
-    }
-}
-
-impl Drop for MMUMapping {
-    fn drop(&mut self) {
-        let mut _pg_count = 0;
-        let mut _pg_st_count = 0;
-        // Release the paging structures
-        for pdpt0e_i in 0..512 {
-            let pdpt0e = Self::read_table_entry(self.pdpt0_base, pdpt0e_i);
-            if pdpt0e & Self::PGENT_PRESENT > 0 && pdpt0e & Self::PGENT_PS == 0{
-                // Points to a page directory
-                let pde_base = pdpt0e & Self::PGENT_BASE_MASK;
-                for pde_i in 0..512 {
-                    let pde = Self::read_table_entry(pde_base as usize, pde_i);
-                    if pde & Self::PGENT_PRESENT > 0 &&
-                        pde & Self::PGENT_PS == 0 {
-                        // Points to a page table
-                        let pt_base = (pde & Self::PGENT_BASE_MASK) as usize;
-                        for pte_i in 0..512 {
-                            let pte = Self::read_table_entry(pt_base, pte_i);
-                            if pte & Self::PGENT_PRESENT > 0 {
-                                // Release the physical frame itself too
-                                _pg_count += 1;
-                                pfree((pte & Self::PGENT_BASE_MASK) as usize);
-                            }
-                        }
-                        // Release the Page Table
-                        _pg_st_count += 1;
-                        pfree((pde & Self::PGENT_BASE_MASK) as usize);
-                    }
-                }
-                // Release the Page Directory
-                _pg_st_count += 1;
-                pfree(pde_base as usize);
-            }
-        }
-        _pg_st_count += 2;
-        pfree(self.pdpt0_base);
-        pfree(self.pml4_base);
-        dbg!("Released {} user frames and {} paging structure frames - \
-              Free frames: {}\n", _pg_count, _pg_st_count,
-              pmm_num_free_frames());
-
-    }
-}
-
-pub enum MmuCachingPolicy {
-    NonCaching,    // Slow Memory RW - Totally safe for MMIO/DMA
-    WriteThrough,  // Fast Memory R, Slow Memory/MMIO W - Not safe for MMIO Read
-    WriteBack      // Fast Memory-only R/W - Not for MMIO
-}
-
-extern "C" {
-    fn switch_to_userspace(rip: usize, rsp: usize, pml4_base: usize,
-                            tss_rsp0_addr: usize);
-}
 
 //
 // Symmetric Multiprocessing Support
