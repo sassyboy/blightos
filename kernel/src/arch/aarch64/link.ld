@@ -8,27 +8,27 @@ SECTIONS {
 
   . = ALIGN(8);
   _KERNEL_TEXT_START = .;
-  .tex.boot : {
+  .text.boot : {
     *(.text.boot)
   }
   .text : {
-    *(.text)
+    *(.text.*)
   }
   _KERNEL_TEXT_END = .;
 
   . = ALIGN(8);
   _KERNEL_RODATA_START = .;
-  .rodata : { *(.rodata) }
+  .rodata : { *(.rodata.*) }
   _KERNEL_RODATA_END = .;
 
   . = ALIGN(8);
   _KERNEL_DATA_START = .;
-  .data : { *(.data) }
+  .data : { *(.data.*) }
   _KERNEL_DATA_END = .;
 
   . = ALIGN(8);
   _KERNEL_BSS_START = .;
-  .bss : { *(.bss COMMON) }
+  .bss : { *(.bss.*) }
   _KERNEL_BSS_END = .;
   _KERNEL_BSS_SIZE = _KERNEL_BSS_END - _KERNEL_BSS_START;
 

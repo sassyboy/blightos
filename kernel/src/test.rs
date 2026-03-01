@@ -42,13 +42,13 @@ pub fn kself_test() {
             counter and screen buffer\n");
     for c in 0..cpu_count() {
         if c == 0 {
-            let t = Task::spawn_on_cpu(task1_exec, 0, format!("CPU0-Test1-1"));
+            let t = Task::spawn_on_cpu(task1_exec, 0, 0, format!("Cpu0Tst1.1"));
             BSP_T1_TID.store(t, Ordering::Relaxed);
-            let t = Task::spawn_on_cpu(task2_exec, 0, format!("CPU0-Test1-2"));
+            let t = Task::spawn_on_cpu(task2_exec, 0, 0, format!("Cpu0Tst1.2"));
             BSP_T2_TID.store(t, Ordering::Relaxed);
         } else {
-            Task::spawn_on_cpu(task1_exec, c, format!("CPU{}-Test1-1", c));
-            Task::spawn_on_cpu(task2_exec, c, format!("CPU{}-Test1-1", c));
+            Task::spawn_on_cpu(task1_exec, 0, c, format!("Cpu{}-Tst1.1", c));
+            Task::spawn_on_cpu(task2_exec, 0, c, format!("Cpu{}-Tst1.2", c));
         }
     }
     while BSP_T3_TID.load(Ordering::Relaxed) == 0 {
@@ -58,7 +58,7 @@ pub fn kself_test() {
 
 }
 
-fn task1_exec() {
+fn task1_exec(_arg: usize) {
     let cpuid = Task::current_cpu();
     // Wait for all the test tasks to spawn before racing over the counter
     TEST_TASKS_STARTED.fetch_add(1, Ordering::Relaxed);
@@ -78,7 +78,7 @@ fn task1_exec() {
     }
 }
 
-fn task2_exec() {
+fn task2_exec(_arg: usize) {
     let cpuid = Task::current_cpu();
     // Wait for all the test tasks to spawn before racing over the counter
     TEST_TASKS_STARTED.fetch_add(1, Ordering::Relaxed);
@@ -86,7 +86,7 @@ fn task2_exec() {
         spin_loop();
     }
     if cpuid == 0 {
-        let tid = Task::spawn_named(task3_exec, String::from("Self-Test-Main"));
+        let tid = Task::spawn_named(task3_exec, 0, String::from("KSelfTest"));
         BSP_T3_TID.store(tid, Ordering::Relaxed); 
     }
     loop {
@@ -104,7 +104,7 @@ fn task2_exec() {
 
 static WC : WaitChannel = WaitChannel::new();
 
-fn task3_exec() {
+fn task3_exec(_arg: usize) {
     klog!("<A LONG MESSAGE TO TEST THE CONSOLE PRINT_STR LOCK - {} (TID: {})>",
                 Task::name(), Task::current_tid());
     // Wait for the first two tasks to finish
@@ -127,10 +127,10 @@ fn task3_exec() {
     );
     klog!("[Test] Best-effort Sleep + 5 other tasks running\n  ");
     for i in 0..5 {
-        Task::spawn_on_cpu(|| {
+        Task::spawn_on_cpu(|_arg: usize| {
             klog!("<{}>", Task::name());
             cpu_busywait(Duration::from_millis(50));
-        }, Task::current_cpu(), format!("ST{}", i));
+        }, Task::current_cpu(), 0, format!("ST{}", i));
     }
     let tsc0 = SystemTimer::current_timestamp_as_duration();
     Task::sleep(Duration::from_millis(5));
@@ -144,9 +144,9 @@ fn task3_exec() {
         tsc2.as_micros() - tsc1.as_micros() - 15000
     );
     klog!("[Test] Waking up a asleep task early\n");
-    let sleeping_tid = Task::spawn( || {
+    let sleeping_tid = Task::spawn( |_arg: usize| {
         Task::sleep(Duration::from_secs(20));
-    });
+    }, 0);
     Task::sleep(Duration::from_millis(100));
     Task::wake(sleeping_tid);
     Task::join(sleeping_tid);
@@ -155,7 +155,7 @@ fn task3_exec() {
     klog!("[Test] Parallel heap allocations - Free frames: {}\n",
             pmm_num_free_frames());
 
-    let t4 = Task::spawn(|| {
+    let t4 = Task::spawn(|_arg: usize| {
         klog!("  <Task {}(CPU{}) allocate/verify/free 1000 i32>\n",
                 Task::current_tid(), Task::current_cpu());
         let mut myvec: Vec<i32> = Vec::new();
@@ -170,7 +170,7 @@ fn task3_exec() {
             }
         }
         klog!("  <Task {} Finished>\n", Task::current_tid());
-    });
+    }, 0);
     
     {
         Task::sleep(Duration::from_millis(5));
@@ -200,13 +200,13 @@ fn task3_exec() {
 
     // TEST - CO-OP SCHEDULING -------------------------------------------------
     klog!("[TEST] Co-op scheduling\n  ");
-    let t5 = Task::spawn_on_cpu(|| {
+    let t5 = Task::spawn_on_cpu(|_arg: usize| {
         for _i in 0..10 {
             klog!("<{}>", Task::name());
             Task::preempt();
             
         }
-    }, Task::current_cpu(), format!("COP2"));
+    }, 0, Task::current_cpu(), format!("COP2"));
 
     for _i in 0..10 {
         Task::preempt();
@@ -219,17 +219,17 @@ fn task3_exec() {
     // TEST - REMOTE TASK CREATION AND JOIN ------------------------------------
     klog!("[Test] Remote task creation/join - Caller: tid={}, cpu={}\n",
                 Task::current_tid(), Task::current_cpu());
-    let tid = Task::spawn_on_cpu(|| {
+    let tid = Task::spawn_on_cpu(|_arg: usize| {
         klog!("  Task {} currently running on CPU{}\n",
                                     Task::current_tid(), Task::current_cpu());
         Task::sleep(Duration::from_millis(500));
-    }, (cpu_id() + 1) % cpu_count(), format!("RemoteCreateTestTask"));
+    }, 0, (cpu_id() + 1) % cpu_count(), format!("RemoteCreateTestTask"));
     klog!("  Task {} joining the remote task {}\n", Task::current_tid(), tid);
     Task::join(tid);
 
     // TEST - TASK MIGRATION ---------------------------------------------------
     klog!("[TEST] Task migration\n");
-    let tid = Task::spawn(||
+    let tid = Task::spawn(|_arg: usize|
     {
        
         klog!("  Task {} currently running on CPU{}\n",
@@ -243,21 +243,21 @@ fn task3_exec() {
         Task::migrate_to_cpu((Task::current_cpu() + 1) % cpu_count());
         klog!("  Task {} migrated and is currently running on CPU{}\n",
                                     Task::current_tid(), Task::current_cpu());
-    });
+    }, 0);
     Task::join(tid);
 
     // TEST - SHARED WAIT CHANNEL ----------------------------------------------
     klog!("[TEST] Shared wait channel...\n  ");
     let mut wtid : [usize; 5] = [0; 5];
     for i in 0..5 {
-        wtid[i] = Task::spawn(|| {
+        wtid[i] = Task::spawn(|_arg: usize| {
             klog!("<T{} Waiting on CPU {}>", 
                     Task::current_tid(), Task::current_cpu());
             
             WC.wait();
             klog!("<T{} Resumed on CPU {}>",
                     Task::current_tid(), Task::current_cpu());
-        });
+        }, 0);
     }
     Task::sleep(Duration::from_millis(1000));
     klog!("\n  <Task {} Signaling all the waiters>\n  ", Task::current_tid());

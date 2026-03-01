@@ -3,4 +3,4 @@
 .globl _start
 _start:
     call main
-    hlt
+ret /* The OS has put the return address for us! */

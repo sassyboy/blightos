@@ -295,6 +295,8 @@ pub struct ELFSegment {
     pub p_filesz:   usize, // # of bytes in the file image of the segment; may be 0
     pub p_memsz:    usize, // # of bytes in the memory image of the segment
     pub p_align:    usize,
+    // Note: p_memsz can be greater than p_filesz, in which case the extra bytes
+    // (e.g., belonging to a .bss section)should be zero-initialized in memory.
 }
 impl ELFSegment {
     pub const P_TYPE_LOAD:      u32 = 1;
@@ -449,7 +451,7 @@ impl ELFBinary {
 
     pub fn load_segment(&self, seg_index: usize, dest_addr: usize) -> usize {
         let mut xfer_len = 0;
-        let mut left = self.segments[seg_index].p_memsz;
+        let mut left = self.segments[seg_index].p_filesz;
         let mut foff = self.segments[seg_index].p_offset;
         let mut dest = dest_addr;
         while left > 0 {
@@ -468,6 +470,13 @@ impl ELFBinary {
             } else {
                 break; // IO Error
             }
+        }
+        // If memsz > filesz, the remaining bytes should be zero-initialized. 
+        for i in xfer_len..self.segments[seg_index].p_memsz {
+            unsafe {
+                ((dest_addr + i) as *mut u8).write(0);
+            }
+            xfer_len += 1;
         }
         xfer_len
     }

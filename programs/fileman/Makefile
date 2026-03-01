@@ -1,4 +1,4 @@
-PROGRAM=shell
+PROGRAM=fileman
 
 include ../../config.mk
 include ../rtlib/include.mk

@@ -117,9 +117,9 @@ impl Machine {
         crate::arch::machine_reboot();
     }
     fn exec_ktest() {
-        Task::spawn_on_cpu(|| {
+        Task::spawn_on_cpu(|_arg: usize| {
             test::kself_test();
-        }, 0, String::from("Machine::ktest"));
+        }, 0, 0, String::from("Machine::ktest"));
         
     }
 

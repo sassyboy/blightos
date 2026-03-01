@@ -29,10 +29,10 @@ impl UARTKeyboard {
 
     pub fn post_enum() {
         // Spawn a worker that checks the uart input buffer
-        Task::spawn_named(Self::worker, String::from("UARTKBD-WORKER"));
+        Task::spawn_named(Self::worker, 0, String::from("UARTKBD-WORKER"));
     }
 
-    fn worker() {
+    fn worker(_arg: usize) {
         loop {
             if let Some(ch) = crate::arch::bcm_peripherals::pl011uart_getc() {
                 Keyboard::push_ascii(ch);

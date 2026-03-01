@@ -7,18 +7,20 @@ use core::arch::asm;
 #[derive(PartialEq, PartialOrd)]
 pub enum SyscallOpCode {
     TaskCtl         = 0,
-    Open            = 1,
-    Enum            = 2,
-    Read            = 3,
-    Write           = 4,
-    Exec            = 5,
-    Close           = 6,
-    Max             = 7
+    ProcCtl         = 1,
+    Open            = 2,
+    Enum            = 3,
+    Read            = 4,
+    Write           = 5,
+    Exec            = 6,
+    Close           = 7,
+    Max             = 8
 }
 
 pub enum Syscall {
     // Task/Process control
     TaskControl{opcode: usize, args: usize, ret_code: usize},
+    ProcControl{opcode: usize, args: usize, ret_code: usize},
 
     // Device/File control
     Open{path_ptr: usize, path_len: usize, mode: usize, ret_ptr: usize},
@@ -48,8 +50,11 @@ pub enum SyscallRsvdFDs {
 pub enum TaskControlOpCode {
     Exit        = 0,
     Current     = 1,
-    Spawn       = 2,
-    Join        = 3,
+    CurrentCpu  = 2,
+    Spawn       = 3,
+    Join        = 4,
+    Yield       = 5,
+    Sleep       = 6,
 }
 
 #[repr(C, packed)]
@@ -59,7 +64,74 @@ pub struct TaskControlCurrentArguments{
     pub name:       [u8; 64]
 }
 
+#[repr(C, packed)]
+pub struct TaskControlSpawnArguments{
+    pub func_ptr:   usize,          // Input
+    pub func_arg:   usize,          // Input
+    pub name:       [u8; 64],       // Input
+    pub name_len:   usize,          // Derived
+    pub tid:        usize,          // Output
+    pub pid:        usize,          // Output
+}
 
+#[repr(C, packed)]
+pub struct TaskControlJoinArguments{
+    pub tid:        usize,          // Input
+    pub joined:     bool,           // Output
+}
+
+
+//
+// Process Control structures
+//
+#[repr(usize)]
+#[derive(PartialEq, PartialOrd)]
+pub enum ProcCtlOpCode {
+    Exit        = 0,
+    Current     = 1, // Returns the PID and TID of the main task of the current process
+    GetInfo     = 2, // Returns more detailed information about the current process
+    ResizeHeap  = 3, // Expand/Shrink the heap of the current process
+    Spawn       = 4, // Spawn a new process by executing a file
+    Fork        = 5, // Clone the current process
+    Exec        = 6, // Replace the current process with a new executable
+}
+
+pub struct ProcCtlCurrentArgs{
+    pub pid:        usize,
+    pub main_tid:   usize,
+}
+
+pub struct ProcCtlGetInfoArgs {
+    pub pid:                usize,
+    pub name:               [u8; 64],
+    pub main_tid:           usize,
+    pub task_count:         usize,
+    pub fd_count:           usize,
+    pub img_base:           usize,
+    pub img_size:           usize,
+    pub heap_base:          usize,
+    pub heap_size:          usize,
+    pub stack_top:          usize,
+    pub total_mem_usage:    usize,
+    pub meta_mem_usage:     usize,
+}
+
+pub struct ProcCtlSpawnArgs {
+    pub path_ptr: usize,// Input: Pointer to the path string in user-space
+    pub path_len: usize,// Input: Length of the path string
+    // pub cmd_ptr: usize, // Input: Pointer to the command buffer in user-space (optional)
+    // pub cmd_len: usize, // Input: Length of the command buffer (optional)
+    // pub env_ptr: usize, // Input: Pointer to the environment variables buffer in user-space (optional)
+    // pub env_len: usize, // Input: Length of the environment variables buffer (optional)
+    pub pid:    usize,  // Output
+    pub m_tid:  usize,  // Output TID of the main task
+}
+
+pub struct ProcCtlResizeHeapArgs {
+    pub delta:      isize,  // Input: Positive to expand, Negative to shrink
+    pub heap_base:  usize,  // Output: New heap base (No change after the initial expansion)
+    pub heap_size:  usize   // Output: New heap size
+}
 
 //
 // Low level system call interface
@@ -69,6 +141,10 @@ pub fn syscall(params: Syscall) {
     match params {
         Syscall::TaskControl {opcode, args, ret_code}                   => {
             syscall_trigger_int(SyscallOpCode::TaskCtl as usize,
+                                opcode, args, ret_code, 0);
+        },
+        Syscall::ProcControl {opcode, args, ret_code}                   => {
+            syscall_trigger_int(SyscallOpCode::ProcCtl as usize,
                                 opcode, args, ret_code, 0);
         },
         Syscall::Open { path_ptr, path_len, mode, ret_ptr }             => {

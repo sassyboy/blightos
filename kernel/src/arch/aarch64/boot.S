@@ -129,8 +129,6 @@ halt:
 	stp 	  x16,  x17,  [sp, #-0x10]!
 	stp 	  x18,  x19,  [sp, #-0x10]!
   stp 	  x29,  x30,  [sp, #-0x10]!
-
-//  MSR 	DAIFSET, #0b1111 /* Disable the IRQs */
 .endm
 
 .macro LOAD_CALLER_SAVED
@@ -145,8 +143,6 @@ halt:
   ldp     x4,   x5,   [sp], #0x10
   ldp     x2,   x3,   [sp], #0x10
   ldp     x0,   x1,   [sp], #0x10
-//  DSB		SY
-//  ISB		SY
 .endm
 
 .balign 2048
@@ -184,7 +180,9 @@ aarch64_vector_table:
   mrs x0, ESR_EL1
   mrs x1, FAR_EL1
   bl save_fpu_ctx
+  bl save_el0_ctx /* Trapped EL0 task may get blocked and switched during syscall */
   bl aarch64_elx_exception
+  bl rstor_el0_ctx
   bl rstor_fpu_ctx
   LOAD_CALLER_SAVED
   eret
@@ -218,7 +216,9 @@ aarch64_vector_table:
   msr DAIFSET, #0b1111 /* No IRQ Nesting - Disable the IRQs */
   STORE_CALLER_SAVED
   bl save_fpu_ctx
+  bl save_el0_ctx
   bl aarch64_ivt_excep_lower_el
+  bl rstor_el0_ctx
   bl rstor_fpu_ctx
   LOAD_CALLER_SAVED
   eret
@@ -228,7 +228,9 @@ aarch64_vector_table:
   msr DAIFSET, #0b1111 /* No IRQ Nesting - Disable the IRQs */
   STORE_CALLER_SAVED
   bl save_fpu_ctx
+  bl save_el0_ctx
   bl aarch64_ivt_irq_lower_el
+  bl rstor_el0_ctx
   bl rstor_fpu_ctx
   LOAD_CALLER_SAVED
   eret
@@ -336,7 +338,7 @@ early_pcpu_stack_high:
 .global _KLVL1_PGTBL
 _KLVL1_PGTBL:
   /* See Table D8-52 Stage 1 VMSAv8-64 Block and Page descriptor fields pg 7632 */
-  /* V[0..4GB] -> P[0..4GB] BLOCK|MT_NORMAL|EL1-RW|INNER_SHARE|ACCESS_FLG */
+  /* V[0..4GB] -> P[0..4GB] BLOCK|MT_NORMAL|EL1-RW|INNER_SHARE|ACCESS_FLG: 0x701*/
   .quad 0x0        | 0x701
   .quad 0x40000000 | 0x701
   .quad 0x80000000 | 0x701
@@ -443,6 +445,40 @@ _KLVL1_PGTBL:
   stp     x20,   x20,   [sp, #-0x10]!
 .endm
 
+/* For interrupts/exception from EL0 we should also save/restore SPSR_EL1,
+ * ELR_EL1 (last status and ret-address of EL0), SP_EL0 and TTBR1_EL1 
+ * (last EL0 stack pointer and last user address-space). This is because the
+ * exception handler may end up switching to another task and overwriting these
+ * registers.
+ * E.g., Spawn or Sleep operations of the TaskControl system call!
+ * Note that SAVE/RESTOR_CONTEXT don't need to do that as they always take place
+ * in EL1, and should the scheduler select a user-space task, RESTORE_CONTEXT
+ * ends up taking the return from an EL0 interrupt/exception handler where the
+ * task last entered the kernel.
+ */
+save_el0_ctx:
+  mrs     x10,  sp_el0
+  mrs     x11,  ttbr1_el1
+  stp 	  x10,  x11,  [sp, #-0x10]!
+
+  mrs     x10,  spsr_el1
+  mrs     x11,  elr_el1
+  stp 	  x10,  x11,  [sp, #-0x10]!
+ret
+
+rstor_el0_ctx:
+  ldp     x10,  x11,  [sp], #0x10
+  msr     spsr_el1, x10
+  msr     elr_el1,  x11
+
+  ldp 	  x10,  x11,  [sp], #0x10
+  msr     sp_el0, x10
+  dsb     sy
+  tlbi    vmalle1
+  msr     ttbr1_el1, x11
+  isb
+ret
+
 /*******************************************************************************
  * start_first_thread(TaskContext* t)
  * Sets the context of the thread pointed to by "t" and starts executing
@@ -479,33 +515,3 @@ switch_context:
   /* Stack consistency has failed */
   mov     x0,   sp
   bl      aarch64_cs_error
-
-/*******************************************************************************
- * switch_to_userspace(x0: entrypoint, x1: stackpointer, x2: ttbr1)
- */
-.globl switch_to_userspace
-switch_to_userspace:
-  msr DAIFSET, #0b1111    // Disable interrupts
-  isb                     // clear pipeline
-  tlbi    vmalle1         // invalidate all TLB entries
-  dsb     ish             // ensure completion of TLB invalidatation
-  isb
-  msr     ttbr1_el1, x2
-
-  /* Switch from EL1 to EL0
-   * EL0 uses its own stack pointer (SP_EL0), so it should be set here
-   * EL1 continues to use the stack allocated to the initial kernel task
-   *     that's now making the jump to the user space.
-   * Since the context switch logic uses the kernel stack for context
-   * information, SP_EL1 also has to be updated here.
-   */
-  msr     spsr_el1, xzr // Will re-enable the interrupts upon ERET
-  
-  msr     elr_el1, x0
-  msr     sp_el0, x1
-  
-  eret
-
-1:
-  wfe
-  b 1b

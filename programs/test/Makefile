@@ -1,4 +1,4 @@
-PROGRAM=shell
+PROGRAM=test
 
 include ../../config.mk
 include ../rtlib/include.mk

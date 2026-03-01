@@ -1,70 +1,81 @@
 #![no_std]
+extern crate alloc; 
+
+use alloc::string::ToString;
 use rtlib::*;
 use rtlib::stdio::*;
 use rtlib::fileio::*;
 use rtlib::task::*;
 use rtlib::syscall::SyscallRsvdFDs;
+use alloc::string::String;
+use alloc::format;
 
 #[no_mangle]
 extern "C" 
 fn main() {
-    let mut cmd_buf: [u8; 128] = [0; 128];
-    println!("BlightOS Shell (Ver:{:.2}).", 0.01);
+    println!("BlightOS Shell (Ver:{:.2}).", 1.0);
     print_system_resources();
 
-    let mut cwd_buf_len = 0;
-    let mut cwd_buf: [u8; 96] = [0; 96];
-    let mut full_path: [u8; 128] = [0; 128];
+    // Check disk[0-9].[0-9]:/blightos/ for the binary path
+    let mut bin_path = String::new();
+    for d in 0..10 {
+        for p in 0..10 {
+            let path = format!("disk{}.{}:/blightos/", d, p);
+            if path_check(&path) {
+                bin_path = path;
+                break;
+            }
+        }
+    }
+    // Command buffer and current working directory
+    let mut cmd_buf: [u8; 512] = [0; 512];
+    let mut cwd = String::new();
+    let mut path: String;
 
+    // Shell prompt loop
     loop {
-        let cwd = str::from_utf8(&cwd_buf[0..cwd_buf_len]).unwrap();
         print!("\n{} > ", cwd);
         let cnt = read_line(&mut cmd_buf);
         let cmd = str::from_utf8(&cmd_buf[0..cnt]).unwrap();
-
-        if      cmd.trim().is_empty(){
+        if      cmd.trim().is_empty() {
             // Do nothing
         } else if cmd.starts_with("ls ") {
             println!("");
-            let path = make_full_path(cwd, &cmd[3..], &mut full_path, true);
-            exec_ls(path);
+            path = make_full_path(cwd.as_str(), &cmd[3..cnt], true);
+            exec_ls(path.as_str());
         }  else if cmd.eq("ls") {
             println!("");
-            exec_ls(cwd);
+            exec_ls(cwd.as_str());
         } else if cmd.eq("cd ..") {
             // Go back
-            if let Some(rslash) = cwd[..cwd_buf_len - 1].rfind("/") {
-                cwd_buf_len = rslash + 1;
+            if let Some(rslash) = cwd[..cwd.len() - 1].rfind("/") {
+                cwd = cwd[..rslash + 1].to_string();
             }
         }else if   cmd.starts_with("cd ") {
-            let path;
-            let mut cwd_ul = cwd.len();
-            if cmd_buf[3] == b'/' {
-                // Address from the start of the mount point
-                if let Some(collon) = cwd.find(":") {
-                    cwd_ul = collon + 1;
-                }
-            } else if let Some(_) = cmd.find(":") {
-                // Address includes the mount point name => treat it as full
-                cwd_ul = 0;
-            }
-            path = make_full_path(&cwd[..cwd_ul], &cmd[3..], &mut full_path, true);
-            if path_check(path) {
-                cwd_buf_len = path.len();
-                cwd_buf[0..cwd_buf_len].copy_from_slice(&full_path[..cwd_buf_len]);
+            let path = make_full_path(cwd.as_str(), &cmd[3..cnt], true);
+            if path_check(path.as_str()) {
+                cwd = path;
             } else {
                 print!("\nPath {} doesn't exist", path);
             }
         } else if   cmd.starts_with("txtdump ") {
-            let path = make_full_path(cwd, &cmd[8..], &mut full_path, false);
+            let path = make_full_path(cwd.as_str(), &cmd[8..cnt], false);
             println!("");
-            exec_textdump(path);
+            exec_textdump(path.as_str());
+        } else if   cmd.starts_with("hexdump ") {
+            let path = make_full_path(cwd.as_str(), &cmd[8..], false);
+            println!("");
+            exec_hexdump(path.as_str());
+        } else if cmd.starts_with("run ") {
+            let path = make_full_path(cwd.as_str(), &cmd[4..], false);
+            println!("");
+            run_executable(path.as_str());
         } else if   cmd.starts_with("exit") {
-            exit(0);
+            break;
+        } else if   cmd.starts_with("cls") {
+            stdio_clear_screen();
         } else if   cmd.starts_with("reboot") {
             exec_reboot();
-        } else if   cmd.starts_with("test") {
-            exec_test();
         } else if   cmd.starts_with("ktest") {
             exec_ktest();
         }
@@ -72,25 +83,41 @@ fn main() {
             println!("");
             print_help();
         } else {
-            println!("\n{} is not a valid command.", cmd);
-            print_help();
+            // Try to find a binary with the <cmd>.elf under the blightos
+            // directory and run that if it exists
+            if path_check(format!("{}{}.box", cwd, cmd.trim()).as_str()) {
+                // Run the binary from the current directory
+                run_executable(format!("{}{}.box", cwd, cmd.trim()).as_str());
+            } else if path_check(format!("{}{}.box", bin_path, cmd.trim()).as_str()) {
+                // Run the binary from the default binary path
+                run_executable(format!("{}{}.box", bin_path, cmd.trim()).as_str());
+            } else {
+                println!("\n{} is not a valid command.", cmd);
+                print_help();
+            }
         }
     }
+    exit(0);
 }
 
 fn print_help() {
-    print!  ("help          Prints this message\n\
-              cd            Changes the current director. E.g: cd disk0.0: or cd ..\n\
-              ls            Lists directories/files/devices under the current path\n\
-              ls path       Similar to ls but looks under the current-directory/path\n\
-              txtdump path  Reads the file located in the path and prints its content\n\
-              hexdump path  Similar to txtdump but in HEX\n\
-              exit          Ends the shell program\n\
-              reboot        Reboots the machine\n\
-              test          Performs self-test from the user-space\n\
-              ktest         Performs the kernel's self-test"
+    print!(
+        "help            Prints this message\n\
+         cd              Changes the current directory E.g: cd disk0.0: or cd ..\n\
+         ls              Lists directories/files/devices under the current path\n\
+         ls [path]       Similar to ls but looks under the current-directory/path\n\
+         run [path]      Executes the file located in the path as a command\n\
+         [command]       Executes the /blightos/command.box if it exists\n\
+         txtdump [path]  Reads the file located in the path and prints its content\n\
+         hexdump [path]  Similar to txtdump but in HEX\n\
+         exit            Ends the shell program\n\
+         cls             Clears the screen\n\
+         reboot          Reboots the machine\n\
+         test            Performs self-test from the user-space\n\
+         ktest           Performs the kernel's self-test"
     );
 }
+
 
 fn print_system_resources() {
     let mut buff: [u8; 64] = [0; 64];
@@ -163,17 +190,78 @@ fn exec_textdump(path: &str) {
     }
 }
 
-fn make_full_path<'a>(cur_dir: &'a str, path: &'a str, out: &'a mut [u8],
-                                                        dir: bool)  -> &'a str {
-    let c = cur_dir.as_bytes();
-    let p = path.as_bytes();
-    out[0..c.len()].copy_from_slice(c);
-    out[c.len()..(c.len()+p.len())].copy_from_slice(p);
-    if dir && out[c.len()+p.len()-1] != b'/' {
-        out[c.len()+p.len()] = b'/';
-        return str::from_utf8(&out[0..(c.len()+p.len()+1)]).unwrap();
+fn exec_hexdump(path: &str) {
+    let mut buff: [u8; 16] = [0; 16];
+    match fopen(path) {
+        Some(fd)    => {
+            let mut offset = 0;
+            loop {
+                let cnt = fread(fd, &mut buff);
+                if cnt > 0 {
+                    print!("{:08X}  ", offset);
+                    for i in 0..cnt {
+                        print!("{:02X} ", buff[i]);
+                    }
+                    for _i in cnt..16 {
+                        print!("   ");
+                    }
+                    print!("    ");
+                    for i in 0..cnt {
+                        let b = buff[i];
+                        if b.is_ascii_graphic() || b == b' ' {
+                            print!("{}", b as char);
+                        } else {
+                            print!(".");
+                        }
+                    }
+                    println!("");
+                    offset += cnt;
+                } else {
+                    break;
+                }
+            }
+            fclose(fd);
+        },
+        None        => {
+            print!("\nPath {} doesn't exist", path);
+        }
     }
-    str::from_utf8(&out[0..(c.len()+p.len())]).unwrap()
+}
+
+fn run_executable(path: &str) {
+    println!("\nLaunching {} ...", path);
+    if let Some(proc) = Process::spawn(path) {
+        proc.join();
+    } else {
+        println!("\nFailed to execute {}", path);
+    }
+}
+
+fn make_full_path(cur_dir: &str, path: &str, dir: bool)  -> String {
+    let mut out = String::new();
+    if path.starts_with("/") {
+        // FUll address from the start of the mount point
+        if let Some(collon) = cur_dir.find(":") {
+            out.push_str(&cur_dir[..collon + 1]);
+            out.push_str(path);
+        } else {
+            out.push_str(path);
+        }
+    } else if let Some(_) = path.find(":") {
+        // Absolute address (includes the mount-point name)
+        out.push_str(path);
+    } else {
+        // Address relative to the current directory
+        out.push_str(cur_dir);
+        if !cur_dir.ends_with("/") {
+            out.push('/');
+        }
+        out.push_str(path);
+    }
+    if dir && !out.ends_with("/") {
+        out.push_str("/");
+    }
+    out
 }
 
 fn exec_reboot() {
@@ -202,8 +290,4 @@ fn exec_ktest() {
     }
 }
 
-fn exec_test() {
-    println!("\nCurrent Task Information:");
-    let t = Task::current();
-    print!("TID: {}, PID: {}, name: {}", t.tid, t.pid, t.name());
-}
+

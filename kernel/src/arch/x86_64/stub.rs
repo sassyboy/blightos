@@ -9,6 +9,7 @@ use core::arch::asm;
 use core::time::Duration;
 use crate::arch::*;
 use crate::mem::phys::*;
+use crate::mem::virt::AddressSpace;
 use crate::sched::Task;
 use crate::{SyscallHandlerFn, SyscallOpCode, util::*};
 use crate::{dump_memory, kstart};
@@ -193,6 +194,9 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     percpu_init_cpu(bsp_cpu_id);
     THIS_CPU_ID.write(bsp_cpu_id);
 
+    // Setup the Task Segment Selector and the corresponding TSS for this CPU
+    x64_init_tss(0);
+
     // Physical Memory Map Buffer
     let mut mem_map: [PMMapElement; 32] = [
         PMMapElement {base: 0, len: 0, avail: false}; 32];
@@ -327,9 +331,13 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_x864_entry_ap(_arg: usize) {
+    // Per-CPU section initialization
     let cpuid = cpu_lapic_id();
     percpu_init_cpu(cpuid);
     THIS_CPU_ID.write(cpuid);
+    // Setup the Task Segment Selector and the corresponding TSS for this CPU
+    x64_init_tss(cpuid);
+
     THIS_TSC.borrow_mut().init();
     let mylapic = THIS_LAPIC.borrow_mut();
     {
@@ -398,8 +406,8 @@ extern "C" fn kexcep_overflow() {
 extern "C" fn kexcep_invalid_opcode(exframe: usize) {
     let info = x86_decode_exception_frame(exframe, false);
     dump_memory(info.rsp, 8);
-    panic!("#UD CPU={} RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
-        info.cpu, info.rflg, info.cs, info.rip, info.ss, info.rsp
+    panic!("#UD CPU={} RFLG={:X} CR3={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
+        info.cpu, info.rflg, info.cr3, info.cs, info.rip, info.ss, info.rsp
     );
 }
 
@@ -422,19 +430,23 @@ extern "C" fn kexcep_stack_fault() {
 extern "C" fn kexcep_gp_fault(exframe: usize) {
     let info = x86_decode_exception_frame(exframe, true);
     dump_memory(info.rsp, 8);
-    panic!("#GP CPU={} ERR={:X} RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
-            info.cpu, info.err, info.rflg, info.cs, info.rip, info.ss, info.rsp
+    panic!("#GP CPU={} ERR={:X} RFLG={:X} CR3={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
+            info.cpu, info.err, info.rflg, info.cr3, info.cs, info.rip, info.ss, info.rsp
     );
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn kexcep_page_fault(exframe: usize) {
     let info = x86_decode_exception_frame(exframe, true);
-    dump_memory(info.rsp, 8);
-    panic!("#PF CPU={} CR2={:X} ERR={:X} RFLG={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
-        info.cpu, info.cr2, info.err, info.rflg, info.cs, info.rip,
-        info.ss, info.rsp
-    );
+    // Try to handle the page fault
+    if AddressSpace::handle_page_fault(info.cr2) == false {
+        klog!("#PF CPU={} CR2={:X} ERR={:X} RFLG={:X} CR3={:X} CS={:X} RIP={:X} \
+               SS={:X} RSP={:X}",
+                info.cpu, info.cr2, info.err, info.rflg, info.cr3, info.cs, info.rip,
+                info.ss, info.rsp);
+        dump_memory(info.rsp - 4, 8);
+        panic!("Unhandled Page Fault");
+    }
 
 }
 
@@ -476,8 +488,8 @@ extern "C" fn kirq_handler(irq: u8) {
 #[unsafe(no_mangle)]
 extern "C" fn kstack_error(rsp: usize) {
     dump_memory(rsp, 20);
-    panic!("Stack Corruption (Context Switch). CPU={}",
-        *(THIS_CPU_ID.borrow()));
+    panic!("Stack Corruption (Context Switch). CPU={} TID={}",
+        *(THIS_CPU_ID.borrow()), Task::current_tid());
 }
 
 
@@ -491,15 +503,17 @@ struct X86ExceptionInfo {
     rsp:    usize,
     ss:     usize,
     cr2:    usize,
+    cr3:    usize,
     cr4:    usize
 }
 
 fn x86_decode_exception_frame(exframe: usize, error_code: bool) -> 
 X86ExceptionInfo {
     unsafe {
-        let (cpu, cr2, cr4): (usize, usize, usize);
+        let (cpu, cr2, cr3, cr4): (usize, usize, usize, usize);
         cpu = cpu_lapic_id();
         asm!("mov rax, cr2", out("rax")cr2);
+        asm!("mov rax, cr3", out("rax")cr3);
         asm!("mov rax, cr4", out("rax")cr4);
         if error_code {
             X86ExceptionInfo {
@@ -511,6 +525,7 @@ X86ExceptionInfo {
                 rsp : *((exframe + 8 * 4) as *const usize),
                 ss  : *((exframe + 8 * 5) as *const usize),
                 cr2 : cr2,
+                cr3 : cr3,
                 cr4 : cr4
             }
         } else {
@@ -523,6 +538,7 @@ X86ExceptionInfo {
                 rsp : *((exframe + 8 * 3) as *const usize),
                 ss  : *((exframe + 8 * 4) as *const usize),
                 cr2 : cr2,
+                cr3 : cr3,
                 cr4 : cr4
             }
         }
@@ -1277,15 +1293,45 @@ pub fn x64_read_rflags() -> u64 {
 }
 
 unsafe extern "C" {
-    static tss64_base: usize;
+    unsafe static tss64_base: usize;
+    unsafe static gdt64_tssd_base: usize;
+}
+fn x64_tss_base_addr(cpuid: usize) -> usize {
+    unsafe {
+        let base = &tss64_base as *const usize as usize;
+        base + (0x68 * cpuid)
+    }
 }
 pub fn x64_tss_rsp0_addr() -> usize{
     let cpuid = *(THIS_CPU_ID.borrow());
-    
-    unsafe{
-        let base = &tss64_base as *const usize as usize;
-        base + (104 * cpuid) +4
-    }
+    x64_tss_base_addr(cpuid) + 4 /* RSP0 is at offset 4 in the TSS */
+}
+fn x64_init_tss(cpuid: usize) {
+  /* Flags -> RAX*/
+  let access:   u64 = 0x89; /* Present, DPL=0, Type=9 (Available 64-bit TSS) */
+  let limit:    u64 = 0x68; /* TSS size is 104 bytes */
+  let flags:    u64 = 0x00; /* Granularity=0, 64-bit TSS doesn't use granularity */
+  let base:     u64 = x64_tss_base_addr(cpuid) as u64;
+  let tss_desc_low = (limit & 0xFFFF) | ((base as u64 & 0xFFFFFF) << 16) |
+                    (access << 40) | ((limit & 0xF0000) << 48) | (flags << 52) |
+                    ((base as u64 & 0xFF000000) << 56);
+
+  /* First QWORD of the descriptor --> RAX */
+  unsafe {
+    let tss_desc_base_addr = &gdt64_tssd_base as *const usize as usize + (0x10 * cpuid);
+    (tss_desc_base_addr as *mut u64).write_volatile(tss_desc_low);
+  }
+
+
+  /* Load the task register with the descriptor offset in GDT */
+  let gdt_entry_offset = 0x28 + (cpuid as u16 * 0x10);
+  unsafe {
+    asm!(
+        "ltr {0:x}",
+        in(reg) gdt_entry_offset,
+        options(nostack, preserves_flags)
+    );
+  }
 }
 
 pub fn x86_msr_write(msr: u32, val: u64) {
@@ -1954,9 +2000,10 @@ fn x86_acpi_parse_hpet(acpi: &mut AcpiInfo, addr: u32) {
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct TaskContext {
-    ep:     fn(),   // Initial RIP value, i.e., Entry-point
-    rsp:    usize,  // Last RSP (Stack Pointer) value
-    tid:    usize,  // For debugging purposes
+    ep:     fn(usize),  // Initial RIP value, i.e., Entry-point
+    rsp:    usize,      // Last RSP (Stack Pointer) value
+    tid:    usize,      // For debugging purposes
+    rsp0:   usize,      // Kern. stack base of the task for TSS loading on traps
 }
 
 impl TaskContext {
@@ -1966,11 +2013,13 @@ impl TaskContext {
             ep: empty_task,
             rsp: 0,
             tid: 0,
+            rsp0: 0
         }
     }
 
-    pub fn init(&mut self, id: usize, func: fn(), stack: &mut [usize]) {
+    pub fn init(&mut self, id: usize, func: fn(usize), arg: usize, stack: &mut [usize]) {
         let stacklen = stack.len();
+        let kern_cr3 = unsafe { &init_pml4_table as *const usize as usize };
         // Initial stack - compatible with the context switch logic in boot.S
         // ----- stack_base -------------------------------
         // ....
@@ -2001,7 +2050,7 @@ impl TaskContext {
         stack[stacklen - 5] = 0; // RBX
         stack[stacklen - 6] = 0; // RCX
         stack[stacklen - 7] = 0; // RDX
-        stack[stacklen - 8] = 0; // RSI
+        stack[stacklen - 8] = arg; // RSI
         stack[stacklen - 9] = (self as *const TaskContext) as usize; // RDI
         stack[stacklen -10] = (&stack[stacklen-1] as *const usize) as usize; // RBP
         stack[stacklen -11] = 0; // R8
@@ -2012,11 +2061,17 @@ impl TaskContext {
         stack[stacklen -16] = 0; // R13
         stack[stacklen -17] = 0; // R14
         stack[stacklen -18] = 0; // R15
-        stack[stacklen -19] = 0x0123456789abcdef; // Watermark
+        stack[stacklen -19] = kern_cr3; // CR3
+        stack[stacklen -20] = 0x0123456789abcdef; // Watermark
 
         self.ep = func;
-        self.rsp = (&stack[stacklen - 19] as *const usize) as usize;
+        self.rsp = (&stack[stacklen - 20] as *const usize) as usize;
         self.tid = id;
+        // Every time the CPU traps from user to kernel mode, it loads rsp from
+        // TSS.RSP0 and then pushes the INT frame (and so on). rsp0 should be
+        // set to the base of the kernel stack of the task every time we switch
+        // to it.
+        self.rsp0 = (&stack[stacklen - 1] as *const usize) as usize;
     }
 
     pub fn tid(&self) -> usize {
@@ -2024,23 +2079,24 @@ impl TaskContext {
     }
     // This function is called as a wrapper of the task's callback to handle
     // the return of the task (i.e., exit)
-    fn launch_task(task: &mut TaskContext) {
+    fn launch_task(task: &mut TaskContext, arg: usize) {
         // archlog!("Starting task[{}]: state {}, rip:{:X}, rsp:{:X}\n",
         //     task.tid, task.state, task.ep as usize, task.rsp);
-        (task.ep)();
+        (task.ep)(arg);
         // Terminate the task
         Task::exit();
         panic!("Continued a dead task's code where it have been unreachable!");
     }
 }
 
-fn empty_task() {
-
+fn empty_task(_arg: usize) {
+    panic!("This task should never run!");
 }
 
 unsafe extern "C" {
-    fn start_first_thread(task_p: usize);
-    fn switch_context(old_p: usize,  new_p: usize);
+    unsafe static init_pml4_table: usize;
+    unsafe fn start_first_thread(task_p: usize);
+    unsafe fn switch_context(old_p: usize,  new_p: usize);
 }
 
 // Switch to the context of the specified task without saving the current
@@ -2054,6 +2110,8 @@ pub fn cpu_switch_context_nosave(task: &TaskContext) {
 
 pub fn cpu_switch_context(from: &TaskContext, to: &TaskContext) {
     unsafe{
+        let tss_rsp0 = x64_tss_rsp0_addr() as *mut usize;
+        tss_rsp0.write(to.rsp0);
         switch_context(from as *const TaskContext as usize,
                         to as *const TaskContext as usize);
     }

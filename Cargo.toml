@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["kernel",  "programs/rtlib", "programs/shell"]
+members = [
+    "kernel", 
+    "programs/rtlib",
+    "programs/shell",
+    "programs/test",
+    "programs/fileman"
+]
 
 [profile.release]
 panic = "abort"

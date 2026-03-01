@@ -55,7 +55,7 @@ percpu_global! {
     pub SCHEDULER:  Scheduler = Scheduler::new();
 }
 
-static DEFAULT_STACK_SIZE:  AtomicUsize = AtomicUsize::new(PHY_FRAME_SIZE * 4);
+static DEFAULT_KSTACK_SIZE: AtomicUsize = AtomicUsize::new(PHY_FRAME_SIZE * 4);
 static NEXT_TASK_ID:        AtomicUsize = AtomicUsize::new(0);
 static MSG_QUEUE:           Spinlock<LinkedList<InterProcessorMessage>> = 
                                     Spinlock::new(LinkedList::new());
@@ -87,7 +87,8 @@ enum InterProcessorMessagePayload {
     CreateTask {
         caller_tid: usize,
         caller_cpu: usize,
-        func: fn(),
+        func:       fn(usize),
+        func_arg:   usize,
         stack_pgs:  usize,
         name:       String
     },
@@ -141,7 +142,13 @@ impl Display for TaskState {
 }
 
 ///
-/// Generic Task Structure
+/// Encapsulates all the information about a task including its state,
+/// scheduling parameters, parent process (for user-space tasks).
+/// 
+/// Every task (kernel or user) is represented by a Task structure.
+/// User-space tasks are additionally associated with a process address space
+/// (identified by a non-zero pid) and a UserTask structure in the virt module
+/// that holds the user-space stack, etc.
 /// 
 #[derive(Debug)]
 pub struct Task {
@@ -150,9 +157,9 @@ pub struct Task {
     name:           String,
     pub state:      TaskState,
     pub cpu:        u64, // Todo use as a mask, but for now run on 1 cpu only
-    //
-    stack_base:     usize,
-    stack_pages:    usize,
+    // Kernel stack information - Each task has its own kernel stack
+    kstack_base:    usize,
+    kstack_pages:   usize,
     // Priority fields for RMS, FQS (b/p), etc
     _sched_p1:      u64,
     _sched_p2:      u64,
@@ -179,8 +186,8 @@ impl Task {
             state:          TaskState::New,
             ctx:            arch::TaskContext::new(),
             cpu:            0,
-            stack_base:     0,
-            stack_pages:    0,
+            kstack_base:    0,
+            kstack_pages:   0,
             _sched_p1:      0,
             _sched_p2:      0,
             _sched_p3:      0,
@@ -224,25 +231,25 @@ impl Task {
         cpu_id()
     }
 
-    pub fn set_default_stack_size(size_bytes: usize) {
-        DEFAULT_STACK_SIZE.store(size_bytes, Ordering::Relaxed);
+    pub fn set_default_kstack_size(size_bytes: usize) {
+        DEFAULT_KSTACK_SIZE.store(size_bytes, Ordering::Relaxed);
     }
 
     //
     // Creates a task with the default stack size on a CPU chosen by the
     // load-balancer and returns the tid of the new task.
     //
-    pub fn spawn(func: fn()) -> usize {
-        Self::spawn_named(func, String::new())
+    pub fn spawn(func: fn(usize), func_arg: usize) -> usize {
+        Self::spawn_named(func, func_arg, String::new())
     }
 
-    pub fn spawn_named(func: fn(), name: String) -> usize {
+    pub fn spawn_named(func: fn(usize), func_arg: usize, name: String) -> usize {
         let target_cpu;
         {
             let lb = LOAD_BALANCER.lock();
             target_cpu = lb.select_cpu();
         }
-        Self::spawn_on_cpu(func, target_cpu, name)
+        Self::spawn_on_cpu(func, func_arg, target_cpu, name)
     }
 
     //
@@ -251,16 +258,18 @@ impl Task {
     // The caller will remain blocked until the target CPU's scheduler receives
     // the message, creates the task and returns the tid to the caller.
     //
-    pub fn spawn_on_cpu(func: fn(), target_cpu: usize, name: String) -> usize{
+    pub fn spawn_on_cpu(func: fn(usize), func_arg: usize, target_cpu: usize,
+                                                        name: String) -> usize
+    {
         let tid = Self::current_tid();
         let cpu = Self::current_cpu();
-        let stack_pgs = round_up!(DEFAULT_STACK_SIZE.load(Ordering::Relaxed),
+        let stack_pgs = round_up!(DEFAULT_KSTACK_SIZE.load(Ordering::Relaxed),
                                     PHY_FRAME_SIZE) / PHY_FRAME_SIZE;
         let ret;
         if target_cpu == cpu {
             // Local task creation - no need for inter-processor messaging
             let sched = SCHEDULER.borrow_mut();
-            ret = sched.create_task(func, stack_pgs, name)
+            ret = sched.create_task(func, func_arg, stack_pgs, name)
         } else {
             // Remote task creation - Send and IPM and block
             Scheduler::send_ipm(
@@ -270,6 +279,7 @@ impl Task {
                         caller_tid: tid,
                         caller_cpu: cpu,
                         func:       func,
+                        func_arg:   func_arg,
                         stack_pgs:  stack_pgs,
                         name:       name
                     }
@@ -409,7 +419,8 @@ impl Task {
         SCHEDULER.borrow_mut().block_task(tid);
     }
 
-    pub fn migrate_to_process(pid: usize) {
+    // Updates the task structure to reflect the new PID
+    pub fn set_pid(pid: usize) {
         if let Ok(_lock) = Preemption::lock() {
             let tid = *(CURR_TID.borrow());
             let tpool = TASK_POOL.borrow_mut();
@@ -453,7 +464,7 @@ impl Drop for Task {
         // Notify the process about this task being dropped
         AddressSpace::task_dropped(self.pid, self.tid);
         // Free the kernel stack
-        pfree_continuous(self.stack_base, self.stack_pages);
+        pfree_continuous(self.kstack_base, self.kstack_pages);
         self.state = TaskState::Dropped;
         dbg!("Dropped task {} - Free frames: {}\n",
                 self.tid, pmm_num_free_frames());
@@ -511,7 +522,7 @@ impl Scheduler {
     pub fn start_scheduling(&mut self) {
         let cpuid = cpu_id();
         // Add the percpu worker scheduler task
-        let pcpuw_tid = self.create_task(Self::percpu_sched_worker, 2,
+        let pcpuw_tid = self.create_task(Self::percpu_sched_worker, 0, 2,
                             format!("CPU{}-WORKER", cpuid));
         let pcpuw_task = TASK_POOL.borrow_mut().get_mut(&pcpuw_tid)
                 .expect("Cannot start the scheduler without a starting task");
@@ -523,8 +534,9 @@ impl Scheduler {
     }
 
     // Returns the tid of the task created
-    pub fn create_task(&mut self, func: fn(), stack_pgs: usize, name: String) -> 
-    usize {
+    pub fn create_task(&mut self, func: fn(usize), func_arg: usize,
+                                    stack_pgs: usize, name: String) ->  usize
+    {
         let _ = Preemption::lock();
         // Changing the per-cpu pool -> Disable Preemption
         if let Some(stack) = self.stack_alloc(stack_pgs) {
@@ -537,15 +549,15 @@ impl Scheduler {
             new_task.tid            = tid;
             new_task.cpu            = cpuid as u64;
             new_task.name           = name;
-            new_task.stack_base     = stack.as_mut_ptr() as usize;
-            new_task.stack_pages    = stack.len() * 
+            new_task.kstack_base    = stack.as_mut_ptr() as usize;
+            new_task.kstack_pages   = stack.len() * 
                                             size_of::<usize>() / PHY_FRAME_SIZE;
-            new_task.ctx.init(tid, func, stack);
+            new_task.ctx.init(tid, func, func_arg, stack);
             {
                 let mut tid_cpu_map = TID_CPU_MAP.lock();
                 tid_cpu_map.insert(tid, cpuid);
             }
-            dbg!("Created Task TID:{}, stack: {:p}, state: {}\n",
+            dbg!("Created Task TID:{}, kernel stack: {:p}, state: {}\n",
                     new_task.tid, stack, new_task.state);
             match &mut self.ops {
                 SchedulerOps::FirstComeFirstServe(fcfs) => {
@@ -746,7 +758,7 @@ impl Scheduler {
     // Class Methods - continued
     //
     // This task performs IPI message processing, dead task cleanup, etc
-    fn percpu_sched_worker(){
+    fn percpu_sched_worker(_arg: usize){
         let cpuid       = cpu_id();
         let worker_tid  = *(CURR_TID.borrow());
         let mut last_pool_size;
@@ -865,10 +877,10 @@ impl Scheduler {
                         cpuid, _wtid, tid);
             },
             InterProcessorMessagePayload::CreateTask 
-            { caller_tid, caller_cpu, func, stack_pgs, name} => {
+            { caller_tid, caller_cpu, func, func_arg, stack_pgs, name} => {
                 dbg!("IPM::CreateTask received by {}\n", Task::name());
                 let new_tid = SCHEDULER.borrow_mut()
-                                .create_task(func, stack_pgs, name);
+                                .create_task(func, func_arg, stack_pgs, name);
                 Self::send_ipm(
                     InterProcessorMessage {
                         dest_cpu: caller_cpu,

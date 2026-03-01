@@ -3,13 +3,14 @@ include config.mk
 BUILDDIR=build/
 KERN_ELF=$(BUILDDIR)kernel.elf
 KERN_BIN=$(BUILDDIR)kernel.bin
-SHELL_ELF=$(BUILDDIR)shell.elf
 GRUB_CFG=$(BUILDDIR)grub.cfg
 BOOT_IMG=$(BUILDDIR)boot.img
 DISK_IMG=$(BUILDDIR)disk.img
+USER_PROGS=	$(BUILDDIR)shell.box \
+			$(BUILDDIR)test.box \
+			$(BUILDDIR)fileman.box
 
-
-all: kernel $(BOOT_IMG) run
+all: kernel $(BOOT_IMG) $(DISK_IMG) run
 
 kernel: force
 	@echo "=============================================================="
@@ -17,13 +18,13 @@ kernel: force
 	@echo "=============================================================="
 	make -C kernel all
 
-$(SHELL_ELF): force
+%.box: force
 	@echo "=============================================================="
-	@echo "==                Building the Shell Program                =="
+	@echo "==               Building User-space Program: $@"
 	@echo "=============================================================="
-	make -C programs/shell all
+	make -C $(patsubst $(BUILDDIR)%,programs/%,$(basename $@)) all
 
-$(BOOT_IMG): $(KERN_ELF) $(SHELL_ELF) $(GRUB_CFG)
+$(BOOT_IMG): $(KERN_ELF) $(GRUB_CFG)
 	@echo "=============================================================="
 	@echo "==  Createing a GRUB Resuce Disk Image to boot the Kernel   =="
 	@echo "=============================================================="
@@ -40,7 +41,7 @@ $(GRUB_CFG):
 	@echo "  multiboot2 /boot/kernel.elf" >> $(GRUB_CFG)
 	@echo "}" >> $(GRUB_CFG)
 
-$(DISK_IMG): $(KERN_ELF) $(SHELL_ELF)
+$(DISK_IMG): $(KERN_ELF) $(USER_PROGS)
 	@echo "=============================================================="
 	@echo "== Creating a test disk image with a GPT and a FAT32 Volume =="
 	@echo "=============================================================="

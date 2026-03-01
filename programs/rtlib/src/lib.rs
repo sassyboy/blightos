@@ -5,6 +5,7 @@ pub mod syscall;
 pub mod stdio;
 pub mod fileio;
 pub mod task;
+pub mod heap;
 
 use crate::stdio::*;
 use crate::syscall::*;

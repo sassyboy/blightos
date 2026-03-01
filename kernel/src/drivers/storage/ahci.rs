@@ -10,8 +10,6 @@
 #![allow(dead_code)]
 use core::hint::spin_loop;
 use core::ptr::null_mut;
-use core::sync::atomic::AtomicU8;
-use core::sync::atomic::Ordering::Relaxed;
 use core::time::Duration;
 use alloc::collections::linked_list::LinkedList;
 use alloc::{format, vec::*};
@@ -24,7 +22,6 @@ use crate::sched::Task;
 use crate::util::*;
 
 pub static AHCI_BUS: Spinlock<AHCIBus> = Spinlock::new(AHCIBus::new());
-static DRIVE_WORKER_INDEX: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(feature="debug_ahci")]
 macro_rules! dbg {
@@ -150,7 +147,8 @@ impl AHCIBus {
         // and completion queues
         let n = AHCI_BUS.lock().drives.len();
         for i in 0..n {
-            Task::spawn_named(Self::drive_worker, format!("AHCI-WORKER{}", i));
+            Task::spawn_named(Self::drive_worker, i, 
+                                                format!("AHCI-WORKER{}", i));
         }
     }
 
@@ -626,10 +624,10 @@ impl AHCIBus {
     //
     // Drive Worker Task
     //
-    fn drive_worker() {
+    fn drive_worker(drive_id: usize) {
         // Select the last drive in the AHCI to work on
-        dbg!("{} started on CPU {}\n", Task::name(), crate::arch::cpu_id());
-        let drive_id = DRIVE_WORKER_INDEX.fetch_add(1, Relaxed);
+        dbg!("{} started on CPU {} - drive_id: {}\n", Task::name(),
+                                            crate::arch::cpu_id(), drive_id);
         let call_irq_manually;
         {
             let ahci = AHCI_BUS.lock();
@@ -647,7 +645,7 @@ impl AHCIBus {
                 let mut ahci = AHCI_BUS.lock();
                 let iorq = ahci.drives[drive_id as usize].request_queue
                                     .pop_front().expect("IORequest Queue Bug");
-                Self::submit_io_command(&mut ahci, drive_id, iorq);
+                Self::submit_io_command(&mut ahci, drive_id as u8, iorq);
                 // Todo - Handle the case that the cmd queue gets full again
             }
 

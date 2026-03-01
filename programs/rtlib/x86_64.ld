@@ -10,23 +10,23 @@ SECTIONS {
   . = ALIGN(8);
   _USER_TEXT_START = .;
   .text : {
-    *(.text)
+    *(.text.*)
   }
   _USER_TEXT_END = .;
 
   . = ALIGN(8);
   _USER_RODATA_START = .;
-  .rodata : { *(.rodata) }
+  .rodata : { *(.rodata.*) }
   _USER_RODATA_END = .;
 
   . = ALIGN(8);
   _USER_DATA_START = .;
-  .data : { *(.data) }
+  .data : { *(.data.*) }
   _USER_DATA_END = .;
 
   . = ALIGN(8);
   _USER_BSS_START = .;
-  .bss : { *(.bss COMMON) }
+  .bss : { *(.bss.*) }
   _USER_BSS_END = .;
 
 

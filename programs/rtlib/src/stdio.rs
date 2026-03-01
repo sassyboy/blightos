@@ -62,3 +62,11 @@ pub fn stdio_read_byte() -> u8 {
     outchar
 }
 
+pub fn stdio_clear_screen() {
+    syscall(Syscall::Exec {
+        fd: SyscallRsvdFDs::StandardIO as usize,
+        cmd_buf_ptr: 1,
+        cmd_buf_len: 0,
+        ret_ptr: 0
+    });
+}

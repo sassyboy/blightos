@@ -13,6 +13,7 @@ use core::sync::atomic::*;
 use core::arch::asm;
 use fdt::FdtMachineResources;
 use crate::sched::Task;
+use crate::mem::virt::AddressSpace;
 use crate::{SyscallHandlerFn, SyscallOpCode};
 use crate::drivers::video::framebuffer::*;
 use crate::util::*;
@@ -821,6 +822,17 @@ pub fn cpu_restore_ints(int_en: bool) {
     }
 }
 
+pub fn aarch64_ttbr1_el1() -> usize {
+    let ttbr1_el1: usize;
+    unsafe {
+        asm!(
+            "mrs {0}, ttbr1_el1",
+            out(reg)ttbr1_el1
+        )
+    }
+    ttbr1_el1
+}
+
 //
 // PerCpu Storage Support - util::PerCpuGlobal<T> requires the following
 // architecture-dependent functions to be defined here:
@@ -905,6 +917,17 @@ pub fn aarch64_stack_pointer() -> usize {
     stack_pointer
 }
 
+pub fn aarch64_stack_pointer_el0() -> usize {
+    let sp_el0: usize;
+    unsafe {
+        asm!(
+            "mrs {0}, sp_el0",
+            out(reg)sp_el0
+        )
+    }
+    sp_el0
+}
+
 fn aarch64_spsr_el1() -> usize {
     let spsr_el1: usize;
     unsafe {
@@ -946,22 +969,29 @@ fn aarch64_elx_exception(syndrome: usize, fault_addr: usize) {
                 SystemTimer::exec_handler();
             }
         },
+        0x25        => {
+            klog!("<Data Abort, ELx> FA:{:X}\n", fault_addr);
+            panic!("");
+        }
         _           => {
             let el0_sp: u64;
             let el1_sp = aarch64_stack_pointer();
             let el1_elr:u64;
+            let el1_spsr:u64;
             unsafe {
                 asm!(
                     "mrs    {0}, sp_el0",
                     "mrs    {1}, elr_el1",
+                    "mrs    {2}, spsr_el1",
                     out(reg)el0_sp,
-                    out(reg)el1_elr
+                    out(reg)el1_elr,
+                    out(reg)el1_spsr
                 );
             }
             klog!("Unhandled Exception: Synd:{:X} (cls:{:X}), FA:{:X}\n", 
                 syndrome, exception_class, fault_addr);
-            klog!("EL0: sp={:X}, EL1: sp={:X},elr={:X}\n",
-                    el0_sp, el1_sp, el1_elr);
+            klog!("TID:{} EL0: sp={:X}, EL1: sp={:X},elr={:X},spsr={:X}\n",
+                    Task::current_tid(), el0_sp, el1_sp, el1_elr, el1_spsr);
             // klog!("EL0: sp={:X}    EL1: sp={:X}\n",
             //      el0_sp, el1_sp);
             panic!("aarch64_elx_exception");
@@ -1005,12 +1035,15 @@ fn aarch64_ivt_excep_lower_el(x0: usize, x1: usize, x2: usize, x3: usize,
                         x4: usize) {
     let excep_syndrome: usize;
     let fault_addr: usize;
+    let inst_addr: usize;
     unsafe {
         asm!(
             "mrs {0}, ESR_EL1",
             "mrs {1}, FAR_EL1",
+            "mrs {2}, ELR_EL1",
             out(reg)excep_syndrome,
-            out(reg)fault_addr
+            out(reg)fault_addr,
+            out(reg)inst_addr
         );
     }
     let exception_class = (excep_syndrome & 0xFC000000) >> 26;
@@ -1028,6 +1061,25 @@ fn aarch64_ivt_excep_lower_el(x0: usize, x1: usize, x2: usize, x3: usize,
                 klog!("<ELE{:X}>", exception_class);
             }
         },
+        0x24        => {
+            klog!("<Data Abort, lower> FA:{:X}\n", fault_addr);
+            panic!("");
+        },
+        0x0     => { // Unknown reason
+            // Check illegal instruction address for the user-space
+            if inst_addr < MMUMapping::MIN_VIRTUAL as usize || 
+                inst_addr >= MMUMapping::MAX_VIRTUAL as usize {
+                if AddressSpace::handle_page_fault(inst_addr) {
+                    return;
+                }
+                klog!("<Illegal Execution by EL0> ELR_EL1:{:X}\n", inst_addr);
+                panic!("");
+            } else {
+                klog!("<Unknown Exception, lower> FA:{:X}, ELR_EL1:{:X}\n",
+                    fault_addr, inst_addr);
+                panic!("");
+            }
+        }
         _           => {
             let ttbr1: u64;
             let ttbr0: u64;
@@ -1036,12 +1088,13 @@ fn aarch64_ivt_excep_lower_el(x0: usize, x1: usize, x2: usize, x3: usize,
                     "mrs {0}, ttbr1_el1",
                     "mrs {1}, ttbr0_el1",
                     out(reg)ttbr1,
-                    out(reg)ttbr0
+                    out(reg)ttbr0,
                 );
             }
             klog!("Unhandled Exception: Synd:{:X} (cls:{:X}), FA:{:X}, ttbr1:{:X}, \
-                    ttbr0:{:X}\n", 
-                excep_syndrome, exception_class, fault_addr, ttbr1, ttbr0);
+                    ttbr0:{:X}, elr_el1:{:X}\n", 
+                excep_syndrome, exception_class, fault_addr, ttbr1, ttbr0,
+                inst_addr);
             panic!("aarch64_ivt_excep_lower_el");
         }
     }
@@ -1141,9 +1194,9 @@ fn ksyscall_handler(opcode: usize, a0: usize, a1: usize, a2: usize, a3: usize) {
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct TaskContext {
-    ep:     fn(),   // Initial RIP value, i.e., Entry-point
-    sp:     usize,  // Last RSP (Stack Pointer) value
-    tid:    usize,  // For debugging purposes
+    ep:     fn(usize),  // Initial RIP value, i.e., Entry-point
+    sp:     usize,      // Last RSP (Stack Pointer) value
+    tid:    usize,      // For debugging purposes
 }
 
 impl TaskContext {
@@ -1156,7 +1209,8 @@ impl TaskContext {
         }
     }
 
-    pub fn init(&mut self, id: usize, func: fn(), stack: &mut [usize]) {
+    pub fn init(&mut self, id: usize, func: fn(usize), func_arg: usize,
+                                                        stack: &mut [usize]) {
         let stacklen = stack.len();
         // Initial stack - compatible with the context switch logic in boot.S
         // ----- stack_base -------------------------------
@@ -1168,7 +1222,7 @@ impl TaskContext {
         //        ...... Initial register values
         //        x0
         // ---- stack_base + stack_size ------------------- <- &stack[stacklen]
-        stack[stacklen - 1]  = 0x1001; // x1:  TODO arg to the thread!
+        stack[stacklen - 1]  = func_arg; // x1: argument for the task's function
         stack[stacklen - 2]  = (self as *const TaskContext) as usize; // x0
         // The usual save/switch/restore path is activated via SVC or IRQs and
         // the context-switch should use ret to avoid conflicts with the eret
@@ -1198,7 +1252,8 @@ impl TaskContext {
 
     // This function is called as a wrapper of the task's callback to handle
     // the return of the task (i.e., exit)
-    fn launch_task(task: &mut TaskContext, _task_arg: usize) {
+    // User-space tasks have their exit handled differently via the virt module.
+    fn launch_task(task: &mut TaskContext, task_arg: usize) {
         // let actual_sp = aarch64_stack_pointer();
         // let inten = cpu_ints_enabled();
         // klog!("Starting task[{}] on CPU {}: @{:X} ep:{:X}, sp:{:X} - \
@@ -1206,15 +1261,15 @@ impl TaskContext {
         //     task.tid, cpu_id(), (task as *const TaskContext) as usize,
         //     task.ep as usize, task.sp, actual_sp, _task_arg, inten);
         cpu_enable_ints();
-        (task.ep)();
+        (task.ep)(task_arg);
         // Terminate the task
         Task::exit();
         panic!("Continued a dead task's code where it have been unreachable!");
     }
 }
 
-fn empty_task() {
-
+fn empty_task(_arg: usize) {
+    panic!("This is an empty task. Should never be scheduled!");
 }
 
 unsafe extern "C" {

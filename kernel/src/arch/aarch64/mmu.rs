@@ -50,6 +50,10 @@ macro_rules! dbg{
 pub struct MMUMapping {
     // Translation Table Base Register for User Space
     ttbr1:  u64,
+    // Number of pages mapped via map_pages (for testing/logging purposes)
+    mapped_pages_count : usize,
+    // Number of pages allocated for paging structures (for testing/logging purposes)
+    tlb_page_count : usize,
 }
 impl MMUMapping {
     
@@ -81,7 +85,9 @@ impl MMUMapping {
     
     pub const fn new() -> Self {
         Self {
-            ttbr1:       0
+            ttbr1:       0,
+            mapped_pages_count: 0,
+            tlb_page_count: 0,
         }
     }
 
@@ -178,6 +184,7 @@ impl MMUMapping {
         unsafe {
             (self.ttbr1  as *mut u8).write_bytes(0, 0x1000);
         }
+        self.tlb_page_count += 1;
     }
 
     //
@@ -190,7 +197,7 @@ impl MMUMapping {
     // Maps a page to a frame in User Address Space (addr >= MIN_VIRTUAL)
     // The assumption is that the caller has already reserved page_cnt frames
     // starting from phys_address from the physical memory manager.
-    pub fn map_pages(&self, virt_addr: usize, phys_addr: usize, page_cnt: usize,
+    pub fn map_pages(&mut self, virt_addr: usize, phys_addr: usize, page_cnt: usize,
                      privileged: bool, writeable: bool, _executable: bool,
                     _caching: MmuCachingPolicy) -> bool {
         if virt_addr < Self::MIN_VIRTUAL as usize || 
@@ -222,6 +229,7 @@ impl MMUMapping {
             if l1e == 0 {
                 // Allocate a level-2 table for this 1GB region
                 l2_tbl_base = palloc().expect("Out of memory");
+                self.tlb_page_count += 1;
                 unsafe {
                     (l2_tbl_base as *mut u8).write_bytes(0, 0x1000);
                 }
@@ -239,6 +247,7 @@ impl MMUMapping {
             if l2e == 0 {
                 // Allocate a level-3 table for this 1GB region
                 l3_tbl_base = palloc().expect("Out of memory");
+                self.tlb_page_count += 1;
                 unsafe {
                     (l3_tbl_base as *mut u8).write_bytes(0, 0x1000);
                 }
@@ -273,10 +282,140 @@ impl MMUMapping {
             vaddr += Self::PAGE_SIZE as u64;
             paddr += Self::PAGE_SIZE as u64;
         }
-
+        self.mapped_pages_count += page_cnt;
         true
     }
 
+    ///
+    /// Unmaps the given virtual address and returns the physical address of the
+    /// page that was unmapped. The caller is expected to free the physical page
+    /// after unmapping.
+    /// 
+    pub fn unmap_page(&mut self, virt_addr: usize) -> Option<usize> {
+        let vaddr_upper = virt_addr - Self::MIN_VIRTUAL as usize;
+        let l1e_i = (vaddr_upper >> 30) & 0x1FF; // Index in PDPT[0]
+        let l2e_i = (vaddr_upper >> 21) & 0x1FF; // Index in PD
+        let l3e_i = (vaddr_upper >> 12) & 0x1FF; // Index in PT
+
+        if self.ttbr1 == 0 {
+            return None;
+        }
+        let l2_base = Self::read_table_entry(self.ttbr1 as usize, l1e_i)
+                                                & Self::PGENT_PHYS_ADDR_MASK;
+        if l2_base == 0 {
+            return None;
+        }
+        let l3_base = Self::read_table_entry(l2_base as usize, l2e_i)
+                                                & Self::PGENT_PHYS_ADDR_MASK;
+        if l3_base == 0 {
+            return None;
+        }
+        let pg_entry = Self::read_table_entry(l3_base as usize, l3e_i);
+        if pg_entry & Self::PGENT_PG_DESC == 0 {
+            return None;
+        }
+                                                
+        // Clear the page entry to unmap the page
+        Self::write_table_entry(l3_base as usize, l3e_i, 0);
+        
+        self.mapped_pages_count -= 1;
+        Some((pg_entry & Self::PGENT_PHYS_ADDR_MASK) as usize)
+    }
+
+    /// Unmaps the given virtual address range and returns the number of pages
+    /// that were unmapped. The caller is expected to free the physical pages
+    /// after unmapping.
+    pub fn unmap_pages(&mut self, virt_addr: usize, num_pages: usize) -> usize {
+        let mut unmapped_pages = 0;
+        for i in 0..num_pages {
+            if self.unmap_page(virt_addr + i * Self::PAGE_SIZE).is_some() {
+                unmapped_pages += 1;
+            }
+        }
+        unmapped_pages
+    }
+
+    fn write_table_entry(table_virt_base: usize, index: usize, value: u64) {
+        unsafe {
+            let destp : *mut u64 = table_virt_base as *mut u64;
+            *(destp.wrapping_add(index)) = value;
+        }
+    }
+
+    fn read_table_entry(table_virt_base: usize, index: usize) -> u64 {
+        unsafe {
+            let destp : *mut u64 = table_virt_base as *mut u64;
+            destp.wrapping_add(index).read_volatile()
+        }
+    }
+
+    /*
+     * Execution/Segmentation Management methods
+     */
+    ///
+    /// Converts the currently running kernel task into a user-space task as a
+    /// part of this process address space. The calling (kernel) task will not
+    /// return to the next instruction after its call to move_to_userspace.
+    /// The user-space execution must end with an Exit system call, at which
+    /// point the task terminates.
+    /// 
+    pub fn move_to_userspace(priv_data: usize, entry_point: usize, arg: usize,
+                            user_stack: usize, exit_handler: fn()) {
+        dbg!("Moving to EL0 with SP: KERN={:X}, USER={:X}, EXIT_FN: {:p}={:X}\n",
+                            crate::arch::aarch64_stack_pointer(), user_stack,
+                            exit_handler, exit_handler as usize);
+        /* Switch from EL1 to EL0
+         * EL0 uses its own stack pointer (SP_EL0), so it should be set here
+         * EL1 continues to use the stack allocated to the initial kernel task
+         *     that's now making the jump to the user space.
+         * Since the context switch logic uses the kernel stack for context
+         * information, SP_EL1 also has to be updated here.
+         */
+        unsafe {
+            asm!(
+                "msr DAIFSET, #0b1111",    // Disable interrupts
+                "isb",                     // clear pipeline
+                "tlbi   vmalle1",         // invalidate all TLB entries
+                "dsb    ish",             // ensure completion of TLB invalidatation
+                "isb",                     // clear pipeline after TLB invalidation
+                "msr    ttbr1_el1, {ttbr1_val}", // Switch to the new page table for user-space
+                "msr    spsr_el1, xzr",    // Jump to EL0 and re-enable the interrupts upon ERET
+                "msr    elr_el1, {entry_point}",
+                "msr    sp_el0, {user_stack}",
+                "mov    x0, {ep_arg}",
+                "mov    x30, {ret_addr}",
+                "eret",
+                ttbr1_val   = in(reg)priv_data,
+                entry_point = in(reg)entry_point,
+                user_stack  = in(reg)user_stack,
+                ep_arg      = in(reg)arg,
+                ret_addr    = in(reg)exit_handler,
+            );
+        }
+        panic!("Must have been unreachable!\n");
+    }
+
+    pub fn copy_priv_data(&self) -> usize {
+        self.ttbr1 as usize
+    }
+
+    /*
+     * DMA
+     */
+    pub fn dma_from_kernel_phys(phys_addr: usize) -> usize{
+        phys_addr | ((1 as usize) << 32)
+    }
+
+    //
+    // Misc.
+    //
+    pub fn mapped_pages_count(&self) -> usize {
+        self.mapped_pages_count
+    }
+
+    pub fn tlb_page_count(&self) -> usize {
+        self.tlb_page_count
+    }
     pub fn log_mapping(&self, vaddr: usize) {
         let vaddr_upper = vaddr - Self::MIN_VIRTUAL as usize;
         let l1e_i = (vaddr_upper >> 30) & 0x1FF; // Index in PDPT[0]
@@ -317,55 +456,6 @@ impl MMUMapping {
         klog!("    L3_Tbl @ {:X} L3_Tbl[{}]=> {:X}\n", l3_base, l3e_i,
                             Self::read_table_entry(l3_base as usize, l3e_i));
         klog!("VADDR {:X} --> PADDR {:X}\n", vaddr, pg_base);
-    }
-
-    pub fn unmap_pages(_virt_addr: usize, _num_pages: usize) {
-
-    }
-
-    fn write_table_entry(table_virt_base: usize, index: usize, value: u64) {
-        unsafe {
-            let destp : *mut u64 = table_virt_base as *mut u64;
-            *(destp.wrapping_add(index)) = value;
-        }
-    }
-
-    fn read_table_entry(table_virt_base: usize, index: usize) -> u64 {
-        unsafe {
-            let destp : *mut u64 = table_virt_base as *mut u64;
-            destp.wrapping_add(index).read_volatile()
-        }
-    }
-
-    /*
-     * Execution/Segmentation Management methods
-     */
-    ///
-    /// Converts the currently running kernel task into a user-space task as a
-    /// part of this process address space. The calling (kernel) task will not
-    /// return to the next instruction after its call to move_to_userspace.
-    /// The user-space execution must end with an Exit system call, at which
-    /// point the task terminates.
-    /// 
-    pub fn move_to_userspace(priv_data: usize, entry_point: usize,
-                            user_stack: usize) {
-        dbg!("Moving to EL0 with SP: KERN={:X}, USER={:X}\n",
-                            crate::arch::aarch64_stack_pointer(), user_stack);
-        unsafe {
-            switch_to_userspace(entry_point, user_stack, priv_data);
-        }
-        panic!("Must have been unreachable!\n");
-    }
-
-    pub fn copy_priv_data(&self) -> usize {
-        self.ttbr1 as usize
-    }
-
-    /*
-     * DMA
-     */
-    pub fn dma_from_kernel_phys(phys_addr: usize) -> usize{
-        phys_addr | ((1 as usize) << 32)
     }
 }
 
@@ -418,5 +508,4 @@ impl Drop for MMUMapping {
 
 unsafe extern "C" {
     static _KLVL1_PGTBL: usize;
-    fn switch_to_userspace(ep: usize, sp: usize, ttbr1: usize);
 }

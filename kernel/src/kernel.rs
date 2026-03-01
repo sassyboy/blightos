@@ -29,10 +29,11 @@ pub mod drivers;
 pub mod test;
 
 use core::cmp::min;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+use alloc::boxed::Box;
 use alloc::{format, str};
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use util::*;
 use crate::arch::*;
@@ -71,7 +72,6 @@ pub struct RamdiskInfo {
     pub start_phy_addr: usize,
     pub end_phy_addr:   usize
 }
-static USER_INIT_PID: AtomicUsize = AtomicUsize::new(0);
 
 // kstart : Kernel's Generic Entry Point
 // This function will be called by all onlined CPUs (BSP with cpuid=0) in any
@@ -113,6 +113,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
 
         // Install the system call handlers
         arch::syscall_register(SyscallOpCode::TaskCtl,  syscall_task_control);
+        arch::syscall_register(SyscallOpCode::ProcCtl,  syscall_proc_control);
         arch::syscall_register(SyscallOpCode::Open,     syscall_open);
         arch::syscall_register(SyscallOpCode::Enum,     syscall_enum);
         arch::syscall_register(SyscallOpCode::Read,     syscall_read);
@@ -128,7 +129,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
         // Spawn the first process address space from shell.elf.
         // Scans the enumerated partitions for the following path:
         // /blightos/shell.elf
-        Task::spawn_on_cpu(kinit_task, cpuid,String::from("kInit"));
+        Task::spawn_on_cpu(kinit_task, 0, cpuid, String::from("kInit"));
         BSP_INITIALIZED.store(true, Ordering::Relaxed);
         SCHEDULER.borrow_mut().start_scheduling();
     } else {
@@ -177,7 +178,7 @@ pub fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// 2) (Optional) Performs kernel's self-test
 /// 3) Sets up the first address-space and lunches the first user program
 ///
-fn kinit_task() {
+fn kinit_task(_arg: usize) {
     // Perform the post-enumeration phase of the drivers
     dbg!("[{}({})] started on CPU {} (Free frames: {})\n", 
             Task::name(), Task::current_tid(),Task::current_cpu(),
@@ -197,9 +198,9 @@ fn kinit_task() {
     // klog!("calling test::kself_test\n");
     // test::kself_test();
 
-    // Find the initial binary (disk%d.0:/blightos/shell.elf) to load
+    // Find the initial binary (disk%d.0:/blightos/shell.box) to load
     for d in 0..ndisks {
-        let path = format!("disk{}.0:/blightos/shell.elf", d);
+        let path = format!("disk{}.0:/blightos/shell.box", d);
         // Open the file (if exists)
         if let Some(mnt) = MountPoint::from_path(path.as_str()) {
             let fopen_ret = mnt.fopen(path.as_str());
@@ -213,25 +214,21 @@ fn kinit_task() {
                     // for i in 0..elf.segments.len() {
                     //     klog!("  {:X?}\n", elf.segments[i]);
                     // }
-                    if let Some(pid) = AddressSpace::spawn_from_elf(&elf) {
-                        USER_INIT_PID.store(pid, Ordering::Relaxed);
-                        dbg!("  Launching {} (Free frames: {})\n", path,
-                                    crate::mem::phys::pmm_num_free_frames());
+                    if let Some(pid) = AddressSpace::spawn_from_elf(&elf, "shell.box".to_string()) {
+                        dbg!("  Launching the INIT user-space process.. {}({}) \
+                                (Free frames: {})\n",
+                                Task::name(), Task::current_tid(),
+                                crate::mem::phys::pmm_num_free_frames());
+                        Keyboard::clear_buffer();
+                        AddressSpace::launch_as_main(pid);
                     }
                 }
                 // ELFBinary goes out of scope and releases closes the file
             }
         }
     }
-
-    // Spawn the initial user-space process and convert this task into a
-    // user-space task in the initial process!
-    dbg!("  Switching to the INIT user-space process.. {}({}) \
-            (Free frames: {})\n",
-            Task::name(), Task::current_tid(),
-            crate::mem::phys::pmm_num_free_frames());
-    Keyboard::clear_buffer();
-    AddressSpace::launch(USER_INIT_PID.load(Ordering::Relaxed));
+    panic!("/blightos/shell.box not found on any supported disk partition!");
+    
 }
 
 
@@ -243,13 +240,14 @@ fn kinit_task() {
 #[derive(PartialEq, PartialOrd)]
 pub enum SyscallOpCode {
     TaskCtl         = 0,
-    Open            = 1,
-    Enum            = 2,
-    Read            = 3,
-    Write           = 4,
-    Exec            = 5,
-    Close           = 6,
-    Max             = 7
+    ProcCtl         = 1,
+    Open            = 2,
+    Enum            = 3,
+    Read            = 4,
+    Write           = 5,
+    Exec            = 6,
+    Close           = 7,
+    Max             = 8
 }
 
 #[repr(usize)]
@@ -265,6 +263,7 @@ pub enum SyscallRsvdFDs {
 pub enum Syscall {
     // Task/Process control
     TaskControl{opcode: usize, args: usize, ret_code: usize},
+    ProcControl{opcode: usize, args: usize, ret_code: usize},
 
     // Device/File control
     Open{path_ptr: usize, path_len: usize, mode: usize, ret_ptr: usize},
@@ -277,6 +276,20 @@ pub enum Syscall {
 }
 pub type SyscallHandlerFn = fn(usize, usize, usize, usize);
 
+fn copy_to_user<T>(dst_ptr: usize, ret_val: T) {
+    if dst_ptr != 0 {
+        unsafe {(dst_ptr as *mut T).write(ret_val);}
+    }
+}
+
+fn copy_from_user<T>(src_ptr: usize) -> Option<T> {
+    if src_ptr == 0 {
+        None
+    } else {
+        Some(unsafe { (src_ptr as *const T).read() })
+    }
+}
+
 //
 // Task Control System Call
 //
@@ -285,52 +298,344 @@ pub type SyscallHandlerFn = fn(usize, usize, usize, usize);
 pub enum TaskControlOpCode {
     Exit        = 0,
     Current     = 1,
-    Spawn       = 2,
-    Join        = 3,
+    CurrentCpu  = 2,
+    Spawn       = 3,
+    Join        = 4,
+    Yield       = 5,
+    Sleep       = 6,
 }
 
 #[repr(C, packed)]
-pub struct UserTaskInfo{
+pub struct TaskControlCurrentArguments{
     pub tid:        usize,
     pub pid:        usize,
     pub name:       [u8; 64]
 }
+#[repr(C, packed)]
+pub struct TaskControlSpawnArguments{
+    pub func_ptr:   usize,          // Input
+    pub func_arg:   usize,          // Input
+    pub name:       [u8; 64],       // Input
+    pub name_len:   usize,          // Derived
+    pub tid:        usize,          // Output
+    pub pid:        usize,          // Output
+}
+#[repr(C, packed)]
+pub struct TaskControlJoinArguments{
+    pub tid:        usize,          // Input
+    pub joined:     bool,           // Output
+}
+
+struct UserTaskLaunchInfo {
+    func_ptr: fn(usize),
+    func_arg: usize,
+    target_pid: usize,
+}
+
+fn kuser_task_launcher(args: usize) {
+    let info = unsafe { &*(args as *const Box<UserTaskLaunchInfo>) };
+    let pid = info.target_pid;
+    let func = info.func_ptr;
+    let farg = info.func_arg;
+    dbg!("kuser_task_launcher: PID={}, func={:p}, arg={}\n",
+            info.target_pid, info.func_ptr, info.func_arg);
+    // Box will be dropped here
+    AddressSpace::launch(pid, func, farg);
+    klog!("BUG: TID{} returned to kuser_task_launcher!\n", Task::current_tid());
+    Task::exit();
+}
 
 fn syscall_task_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
     if opcode == TaskControlOpCode::Exit as usize {
+        //
         // EXIT
+        //
         klog!("\nProgram ({} - MainTID:{}) Exited with status {}\n",
                                     Task::name(), Task::current_tid(), args);
         Task::exit();
-    } else if opcode == TaskControlOpCode::Current as usize {
+    } else if opcode == TaskControlOpCode::CurrentCpu as usize {
+        // CURRENT CPU
+        copy_to_user(ret_ptr, Task::current_cpu());
+    }else if opcode == TaskControlOpCode::Current as usize {
+        //
         // CURRENT
-        let tinfo: *mut UserTaskInfo = args as *mut UserTaskInfo;
-        let mut tname_out = [0 as u8; 64];
-        let tname = Task::name();
-        let tname_len = min(tname.len(), 63);
-        tname_out[0..tname_len].copy_from_slice(&tname.as_bytes()[0..tname_len]);
-
-        unsafe {
-            tinfo.write(UserTaskInfo {
-                tid: Task::current_tid(),
-                pid: Task::current_pid(),
-                name: tname_out
-            });
-            if ret_ptr != 0 {
-                (ret_ptr as *mut usize).write(size_of::<UserTaskInfo>());
+        //
+        let ret_val: usize;
+        if args == 0 || ret_ptr == 0 {
+            // Invalid arguments
+            ret_val = 0;
+        } else {
+            let mut tname_out = [0 as u8; 64];
+            let tname = Task::name();
+            let tname_len = min(tname.len(), 63);
+            tname_out[0..tname_len].copy_from_slice(
+                                        &tname.as_bytes()[0..tname_len]);
+            copy_to_user(args, TaskControlCurrentArguments {
+                                    tid: Task::current_tid(),
+                                    pid: Task::current_pid(),
+                                    name: tname_out});
+            ret_val = size_of::<TaskControlCurrentArguments>();
+        }
+        // Return to user-space
+        copy_to_user(ret_ptr, ret_val);
+    } else if opcode == TaskControlOpCode::Spawn as usize {
+        //
+        // SPAWN (Creates a task in the current process address space)
+        //
+        let mut ret_val: usize = 0;
+        if args == 0 || ret_ptr == 0 {
+            // Invalid arguments
+        } else if let Some(mut info) = copy_from_user::<TaskControlSpawnArguments>(args) {
+            if info.name_len > 64 || info.func_ptr == 0 {
+                // Invalid name length
+                ret_val = 0;
+            } else {
+                // Valid arguments - Perform the spawn and return the TID/PID back
+                let name_bytes = &info.name[0..info.name_len];
+                let name_str;
+                if info.name_len > 0 {
+                    name_str = str::from_utf8(name_bytes).unwrap_or("UnnamedTask");
+                } else {
+                    name_str = "UnnamedTask";
+                }
+                let fn_ptr : fn(usize) = unsafe {
+                    core::mem::transmute(info.func_ptr)
+                };
+                let launch_args = Box::new(UserTaskLaunchInfo {
+                    func_ptr: fn_ptr,
+                    func_arg: info.func_arg,
+                    target_pid: Task::current_pid()
+                });
+                let new_tid = Task::spawn_named(kuser_task_launcher, 
+                        &launch_args as *const Box<UserTaskLaunchInfo> as usize,
+                        name_str.to_string());
+                if new_tid != 0{
+                    info.tid = new_tid;
+                    info.pid = Task::current_pid();
+                    copy_to_user(args, info);
+                    ret_val = size_of::<TaskControlSpawnArguments>();
+                }
             }
         }
-        
-    } else if opcode == TaskControlOpCode::Spawn as usize {
-        // SPAWN (Creates a task in the current process address space)
-        klog!("\nTaskControlOpCode::Spawn syscall not implemented!\n");
+        copy_to_user(ret_ptr, ret_val);
     } else if opcode == TaskControlOpCode::Join as usize {
-        klog!("\nTaskControlOpCode::Join syscall not implemented!\n");
-    } else {
+        //
+        // JOIN (Joins a task in the current process address space)
+        //
+        let mut ret_val: usize = 0;
+        if args == 0 || ret_ptr == 0 {
+            // Invalid arguments
+        } else if let Some(mut info) = copy_from_user::<TaskControlJoinArguments>(args) {
+            if Task::exists(info.tid) {
+                // Valid TID - Perform the join and return success
+                Task::join(info.tid);
+                info.joined = true;
+            } else {
+                // Invalid TID
+                info.joined = false;
+            }
+            copy_to_user(args, info);
+            ret_val = size_of::<TaskControlJoinArguments>();
+        }
+        copy_to_user(ret_ptr, ret_val);
+    } else if opcode == TaskControlOpCode::Yield as usize {
+        //
+        // YIELD (Yields the current task's execution voluntarily)
+        //
+        Task::preempt();
+        // No return value for yield
+    } else if opcode == TaskControlOpCode::Sleep as usize {
+        //
+        // SLEEP (Puts the current task to sleep for a specified duration)
+        //
+        if args == 0 {
+            // Invalid arguments
+        } else if let Some(info) = copy_from_user::<Duration>(args) {
+            Task::sleep(info);
+        }
+        // No return value for sleep
+    }else {
         klog!("\nInvalid TaskControlOpcode\n");
     }
     
 }
+
+//
+// Process Control System Call
+//
+#[repr(usize)]
+#[derive(PartialEq, PartialOrd)]
+pub enum ProcCtlOpCode {
+    Exit        = 0,
+    Current     = 1, // Returns the PID and TID of the main task of the current process
+    GetInfo     = 2, // Returns more detailed information about the current process
+    ResizeHeap  = 3, // Expand/Shrink the heap of the current process
+    Spawn       = 4, // Spawn a new process by executing a file
+    Fork        = 5, // Clone the current process
+    Exec        = 6, // Replace the current process with a new executable
+}
+
+pub struct ProcCtlCurrentArgs{
+    pub pid:        usize,
+    pub main_tid:   usize,
+}
+
+pub struct ProcCtlGetInfoArgs {
+    pub pid:                usize,
+    pub name:               [u8; 64],
+    pub main_tid:           usize,
+    pub task_count:         usize,
+    pub fd_count:           usize,
+    pub img_base:           usize,
+    pub img_size:           usize,
+    pub heap_base:          usize,
+    pub heap_size:          usize,
+    pub stack_top:          usize,
+    pub total_mem_usage:    usize,
+    pub meta_mem_usage:     usize,
+}
+
+pub struct ProcCtlSpawnArgs {
+    pub path_ptr: usize,// Input: Pointer to the path string in user-space
+    pub path_len: usize,// Input: Length of the path string
+    // pub cmd_ptr: usize, // Input: Pointer to the command buffer in user-space (optional)
+    // pub cmd_len: usize, // Input: Length of the command buffer (optional)
+    // pub env_ptr: usize, // Input: Pointer to the environment variables buffer in user-space (optional)
+    // pub env_len: usize, // Input: Length of the environment variables buffer (optional)
+    pub pid:    usize,  // Output
+    pub m_tid:  usize,  // Output TID of the main task
+}
+
+pub struct ProcCtlResizeHeapArgs {
+    pub delta:      isize,  // Input: Positive to expand, Negative to shrink
+    pub heap_base:  usize,  // Output: New heap base (No change after the initial expansion)
+    pub heap_size:  usize   // Output: New heap size
+}
+
+fn kuser_proc_launcher(pid: usize) {
+    dbg!("kuser_proc_launcher: PID={}, TID={}\n", pid, Task::current_tid());
+    // Box will be dropped here
+    AddressSpace::launch_as_main(pid);
+    klog!("BUG: TID{} returned to kuser_proc_launcher!\n", Task::current_tid());
+    Task::exit();
+}
+
+fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
+    if opcode == ProcCtlOpCode::Exit as usize {
+        //
+        // EXIT
+        //
+        let exit_code = args;
+        klog!("\nProcess {} Exited with status {}\n", Task::current_pid(),
+                                                                    exit_code);
+        // TODO: Implement - Kill the main task
+    } else if opcode == ProcCtlOpCode::Current as usize {
+        //
+        // CURRENT
+        //
+        if args != 0 && ret_ptr != 0 {
+            let pid = Task::current_pid();
+            if let Some(mtid) = AddressSpace::get_main_tid(pid) {
+                copy_to_user(args, ProcCtlCurrentArgs {
+                                        pid: pid,
+                                        main_tid: mtid
+                });
+                copy_to_user(ret_ptr, size_of::<ProcCtlCurrentArgs>());
+                return;
+            }
+            copy_to_user(ret_ptr, 0);
+        }
+    } else if opcode == ProcCtlOpCode::GetInfo as usize {
+        //
+        // GET INFO
+        //
+        let mut ret_val: usize = 0;
+        if args != 0 && ret_ptr != 0 {
+            let pid = Task::current_pid();
+            if let Some(info) = AddressSpace::get_process_info(pid) {
+                copy_to_user(args, info);
+                ret_val = size_of::<ProcCtlGetInfoArgs>();
+            }
+        }
+        copy_to_user(ret_ptr, ret_val);
+    } else if opcode == ProcCtlOpCode::Spawn as usize {
+        //
+        // SPAWN
+        //
+        if let Some(mut info) = copy_from_user::<ProcCtlSpawnArgs>(args) {
+            let path;
+            if info.path_ptr == 0 || info.path_len == 0 {
+                // Invalid path
+                copy_to_user(ret_ptr, 0);
+                return;
+            } else {
+                let path_bytes = unsafe {
+                    core::slice::from_raw_parts(info.path_ptr as *const u8, 
+                                                info.path_len)
+                };
+                path = str::from_utf8(path_bytes).unwrap_or("");
+                if path.len() == 0 {
+                    // Invalid path string
+                    copy_to_user(ret_ptr, 0);
+                    return;
+                }
+            }
+            // Valid arguments - Perform the spawn and return the PID back
+            if let Some(mnt) = MountPoint::from_path(path) {
+                let pname = match path.rfind('/') {
+                    Some(idx) => &path[idx + 1..],
+                    None => path
+                };
+                let fopen_ret = mnt.fopen(path);
+                if let IOCompletion::Successful(hnd) = fopen_ret {
+                    if let Some(elf) = ELFBinary::from_file(mnt.clone(), hnd) {
+                        if let Some(pid) = AddressSpace::spawn_from_elf(&elf, pname.to_string()) {
+                            dbg!("  Launching user-space process.. {}({}) \
+                                    (Free frames: {})\n",
+                                Task::name(), Task::current_tid(),
+                                crate::mem::phys::pmm_num_free_frames()
+                            );
+                            // Spawn a main task
+                            info.m_tid = Task::spawn_named(
+                                kuser_proc_launcher, pid,
+                                format!("P[{}].main", pid).to_string());
+                            info.pid = pid;
+                            // Return the PID back to the caller
+                            copy_to_user(args, info);
+                            copy_to_user(ret_ptr, size_of::<ProcCtlSpawnArgs>());
+                            return; // Success
+                        }
+                    }
+                }
+            }
+        }
+        // Something went wrong
+        copy_to_user(ret_ptr, 0);
+    } else if opcode == ProcCtlOpCode::ResizeHeap as usize {
+        //
+        // RESIZE HEAP
+        //
+        let mut ret_val: usize = 0;
+        if let Some(mut info) = copy_from_user::<ProcCtlResizeHeapArgs>(args) {
+            dbg!("\nProcess {} requested heap resize with delta {}\n", 
+                Task::current_pid(), info.delta);
+            let delta = info.delta;
+            if let Some((new_base, new_size)) = AddressSpace::resize_heap(delta) {
+                info.heap_base = new_base;
+                info.heap_size = new_size;
+                copy_to_user(args, info);
+                ret_val = size_of::<ProcCtlResizeHeapArgs>();
+            }
+        }
+        copy_to_user(ret_ptr, ret_val);
+    } else {
+        klog!("\nInvalid ProcessControlOpcode\n");
+    }
+}
+
+//
+// Virtual File System Control System Calls
+//
 
 // ret_code = 0 no error
 fn syscall_read_resources(out_buffer: &mut [u8], _offset: usize) -> usize {
@@ -377,22 +682,18 @@ fn syscall_open(path_ptr: usize, path_len: usize, _mode: usize, ret_ptr: usize) 
                 let fd = AddressSpace::add_fd(pid, fd_obj);
                 if ret_ptr != 0 {
                     // For now just add 4 to the hnd to obtain an FD
-                   unsafe { (ret_ptr as *mut usize).write(fd); }
+                    copy_to_user(ret_ptr, fd);
                 }
             },
             _                   => {
                 dbg!("OPEN syscall failed for {} w\\ {:?}\n", path, fopen_ret);
-                if ret_ptr != 0 {
-                    unsafe { (ret_ptr as *mut usize).write(0); }
-                }
+                copy_to_user(ret_ptr, 0 as usize);
             }
         }
     } else {
         // Device not found
         // TODO need a way to pass different error codes
-        if ret_ptr != 0 {
-            unsafe { (ret_ptr as *mut usize).write(0); }
-        }
+        copy_to_user(ret_ptr, 0 as usize);
     }
     // klog!("\nSyscall: OPEN({}, {}, {}) by PID:{} TID:{}\n{:?}", 
     //         path, path_len, mode, Task::current_pid(), Task::current_tid());
@@ -410,13 +711,9 @@ fn syscall_read(fd: usize, buf: usize, len: usize, ret_ptr: usize) {
         return;
     } else if fd == SyscallRsvdFDs::SystemResources as usize {
         // Resource Enumeration
-        unsafe {
-            let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
-            let ret_val = syscall_read_resources(out, 0);
-            if ret_ptr != 0 {
-                (ret_ptr as *mut usize).write(ret_val);
-            }
-        }
+        let out = unsafe {core::slice::from_raw_parts_mut(buf as *mut u8, len)};
+        let ret_val = syscall_read_resources(out, 0);
+        copy_to_user(ret_ptr, ret_val);
         return;
     }
     // Normal File Read
@@ -434,35 +731,24 @@ fn syscall_read(fd: usize, buf: usize, len: usize, ret_ptr: usize) {
                 } else {
                     ret_val = 0;
                 }
-                if ret_ptr != 0 {
-                    (ret_ptr as *mut usize).write(ret_val);
-                }
+                copy_to_user(ret_ptr, ret_val);
             }
         } else {
             // Invalid Mount Point
             dbg!("READ syscall failed due to invalid Mount Point {}\n", fd);
-            if ret_ptr != 0 {
-                unsafe {(ret_ptr as *mut usize).write(0);}
-            }
+            copy_to_user(ret_ptr, 0 as usize);
         }
     } else {
         // Invalid FD
         dbg!("READ syscall failed due to invalid FD {}\n", fd);
-        if ret_ptr != 0 {
-            unsafe {(ret_ptr as *mut usize).write(0);}
-        }
+        copy_to_user(ret_ptr, 0 as usize);
     }
 }
 
 fn syscall_enum(fd: usize, buf: usize, buf_len: usize, ret_ptr: usize) {
     if fd <= SyscallRsvdFDs::SystemResources as usize {
         //Enum not supported on special FDs!
-        unsafe {
-            if ret_ptr != 0 {
-                (ret_ptr as *mut usize).write(0);
-            }
-                
-        }
+        copy_to_user(ret_ptr, 0 as usize);
         return;
     }
 
@@ -482,29 +768,20 @@ fn syscall_enum(fd: usize, buf: usize, buf_len: usize, ret_ptr: usize) {
                     let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
                     out[0..len].copy_from_slice(serialized.as_bytes());
                 }
-                
-                if ret_ptr != 0 {
-                    unsafe {(ret_ptr as *mut usize).write(len);}
-                }    
+                copy_to_user(ret_ptr, len);
             } else {
                 // Enum failed/not-supported
-                if ret_ptr != 0 {
-                    unsafe { (ret_ptr as *mut usize).write(0); }
-                }
+                copy_to_user(ret_ptr, 0 as usize);
             }
         } else {
             // Invalid Mount Point
             dbg!("ENUM syscall failed due to invalid Mount Point {}\n", fd);
-            if ret_ptr != 0 {
-                unsafe {(ret_ptr as *mut usize).write(0);}
-            }
+            copy_to_user(ret_ptr, 0 as usize);
         }
     } else {
         // Invalid FD
         dbg!("ENUM syscall failed due to invalid FD {}\n", fd);
-        if ret_ptr != 0 {
-            unsafe {(ret_ptr as *mut usize).write(0);}
-        }
+        copy_to_user(ret_ptr, 0 as usize);
     }    
 }
 
@@ -523,7 +800,14 @@ fn syscall_write(fd: usize, buf: usize, len: usize, _ret_ptr: usize) {
 
 fn syscall_exec(fd: usize, cmd_ptr: usize, cmd_len: usize, fr_ptr: usize) {
     let pid = Task::current_pid();
-    if let Some(fd_obj) = AddressSpace::get_fd(pid, fd) {
+    if fd == SyscallRsvdFDs::StandardIO as usize {
+        // Exec the command on the shell
+        if cmd_ptr == 1 && cmd_len == 0 {
+            // Clear screen
+            kearly_console::init();
+        }
+    } else if let Some(fd_obj) = AddressSpace::get_fd(pid, fd) {
+        // Normal files/devices
         if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
             let cmd_func;
             let mut ret_val: usize = 0;
@@ -539,23 +823,17 @@ fn syscall_exec(fd: usize, cmd_ptr: usize, cmd_len: usize, fr_ptr: usize) {
                 if let IOCompletion::Successful(len) = ioc {
                     ret_val = len;
                 }
-                if fr_ptr != 0 {
-                    (fr_ptr as *mut usize).write(ret_val);
-                }
+                copy_to_user(fr_ptr, ret_val);
             }
         } else {
             // Invalid Mount Point
             dbg!("EXEC syscall failed due to invalid Mount Point {}\n", fd);
-            if fr_ptr != 0 {
-                unsafe {(fr_ptr as *mut usize).write(0);}
-            }
+            copy_to_user(fr_ptr, 0 as usize);
         }
     } else {
         // Invalid FD
         dbg!("EXEC syscall failed due to invalid FD {}\n", fd);
-        if fr_ptr != 0 {
-            unsafe {(fr_ptr as *mut usize).write(0);}
-        }
+        copy_to_user(fr_ptr, 0 as usize);
     }    
 }
 

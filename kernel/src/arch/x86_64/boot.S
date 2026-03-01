@@ -85,24 +85,6 @@ bsp_start32:
   mov   %ax, %ss
   lidt  idt_pointer
 
-  /* Fixing up TSS for CPU0
-   * TODO: move this to Rust and do it for all enabled CPUs
-   */
-  /* Flags -> RAX*/
-  movq  $0x8900, %rax
-  shlq  $32, %rax 
-  /* TSS Base and Limit -> RCX */
-  movq  $tss64_base+(0x68 * 0), %rcx
-  shlq  $16, %rcx /* TSS Base */
-  orq   $0x68, %rcx /* TSS Limit */
-  /* First QWORD of the descriptor --> RAX */
-  orq   %rcx, %rax 
-  movq  %rax, gdt64_tssd_base
-
-  /* Load the task register with the descriptor offset in GDT */
-  mov   $0x28, %ax
-  ltr   %ax
-
   xor   %rdi, %rdi
   mov   %ebx, %edi              /* The multiboot structure address */
   mov   $MAX_CPU_COUNT, %rsi
@@ -485,31 +467,9 @@ gdt64_base:
    * to keep track of Interrupt Stack Table (only storing rsp0 (ring0) for now)
    * See Section 9.2.3 - TSS Descriptor in 64-bit mode
    */
-gdt64_tssd_base:
-  /* 0x28: CPU 0 TSS */
-  .quad 0x0
-  .quad 0x0
-  /* 0x38: CPU 1 TSS */
-  .quad 0x0 
-  .quad 0x0
-  /* 0x48: CPU 2 TSS */
-  .quad 0x0
-  .quad 0x0
-  /* 0x58: CPU 3 TSS */
-  .quad 0x0
-  .quad 0x0
-  /* 0x68: CPU 4 TSS */
-  .quad 0x0
-  .quad 0x0
-  /* 0x78: CPU 5 TSS */
-  .quad 0x0
-  .quad 0x0
-  /* 0x88: CPU 6 TSS */
-  .quad 0x0
-  .quad 0x0
-  /* 0x98: CPU 7 TSS */
-  .quad 0x0
-  .quad 0x0
+.globl gdt64_tssd_base
+gdt64_tssd_base: /* 0x28: Offset of CPU 0's TSS is 0x28 */
+  .zero 16 * MAX_CPU_COUNT 
 
 gdt64_pointer:
   .short gdt64_pointer - gdt64_base - 1
@@ -613,7 +573,14 @@ tss64_base:
   popq      %r15
   movq      $0x0123456789abcdef, %r14
   cmpq      %r14, %r15
-  jne       1f
+  jne       2f
+  /* Pop CR3 to switch address-spaces if neceassary */
+  popq      %rax        /* Saved CR3 */
+  movq      %cr3, %rbx  /* Current CR3 */
+  cmpq      %rax, %rbx
+  je        1f
+  movq      %rax, %cr3  /* Switch the address-space */
+1:
   /* pop thread's saved execution state */
   popq      %r15
   popq      %r14
@@ -650,6 +617,8 @@ tss64_base:
   pushq     %r13
   pushq     %r14
   pushq     %r15
+  movq      %cr3, %rax
+  pushq     %rax
   /* push stack watermark */
   movq      $0x0123456789abcdef, %r15
   pushq     %r15
@@ -665,13 +634,13 @@ start_first_thread:
   movq      8(%rdi), %rsp       /* Retrieve new's stack pointer */
   RESTORE_CONTEXT
   retq
-1:
+2:
   /* Stack consistency has failed */
   movq      %rsp, %rdi
   callq     kstack_error
 
 /*******************************************************************************
- * switch_context(TaskContext* old, TaskContext* new)
+ * switch_context(TaskContext* old, TaskContext* new, usize tss_rsp0_addr)
  */
 .globl switch_context
 switch_context:
@@ -682,30 +651,11 @@ switch_context:
 /*  fxrstor   48(%rsi)      TODO Restore x87 FPU, MMX Technology, and SSE State */
   RESTORE_CONTEXT             /* Restore general x86_64 registers */
   retq
-1:
+2:
   /* Stack consistency has failed */
   movq      %rsp, %rdi
   callq     kstack_error
 
-/*******************************************************************************
- * switch_to_userspace(rdi: entrypoint, rsi: stackpointer, rdx: pml4_base, 
-                       rcx: tss_rsp0_addr)
- */
-.globl switch_to_userspace
-switch_to_userspace:
-  cli
-  /* Push the dummy irq stack onto the current kernel stack to jump to the
-   * new user address-space based in rdx
-   */
-  pushq   $(0x20 | 3)   /* Ring-3 Stack Segment */
-  pushq   %rsi          /* Ring-3 Stack Pointer */
-  pushq   $0x202        /* Ring-3 Starting RFLAGS */
-  pushq   $(0x18 | 3)   /* Ring-3 Code Segment */
-  pushq   %rdi          /* Ring-3 RIP (Entry Point) */
-  mov     %rsp, (%rcx)  /* Ring-0 Stack Pointer */
-  mov     %rdx, %cr3    /* Swith to the new address-space */
-  iretq
-  hlt
 
 /*******************************************************************************
  * Initial kernel buffers (stack, paging structs, etc.)
@@ -736,6 +686,7 @@ switch_to_userspace:
 /* L3) Allocate 1 Page Directory Pointer Table. Each PDPT can map 512 GB*/
 .comm	    init_page_dir_pointer_table, 0x1000 /* Only first 4 PDPTEs are used */
 /* L4) Allocate 1 PML4 Table. Each PML4 can map 256 TB */
+.globl    init_pml4_table
 .comm	    init_pml4_table, 0x1000 /* Only the first PML4E is used */
 
 
