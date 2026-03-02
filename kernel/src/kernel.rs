@@ -84,6 +84,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
         // BSP-only initialization
         klog!("BlightOS - Number of CPUs online: {}\n", cpu_count());
 
+        // Initialize the physical memory manage
         match mmap_opt {
             Some(mmap) => {
                 let kernel_start: usize;

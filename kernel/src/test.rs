@@ -11,6 +11,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use crate::mem::heap::Kalloc;
 use crate::util::*;
 use crate::arch::*;
 use crate::drivers::storage::*;
@@ -152,8 +153,10 @@ fn task3_exec(_arg: usize) {
     Task::join(sleeping_tid);
 
     // TEST - PARALLEL HEAP ALLOCATION -----------------------------------------
-    klog!("[Test] Parallel heap allocations - Free frames: {}\n",
-            pmm_num_free_frames());
+    klog!("[Test] Parallel heap allocations - Free frames: {}\n\
+           Pages used by the heap: Meta-data {}, User-data: {}\n",
+            pmm_num_free_frames(),
+            Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
 
     let t4 = Task::spawn(|_arg: usize| {
         klog!("  <Task {}(CPU{}) allocate/verify/free 1000 i32>\n",
@@ -184,7 +187,10 @@ fn task3_exec(_arg: usize) {
         for i in 0..1000 {
             myvec.push(i);
         }
-        klog!("  [MIDPOINT] Free frames: {}\n", pmm_num_free_frames());
+        klog!("  [MIDPOINT] Free frames: {}, \
+                 Pages used by the heap: Meta-data {}, User-data: {}\n",
+            pmm_num_free_frames(),
+            Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
         klog!("  _myvars: {}, {}, {}, {}\n",
                     *_myvar1, *_myvar2, *_myvar3, *_myvar4);
         for i in 0..1000 {
@@ -195,8 +201,10 @@ fn task3_exec(_arg: usize) {
         }
     }
     Task::join(t4);
-    klog!("  Free frames: {}, Cached TLSF Metadata: ~5\n",
-        pmm_num_free_frames());
+    klog!("  Free frames: {}, \
+             Pages used by the heap: Meta-data {}, User-data: {}\n",
+            pmm_num_free_frames(),
+            Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
 
     // TEST - CO-OP SCHEDULING -------------------------------------------------
     klog!("[TEST] Co-op scheduling\n  ");
@@ -350,3 +358,134 @@ fn task3_exec(_arg: usize) {
     klog!("\n[KERNEL SELF-TEST] Finished - Free frames: {}\n",
         pmm_num_free_frames());
 }
+
+//
+// Kernel heap correctness/performance testing commented out for efficiency
+//
+// static mut HEAP_TEST_POINTERS: [*mut usize; 64*255*3] = 
+//             [core::ptr::null_mut(); 64*255*3];
+// pub unsafe fn heap_correctness_test() {
+//     klog!("[HEAP CORRECTNESS TEST] Allocating 64*255*3 64-byte variables\n");
+//     // Do not store every timing sample — keep min/max/sum and counts only.
+//     let total: usize = 64 * 255 * 3;
+//     let mut alloc_min: u128 = u128::MAX;
+//     let mut alloc_max: u128 = 0;
+//     let mut alloc_sum: u128 = 0;
+//     let mut alloc_count: usize = 0;
+//     let mut alloc_hist: [usize; 11] = [0; 11]; // Histogram of allocation times (10 buckets)
+//     let bucket_size: u128 = 1000; // 1 microsecond buckets
+
+//     let mut free_min: u128 = u128::MAX;
+//     let mut free_max: u128 = 0;
+//     let mut free_sum: u128 = 0;
+//     let mut free_count: usize = 0;
+//     let mut free_hist: [usize; 11] = [0; 11]; // Histogram of free times (10 buckets)
+//     let free_bucket_size: u128 = 1000; // 1 microsecond buckets
+
+//     klog!("  [Before Alloc] Free frames: {}, \
+//              Pages used by the heap: Meta-data {}, User-data: {}\n",
+//             pmm_num_free_frames(),
+//             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
+
+//     // Allocating more than 255 clusters worth of AUs to test the chaining of
+//     // descriptor pages. Time each allocation but only aggregate stats.
+//     for i in 0..total {
+//         let t0 = SystemTimer::current_timestamp();
+//         let ptr: Box<usize> = Box::new(i);
+//         let t1 = SystemTimer::current_timestamp();
+//         let dt = SystemTimer::timestamp_to_duration(t1 - t0).as_nanos();
+
+//         // Update histogram
+//         let bucket = (dt / bucket_size) as usize;
+//         if bucket < 10 {
+//             alloc_hist[bucket] += 1;
+//         } else {
+//             alloc_hist[10] += 1; // Overflow bucket
+//         }
+//         // update min/max/sum/count
+//         if dt < alloc_min { alloc_min = dt; }
+//         if dt > alloc_max { alloc_max = dt; }
+//         alloc_sum += dt;
+//         alloc_count += 1;
+
+//         let ptrp: *mut usize = Box::into_raw(ptr);
+//         HEAP_TEST_POINTERS[i] = ptrp;
+//     }
+
+//     klog!("  [After Alloc] Free frames: {}, \
+//              Pages used by the heap: Meta-data {}, User-data: {}\n",
+//             pmm_num_free_frames(),
+//             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
+
+//     // Verify the integrity of the allocated data.
+//     for i in 0..total {
+//         let ptr = HEAP_TEST_POINTERS[i];
+//         if ptr.is_null() || *ptr != i {
+//             klog!("  [FAIL] Heap corruption at index {}: expected {}, got {}\n",
+//                     i, i, if ptr.is_null() { usize::MAX } else { *ptr });
+//             break;
+//         }
+//     }
+
+//     // Free the allocated memory, timing each free but only aggregate stats.
+//     for i in 0..total {
+//         let ptrp = HEAP_TEST_POINTERS[i];
+//         if !ptrp.is_null() {
+//             let t0 = SystemTimer::current_timestamp();
+//             // Recreate the Box and drop it to free.
+//             let bx = Box::from_raw(ptrp);
+//             drop(bx);
+//             let t1 = SystemTimer::current_timestamp();
+//             let dt = SystemTimer::timestamp_to_duration(t1 - t0).as_nanos();
+
+//             // Update histogram
+//             let bucket = (dt / free_bucket_size) as usize;
+//             if bucket < 10 {
+//                 free_hist[bucket] += 1;
+//             } else {
+//                 free_hist[10] += 1; // Overflow bucket
+//             }
+//             // update min/max/sum/count
+//             if dt < free_min { free_min = dt; }
+//             if dt > free_max { free_max = dt; }
+//             free_sum += dt;
+//             free_count += 1;
+
+//             HEAP_TEST_POINTERS[i] = core::ptr::null_mut();
+//         }
+//     }
+
+//     klog!("  [After Free] Free frames: {}, \
+//              Pages used by the heap: Meta-data {}, User-data: {}\n",
+//             pmm_num_free_frames(),
+//             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
+
+//     // Compute stats
+//     let (alloc_min, alloc_max, alloc_avg) = if alloc_count > 0 {
+//         (alloc_min, alloc_max, alloc_sum / (alloc_count as u128))
+//     } else { (0, 0, 0) };
+
+//     let (free_min, free_max, free_avg) = if free_count > 0 {
+//         (free_min, free_max, free_sum / (free_count as u128))
+//     } else { (0, 0, 0) };
+
+//     klog!("[HEAP TIMING] Allocations (us): min={:.2}, max={:.2}, avg={:.2}\n",
+//             alloc_min as f64 / 1000.0,
+//             alloc_max as f64 / 1000.0,
+//             alloc_avg as f64 / 1000.0);
+//     klog!("  Histogram(%) <1us to <10us: ");
+//     for i in 0..10 {
+//         klog!("{:.2} | ", alloc_hist[i] as f64 / alloc_count as f64 * 100.0);
+//     }
+//     klog!("10us+: {:.2}%\n", alloc_hist[10] as f64 / alloc_count as f64 * 100.0);
+//     klog!("[HEAP TIMING] Frees       (us): min={:.2}, max={:.2}, avg={:.2}\n",
+//             free_min as f64 / 1000.0,
+//             free_max as f64 / 1000.0,
+//             free_avg as f64 / 1000.0);
+//     klog!("  Histogram(%) <1us to <10us: ");
+//     for i in 0..10 {
+//         klog!("{:.2} | ", free_hist[i] as f64 / free_count as f64 * 100.0);
+//     }
+//     klog!("10us+: {:.2}%\n", free_hist[10] as f64 / free_count as f64 * 100.0);
+
+// }
