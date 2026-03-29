@@ -179,142 +179,154 @@ setup_idt:
 
 .code64
 
-.macro STORE_CALLER_SAVED
+.macro SAVE_GP_REGS
   pushq   %rax
+  pushq   %rbx
   pushq   %rcx
   pushq   %rdx
   pushq   %rsi
   pushq   %rdi
+  pushq   %rbp
   pushq   %r8
   pushq   %r9
   pushq   %r10
   pushq   %r11
+  pushq   %r12
+  pushq   %r13
+  pushq   %r14
+  pushq   %r15
 .endm
 
-.macro RESTORE_CALLER_SAVED
+.macro RSTR_GP_REGS
+  popq    %r15
+  popq    %r14
+  popq    %r13
+  popq    %r12
   popq    %r11
   popq    %r10
   popq    %r9
   popq    %r8
+  popq    %rbp
   popq    %rdi
   popq    %rsi
   popq    %rdx
   popq    %rcx
+  popq    %rbx
   popq    %rax
 .endm
 
 .macro CALL_KIRQ_HANDLER irq_num
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   movq    $\irq_num, %rdi
   call    kirq_handler
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
 .endm
 
 int_default:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kdefault_handler
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_div_by_zero:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_div_by_zero
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_nmi:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_nmi
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_overflow:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_overflow
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
 	iretq
 
 excep_invalid_opcode:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   movq %rsp, %rdi
-  addq $(9*8), %rdi /* STORE_CALLER_SAVED pushed 9 registers on the stack */
+  addq $(15*8), %rdi /* SAVE_GP_REGS pushed 15 registers on the stack */
   call kexcep_invalid_opcode
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
 	iretq
 
 excep_invalid_tss:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_invalid_tss
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_seg_not_present:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_seg_not_present
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_stack_fault:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_stack_fault
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_gp_fault:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   movq %rsp, %rdi
-  addq $(9*8), %rdi /* STORE_CALLER_SAVED pushed 9 registers on the stack */
+  addq $(15*8), %rdi /* SAVE_GP_REGS pushed 15 registers on the stack */
   call kexcep_gp_fault
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_page_fault:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   movq %rsp, %rdi
-  addq $(9*8), %rdi /* STORE_CALLER_SAVED pushed 9 registers on the stack */
+  addq $(15*8), %rdi /* SAVE_GP_REGS pushed 15 registers on the stack */
   call kexcep_page_fault
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_x87fpu:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_x87fpu
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_alignment_chk:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_alignment_chk
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_machine_chk:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call kexcep_machine_chk
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 excep_simd_fp:
   /* Pass the value of MXCSR value as the argument to the handler */
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   subq    $4, %rsp
   stmxcsr (%rsp)
   movl    (%rsp), %edi
   addq    $4, %rsp
   call kexcep_simd_fp
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 sys_handler:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call    ksyscall_handler
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
 	iretq
 
 irq_lvt_timer:
-  STORE_CALLER_SAVED
+  SAVE_GP_REGS
   call    kirq_lvt_timer
-  RESTORE_CALLER_SAVED
+  RSTR_GP_REGS
   iretq
 
 irq_handler0:

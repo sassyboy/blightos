@@ -384,6 +384,25 @@ pub fn init_framebuffer_from_mb2(inp: &Multiboot2FrameBuffer) {
 // Called by irq_/excep handler wrapper functions in boot.S ensuring proper
 // system stack management and return of the control flow.
 //
+fn dump_cpu_state(info: &X86ExceptionInfo, dump_stack: bool) {
+    klog!("CPU={} ERR={:X} RFLG={:X} CR2={:X} CR3={:X} \
+           RIP={:016X} CS ={:04X} SS ={:04X}\n\
+           RAX={:016X} RBX={:016X} RCX={:016X} RDX={:016X}\n\
+           RSI={:016X} RDI={:016X} RBP={:016X} RSP={:016X}\n\
+           R8 ={:016X} R9 ={:016X} R10={:016X} R11={:016X}\n\
+           R12={:016X} R13={:016X} R14={:016X} R15={:016X}\n",
+            info.cpu, info.err, info.rflg, info.cr2, info.cr3,
+            info.rip, info.cs, info.ss,
+            info.rax, info.rbx, info.rcx, info.rdx, 
+            info.rsi, info.rdi, info.rbp, info.rsp,
+            info.r8, info.r9, info.r10, info.r11,
+            info.r12, info.r13, info.r14, info.r15
+    );
+    if dump_stack {
+        dump_memory_columns(info.rsp, 20, 4);
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn kdefault_handler() {
     kearly_console::print_str(b"kdefault_handler");
@@ -429,10 +448,12 @@ extern "C" fn kexcep_stack_fault() {
 #[unsafe(no_mangle)]
 extern "C" fn kexcep_gp_fault(exframe: usize) {
     let info = x86_decode_exception_frame(exframe, true);
-    dump_memory(info.rsp, 8);
-    panic!("#GP CPU={} ERR={:X} RFLG={:X} CR3={:X} CS={:X} RIP={:X} SS={:X} RSP={:X}",
-            info.cpu, info.err, info.rflg, info.cr3, info.cs, info.rip, info.ss, info.rsp
-    );
+    // Todo - If this is a user-space process, terminate it instead of panicking
+    // the kernel
+    klog!("#GPF Current PID={}, TID={}\n",
+        Task::current_pid(), Task::current_tid());
+    dump_cpu_state(&info, true);
+    panic!("");
 }
 
 #[unsafe(no_mangle)]
@@ -440,12 +461,10 @@ extern "C" fn kexcep_page_fault(exframe: usize) {
     let info = x86_decode_exception_frame(exframe, true);
     // Try to handle the page fault
     if AddressSpace::handle_page_fault(info.cr2) == false {
-        klog!("#PF CPU={} CR2={:X} ERR={:X} RFLG={:X} CR3={:X} CS={:X} RIP={:X} \
-               SS={:X} RSP={:X}",
-                info.cpu, info.cr2, info.err, info.rflg, info.cr3, info.cs, info.rip,
-                info.ss, info.rsp);
-        dump_memory(info.rsp - 4, 8);
-        panic!("Unhandled Page Fault");
+        klog!("#PF Current PID={}, TID={}\n",
+            Task::current_pid(), Task::current_tid());
+        dump_cpu_state(&info, true);
+        panic!("");
     }
 
 }
@@ -497,14 +516,32 @@ extern "C" fn kstack_error(rsp: usize) {
 struct X86ExceptionInfo {
     cpu:    usize,
     err:    usize,
+    // Return Info
     cs:     usize,
     rip:    usize,
     rflg:   usize,
     rsp:    usize,
     ss:     usize,
+    // Control Registers
     cr2:    usize,
     cr3:    usize,
-    cr4:    usize
+    cr4:    usize,
+    // General Purpose Registers
+    rax:    usize,
+    rbx:    usize,
+    rcx:    usize,
+    rdx:    usize,
+    rsi:    usize,
+    rdi:    usize,
+    rbp:    usize,
+    r8:     usize,
+    r9:     usize,
+    r10:    usize,
+    r11:    usize,
+    r12:    usize,
+    r13:    usize,
+    r14:    usize,
+    r15:    usize
 }
 
 fn x86_decode_exception_frame(exframe: usize, error_code: bool) -> 
@@ -515,33 +552,49 @@ X86ExceptionInfo {
         asm!("mov rax, cr2", out("rax")cr2);
         asm!("mov rax, cr3", out("rax")cr3);
         asm!("mov rax, cr4", out("rax")cr4);
+        let mut info = X86ExceptionInfo {
+            cpu : cpu,
+            err : 0,
+            rip : 0,
+            cs  : 0,
+            rflg: 0,
+            rsp : 0,
+            ss  : 0,
+            rax : *((exframe - 8 * 1) as *const usize),
+            rbx : *((exframe - 8 * 2) as *const usize),
+            rcx : *((exframe - 8 * 3) as *const usize),
+            rdx : *((exframe - 8 * 4) as *const usize),
+            rsi : *((exframe - 8 * 5) as *const usize),
+            rdi : *((exframe - 8 * 6) as *const usize),
+            rbp : *((exframe - 8 * 7) as *const usize),
+            r8  : *((exframe - 8 * 8) as *const usize),
+            r9  : *((exframe - 8 * 9) as *const usize),
+            r10 : *((exframe - 8 * 10) as *const usize),
+            r11 : *((exframe - 8 * 11) as *const usize),
+            r12 : *((exframe - 8 * 12) as *const usize),
+            r13 : *((exframe - 8 * 13) as *const usize),
+            r14 : *((exframe - 8 * 14) as *const usize),
+            r15 : *((exframe - 8 * 15) as *const usize),
+            cr2 : cr2,
+            cr3 : cr3,
+            cr4 : cr4
+        };
         if error_code {
-            X86ExceptionInfo {
-                cpu : cpu,
-                err : *((exframe + 8 * 0) as *const usize),
-                rip : *((exframe + 8 * 1) as *const usize),
-                cs  : *((exframe + 8 * 2) as *const usize),
-                rflg: *((exframe + 8 * 3) as *const usize),
-                rsp : *((exframe + 8 * 4) as *const usize),
-                ss  : *((exframe + 8 * 5) as *const usize),
-                cr2 : cr2,
-                cr3 : cr3,
-                cr4 : cr4
-            }
+            info.err = *((exframe + 8 * 0) as *const usize);
+            info.rip = *((exframe + 8 * 1) as *const usize);
+            info.cs  = *((exframe + 8 * 2) as *const usize);
+            info.rflg= *((exframe + 8 * 3) as *const usize);
+            info.rsp = *((exframe + 8 * 4) as *const usize);
+            info.ss  = *((exframe + 8 * 5) as *const usize);
         } else {
-            X86ExceptionInfo {
-                cpu : cpu,
-                err : 0,
-                rip : *((exframe + 8 * 0) as *const usize),
-                cs  : *((exframe + 8 * 1) as *const usize),
-                rflg: *((exframe + 8 * 2) as *const usize),
-                rsp : *((exframe + 8 * 3) as *const usize),
-                ss  : *((exframe + 8 * 4) as *const usize),
-                cr2 : cr2,
-                cr3 : cr3,
-                cr4 : cr4
-            }
+            info.err = 0;
+            info.rip = *((exframe + 8 * 0) as *const usize);
+            info.cs  = *((exframe + 8 * 1) as *const usize);
+            info.rflg= *((exframe + 8 * 2) as *const usize);
+            info.rsp = *((exframe + 8 * 3) as *const usize);
+            info.ss  = *((exframe + 8 * 4) as *const usize);
         }
+        info
     }
 }
 
@@ -1258,6 +1311,21 @@ impl X86IOPortAccess for u8 {
     fn x86_ioport_write(port: u16, data: Self) {
         unsafe {
             asm!("out dx, al", in("dx") port, in("al") data);
+        }
+    }
+}
+
+impl X86IOPortAccess for u16 {
+    fn x86_ioport_read(port: u16) -> Self {
+        let data: u16;
+        unsafe {
+            asm!("in ax, dx", out("ax") data, in("dx") port);
+        }
+        data
+    }
+    fn x86_ioport_write(port: u16, data: Self) {
+        unsafe {
+            asm!("out dx, ax", in("dx") port, in("ax") data);
         }
     }
 }

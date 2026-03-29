@@ -10,6 +10,7 @@ pub mod machine;
 pub mod pci;
 pub mod input;
 pub mod storage;
+pub mod audio;
 pub mod video;
 
 use alloc::{vec, vec::*};
@@ -72,6 +73,13 @@ pub fn get_builtin_drivers() -> Vec<DriverInfo> {
             post_enum: crate::drivers::storage::ahci::AHCIBus::post_enum,
             release: crate::drivers::storage::ahci::AHCIBus::release
         },
+        #[cfg(target_arch = "x86_64")]
+        DriverInfo {
+            name: "Intel HDA Audio Controller",
+            enumerate: crate::drivers::audio::intel_hda::IntelHDA::enumerate,
+            post_enum: crate::drivers::audio::intel_hda::IntelHDA::post_enum,
+            release: crate::drivers::audio::intel_hda::IntelHDA::release
+        },
         // AARCH64 only support
         #[cfg(target_arch = "aarch64")]
         DriverInfo {
@@ -90,6 +98,73 @@ pub fn get_builtin_drivers() -> Vec<DriverInfo> {
     ]
 }
 
+
+///
+/// Basic MMIO read/write for device drivers
+/// 
+/// MMIORegisterFile provides safe read/write access to a memory-mapped I/O
+/// region, with bounds checking.
+/// 
+/// MMIOAccessible is a marker trait for types that can be read/written via MMIO.
+/// Device drivers can implement MMIOAccessible for their custom types/structs
+/// if needed, but basic integer types are already implemented for convenience.
+/// 
+pub trait MMIOAccessible{}
+
+
+#[derive(Clone, Copy)]
+pub struct MMIORegisterFile {
+    pub base_virt: usize,   // Base virtual address of the MMIO region
+    pub length: usize,      // Length of the MMIO region in bytes
+}
+
+impl MMIORegisterFile {
+     pub const fn new(mmio_base_virt: usize, mmio_size: usize) -> Self {
+        Self { base_virt: mmio_base_virt, length: mmio_size }
+    }
+
+    pub fn write<T: MMIOAccessible>(&mut self, offset: usize, value: T) {
+        if offset + core::mem::size_of::<T>() > self.length {
+            panic!("Out-of-bound MMIO write: {} bytes @ offset {}, \
+                    mmio_base: {:#X}, mmio_size: {}",
+                    core::mem::size_of::<T>(), offset,
+                    self.base_virt, self.length);
+        }
+        let addr = (self.base_virt + offset) as *mut T;
+        unsafe { addr.write_volatile(value) }
+    }
+
+    pub fn read<T: MMIOAccessible>(&self, offset: usize) -> T {
+        if offset + core::mem::size_of::<T>() > self.length {
+            panic!("Out-of-bound MMIO read: {} bytes @ offset {}, \
+                    mmio_base: {:#X}, mmio_size: {}",
+                    core::mem::size_of::<T>(), offset,
+                    self.base_virt, self.length);
+        }
+        let addr = (self.base_virt + offset) as *const T;
+        unsafe { addr.read_volatile() }
+    }
+
+    pub unsafe fn as_mut_ptr<T: MMIOAccessible>(&self, offset: usize) -> *mut T {
+        if offset + core::mem::size_of::<T>() > self.length {
+            panic!("Out-of-bound MMIO pointer access: {} bytes @ offset {}, \
+                    mmio_base: {:#X}, mmio_size: {}",
+                    core::mem::size_of::<T>(), offset,
+                    self.base_virt, self.length);
+        }
+        (self.base_virt + offset) as *mut T
+    }
+
+}
+
+impl MMIOAccessible for u8 {}
+impl MMIOAccessible for i8 {}
+impl MMIOAccessible for u16 {}
+impl MMIOAccessible for i16 {}
+impl MMIOAccessible for u32 {}
+impl MMIOAccessible for i32 {}
+impl MMIOAccessible for u64 {}
+impl MMIOAccessible for i64 {}
 
 //
 // Structures that have to be encodeded/decoded to/from a packed/specific format

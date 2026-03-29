@@ -1,14 +1,42 @@
 #![no_std]
 #![cfg(not(test))]
+extern crate alloc; 
 
 pub mod syscall;
 pub mod stdio;
 pub mod fileio;
 pub mod task;
 pub mod heap;
+pub mod zlib;
+pub mod graphics;
+pub mod audio;
 
 use crate::stdio::*;
 use crate::syscall::*;
+
+pub enum ErrorCode {
+    NotFound        = 1,
+    NotAllowed      = 2,
+    InvalidInput    = 3,
+    InvalidHandle   = 4,
+    InvalidData     = 5,
+    InvalidOp       = 6,
+    Unsupported     = 7,
+    UnexpectedEoF   = 8,
+    IOError         = 9,
+    OutOfMemory     = 10,
+    Other           = 255
+}
+
+pub struct Exception {
+    pub code: ErrorCode,
+    pub message: &'static str
+}
+impl Exception {
+    pub const fn new(code: ErrorCode, message: &'static str) -> Self {
+        Self { code, message }
+    }
+}
 
 #[macro_export]
 macro_rules! print {
@@ -50,3 +78,21 @@ pub fn exit(status: usize) {
         ret_code: 0
     });
 }
+
+
+
+/// Math functions missing in core::
+/// 
+pub fn sin(angle_rad: f64) -> f64 {
+    // Taylor series expansion for sin(x) around 0: x - x^3/3! + x^5/5! - x^7/7! + ...
+    let mut term = angle_rad; // First term (n=0)
+    let mut sum = term;       // Initialize sum with the first term
+    let mut n = 1;
+    while term.abs() > 1e-10 { // Continue until the term is small enough
+        term *= -angle_rad * angle_rad / ((n + 1) * (n + 2)) as f64; // Compute next term
+        sum += term; // Add the new term to the sum
+        n += 2; // Increment n by 2 for the next odd term
+    }
+    sum
+}
+

@@ -8,7 +8,8 @@ BOOT_IMG=$(BUILDDIR)boot.img
 DISK_IMG=$(BUILDDIR)disk.img
 USER_PROGS=	$(BUILDDIR)shell.box \
 			$(BUILDDIR)test.box \
-			$(BUILDDIR)fileman.box
+			$(BUILDDIR)fileman.box \
+			$(BUILDDIR)tetris.box
 
 all: kernel $(BOOT_IMG) $(DISK_IMG) run
 
@@ -63,7 +64,9 @@ run: $(BOOT_IMG) $(DISK_IMG)
 		-device ide-hd,drive=sata1,bus=ahci.1 \
 		-device ide-hd,drive=sata2,bus=ahci.2 \
 		-drive  id=sata1,file=$(BOOT_IMG),format=raw,if=none \
-		-drive  id=sata2,file=$(DISK_IMG),format=raw,if=none
+		-drive  id=sata2,file=$(DISK_IMG),format=raw,if=none \
+		-audiodev pa,id=snd0 \
+		-device intel-hda -device hda-duplex,audiodev=snd0 \
 
 run_noreboot: $(BOOT_IMG)
 	@qemu-system-x86_64 -enable-kvm -smp 4 -m 512M \

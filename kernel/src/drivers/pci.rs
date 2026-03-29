@@ -7,7 +7,7 @@
 use core::fmt;
 use core::fmt::Display;
 use alloc::vec::Vec;
-
+use crate::util::*;
 #[cfg(feature="debug_pci")]
 macro_rules! dbg {
     ($($arg:tt)*) => {
@@ -79,6 +79,89 @@ impl PCIDevice {
         self.irq_pin    = ((regf >> 8) & 0xFF) as u8;
         self.valid = true;
     }
+
+    pub fn enable_memspace(&self) -> bool {
+         if !self.valid {
+            return false;
+        }
+        let mut cmdsts = PCIBus::pci_read(self.bus_id, self.slot_id,
+                                        self.func_id, PCIBus::REG_COMMAND);
+        cmdsts |= 0x2; // MEM Space Enable
+        PCIBus::pci_write(self.bus_id, self.slot_id, self.func_id,
+                            PCIBus::REG_COMMAND, cmdsts);
+        true
+    }
+
+    pub fn disable_memspace(&self) -> bool {
+        if !self.valid {
+            return false;
+        }
+        let mut cmdsts = PCIBus::pci_read(self.bus_id, self.slot_id,
+                                        self.func_id, PCIBus::REG_COMMAND);
+        cmdsts &= !0x2; // MEM Space Disable
+        PCIBus::pci_write(self.bus_id, self.slot_id, self.func_id,
+                            PCIBus::REG_COMMAND, cmdsts);
+        true
+    }
+
+    pub fn enable_bus_master(&self) -> bool {
+        if !self.valid {
+            return false;
+        }
+        let mut cmd = PCIBus::pci_read(self.bus_id, self.slot_id, self.func_id,
+                                        PCIBus::REG_COMMAND);
+        cmd |= 0x4; // Bus Master Enable
+        PCIBus::pci_write(self.bus_id, self.slot_id, self.func_id,
+                            PCIBus::REG_COMMAND, cmd);
+        true
+    }
+
+    pub fn get_command(&self) -> Option<u16> {
+        if !self.valid {
+            return None;
+        }
+        Some((PCIBus::pci_read(self.bus_id, self.slot_id, self.func_id,
+                            PCIBus::REG_COMMAND) & 0xFFFF) as u16)
+    }
+    pub fn get_status(&self) -> Option<u16> {
+        if !self.valid {
+            return None;
+        }
+        Some((PCIBus::pci_read(self.bus_id, self.slot_id, self.func_id,
+                            PCIBus::REG_COMMAND) >> 16) as u16)
+    }
+    pub fn get_bar_address(&self, bar_index: usize) -> Option<(usize, usize)> {
+        if bar_index >= 6 {
+            return None;
+        }
+        let bar_val = self.bar[bar_index];
+        if bar_val == 0 {
+            return None; // Not implemented
+        }
+        if (bar_val & 0x1) == 0 {
+            // To determine the amount of address space needed by a PCI device,
+            // you must save the original value of the BAR, write a value of all
+            // 1's to the register, then read it back. The amount of memory can
+            // then be determined by masking the information bits, performing a
+            // bitwise NOT, and incrementing the value by 1
+            // 1) Save the base address of the bar:
+            let base_addr = (bar_val & 0xFFFFFFF0) as usize;
+            // 2) Write all 1's to the BAR:
+            PCIBus::pci_write(self.bus_id, self.slot_id, self.func_id,
+                        PCIBus::REG_BAR0 + bar_index as u8 * 4, 0xFFFFFFFF);
+            // 3) Read the value back:
+            let size_mask = PCIBus::pci_read(self.bus_id, self.slot_id, self.func_id,
+                        PCIBus::REG_BAR0 + bar_index as u8 * 4) & 0xFFFFFFF0;
+            // 4) Restore the original value:
+            PCIBus::pci_write(self.bus_id, self.slot_id, self.func_id,
+                        PCIBus::REG_BAR0 + bar_index as u8 * 4, bar_val);
+            // 5) Calculate the size:
+            let size = (!size_mask + 1) as usize;
+            Some((base_addr, size))
+        } else {
+            None // I/O-mapped BAR
+        }
+    }
 }
 
 impl Display for PCIDevice {
@@ -114,11 +197,14 @@ impl PCIBus {
     const ADDR_BUS_LSHIFT:  u32 = 16;
     const ADDR_SLOT_LSHIFT: u32 = 11;
     const ADDR_FUNC_LSHIFT: u32 = 8;
+    // Register Offset has to point to consecutive DWORDs, ie. bits 1:0 are 0b00
     const ADDR_REG_MASK:    u32 = 0xFC;
 
     const SLOT_NOT_EXISTS:  u16 = 0xFFFF; /* Sepcial VendorID */
     const REG_VENDOR:       u8 = 0; 
     const REG_DEVICE_ID:    u8 = 2;
+    const REG_COMMAND:      u8 = 4;
+    const REG_STATUS:       u8 = 6;
     const REG_REVISION_ID:  u8 = 8;
     const REG_PROG_IF:      u8 = 9;
     const REG_SUBCLASS:     u8 = 10;

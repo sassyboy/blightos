@@ -7,6 +7,9 @@
 /// Only one framebuffer per machine. No multiple screen support
 /// 
 
+use core::mem::size_of;
+use core::cmp::min;
+use alloc::{format, slice};
 use alloc::string::String;
 use crate::fs::{FileOperation, MountPoint};
 use crate::drivers::storage::IOCompletion;
@@ -197,13 +200,21 @@ impl FrameBuffer {
 	// VFS Interface
 	//
 	// Read: Returns the framebuffer information as string
-	// Write: Directly writes pixels into the framebuffer
+	// Write: Nout supported
 	// Exec: See FUNC_ constants below
 	//
 	pub const DEV_HANDLE_DEFAULT:       usize = 1;
-	pub const FUNC_CLEAN_SCREEN:		usize = 1;
-	pub const FUNC_SET_PIXEL:			usize = 2;
-	pub const FUNC_PUT_CHAR:			usize = 3;
+	// Returns the framebuffer information as a FrameBufferInfo struct
+	pub const FUNC_GET_INFO:         	usize = 1;
+	// Saves the current framebuffer content into a buffer provided by
+	// user-space. The buffer should be large enough to hold the entire
+	// framebuffer content (pitch * height * bpp/8 bytes).
+	pub const FUNC_SAVE_FRAME:	 		usize = 2;
+	pub const FUNC_RESTORE_FRAME: 		usize = 3;
+	// Updates a rectangular region of the framebuffer with pixel data provided
+	// by user-space. The user-space buffer should contain pixel data for the
+	// specified rectangle (width * height * bpp/8 bytes).
+	pub const FUNC_UPDATE_RECT: 		usize = 4;
 	fn fops_handler(op: FileOperation) -> IOCompletion {
         match op {
             FileOperation::Open { path }                 => {
@@ -222,39 +233,223 @@ impl FrameBuffer {
                 }
                 return  IOCompletion::InvalidHandle;
             },
-            FileOperation::Read { hnd : _, off: _, buff: _ }          => {
-                return IOCompletion::InvalidOp;
+            FileOperation::Read { hnd, off, buff } 	=> {
+                return Self::fread(hnd, off, buff);
             },
-			FileOperation::Exec { hnd, func, buff: _ }         => {
+			FileOperation::Exec { hnd, func, buff }         	=> {
                 if hnd != Self::DEV_HANDLE_DEFAULT {
                     return  IOCompletion::InvalidHandle;
                 }
                 match func {
-                    Self::FUNC_CLEAN_SCREEN           => {
-                        return IOCompletion::InvalidOp;
+                    Self::FUNC_GET_INFO           => {
+                        return Self::fexec_get_info(hnd, buff);
                     },
-                    Self::FUNC_SET_PIXEL => {
-                        return IOCompletion::InvalidOp;
+                    Self::FUNC_SAVE_FRAME => {
+                        return Self::fexec_save_frame(hnd, buff);
                     },
-					Self::FUNC_PUT_CHAR => {
-                        return IOCompletion::InvalidOp;
-                    },
+					Self::FUNC_RESTORE_FRAME => {
+						return Self::fexec_restore_frame(hnd, buff);
+					},
+					Self::FUNC_UPDATE_RECT => {
+						return Self::fexec_update_rect(hnd, buff);
+					},
                     _       => {
                         return  IOCompletion::InvalidOp;
                     }
                 }
             },
-			FileOperation::Write { hnd : _, off: _, buff: _ }	=> {
-				return  IOCompletion::InvalidOp;
-			},
             _                                               => {
                 return IOCompletion::InvalidOp;
             }
         }
     }
 
+	fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> IOCompletion {
+		let fb = DEFAULT_FB.lock();
+		if !fb.enabled {
+			return IOCompletion::IOError
+		}
+        if hnd == Self::DEV_HANDLE_DEFAULT {
+            let out = format!(
+                "Width : {}\n\
+                 Height: {}\n\
+				 BPP   : {}\n\
+				 Pitch : {}",
+                fb.width, fb.height, fb.bpp, fb.pitch
+            );
+            let len = min(out[off..].len(), buff.len());
+            let ptr = out[off..].as_ptr();
+            unsafe {
+                buff[0..len].copy_from_slice(slice::from_raw_parts(ptr, len));
+            }
+            return IOCompletion::Successful(len);
+        }
+        IOCompletion::InvalidOp
+    }
+
+	fn fexec_get_info(hnd: usize, buff: &mut [u8]) -> IOCompletion {
+		let fb = DEFAULT_FB.lock();
+		if !fb.enabled {
+			return IOCompletion::IOError
+		}
+		if hnd == Self::DEV_HANDLE_DEFAULT {
+			if buff.len() < size_of::<FrameBufferInfo>() {
+				return IOCompletion::InvalidBuffer;
+			}
+			let info = FrameBufferInfo {
+				height: fb.height,
+				width:  fb.width,
+				bpp:    fb.bpp as u8,
+				pitch:  fb.pitch
+			};
+			let ptr = &info as *const FrameBufferInfo as *const u8;
+			unsafe {
+				buff[0..size_of::<FrameBufferInfo>()].copy_from_slice(
+					slice::from_raw_parts(ptr, size_of::<FrameBufferInfo>()));
+			}
+			return IOCompletion::Successful(size_of::<FrameBufferInfo>());
+		}
+		IOCompletion::InvalidOp
+	}
+
+	fn fexec_save_frame(hnd: usize, buff: &mut [u8]) -> IOCompletion {
+		if hnd != Self::DEV_HANDLE_DEFAULT {
+			return IOCompletion::InvalidHandle;
+		}
+		let fb = DEFAULT_FB.lock();
+		if !fb.enabled {
+			return IOCompletion::IOError
+		}
+
+		let frame_size = (fb.pitch * fb.height) as usize;
+		if buff.len() < frame_size {
+			return IOCompletion::InvalidBuffer;
+		}
+
+		unsafe {
+			let src = fb.base_address as *const u8;
+			let dst = buff.as_mut_ptr() as *mut u8;
+			core::ptr::copy_nonoverlapping(src, dst, frame_size);
+		}
+		IOCompletion::Successful(frame_size)
+	}
+
+	fn fexec_restore_frame(hnd: usize, buff: &mut [u8]) -> IOCompletion {
+		if hnd != Self::DEV_HANDLE_DEFAULT {
+			return IOCompletion::InvalidHandle;
+		}
+		let fb = DEFAULT_FB.lock();
+		if !fb.enabled {
+			return IOCompletion::IOError
+		}
+
+		let frame_size = (fb.pitch * fb.height) as usize;
+		if buff.len() < frame_size {
+			return IOCompletion::InvalidBuffer;
+		}
+
+		unsafe {
+			let src = buff.as_ptr() as *const u8;
+			let dst = fb.base_address as *mut u8;
+			core::ptr::copy_nonoverlapping(src, dst, frame_size);
+		}
+		IOCompletion::Successful(frame_size)
+	}
+
+	fn fexec_update_rect(hnd: usize, buff: &mut [u8]) -> IOCompletion {
+		if hnd != Self::DEV_HANDLE_DEFAULT {
+			return IOCompletion::InvalidHandle;
+		}
+		if buff.len() < size_of::<FrameBufferUpdateRectArgs>() {
+			return IOCompletion::InvalidBuffer;
+		}
+		let args = unsafe {
+			(buff.as_ptr() as *const FrameBufferUpdateRectArgs).read()
+		};
+		let rect = args.rect;
+		let buffer_base = args.buffer_base;
+		let buffer_size = args.buffer_size;
+		let flags = args.flags;
+
+		let mut fb = DEFAULT_FB.lock();
+		if !fb.enabled {
+			return IOCompletion::IOError
+		}
+
+		if buffer_size < (rect.height * rect.width * (fb.bpp / 8) as u32) {
+			return IOCompletion::InvalidBuffer;
+		}
+
+		let pixel_data = unsafe {
+			slice::from_raw_parts(buffer_base as *const u8, buffer_size as usize)
+		};
+
+		for r in 0..rect.height {
+			for c in 0..rect.width {
+				let idx;
+				if flags & FrameBufferUpdateRectArgs::FLAG_FULL_FRAME > 0 {
+					// The input buffer contains a full frame.
+					// We should calculate the pixel position based on the
+					// rectangle's position within the framebuffer.
+					let row = rect.row + r;
+					let col = rect.col + c;
+					if row < fb.height && col < fb.width {
+						idx = ((row * fb.pitch + col * (fb.bpp as u32 / 8)) as usize) as usize;
+					} else {
+						continue; // Skip out-of-bounds pixels
+					}
+				} else {
+					// The input buffer contains only the pixel data for the
+					// specified rectangle.
+					idx = ((r * rect.width + c) * 4) as usize;
+				}
+				if idx + 3 >= pixel_data.len() {
+					return IOCompletion::InvalidBuffer;
+				}
+				let rgb = (
+					pixel_data[idx],
+					pixel_data[idx + 1],
+					pixel_data[idx + 2]
+				);
+				fb.set_pixel_locked(rect.row + r, rect.col + c, rgb);
+			}
+		}
+
+		return IOCompletion::Successful(0);
+	}
 }
 
+//
+// VFS Function Structures
+//
+#[repr(C, packed)]
+pub struct FrameBufferInfo {
+	pub height: u32,
+	pub width: 	u32,
+	pub bpp: 	u8,
+	pub pitch: 	u32
+}
+#[repr(C, packed)]
+pub struct FrameBufferRect {
+	pub row: 	u32,
+	pub col: 	u32,
+	pub height: u32,
+	pub width: 	u32
+}
+#[repr(C, packed)]
+pub struct FrameBufferUpdateRectArgs {
+	pub rect: 			FrameBufferRect,
+	// User-buffer address containing pixel data (bpp-bytes) for the specified
+	// rectangle.
+	pub buffer_base: 	usize,
+	pub buffer_size: 	u32,
+	// Flags: Whether the buffer is a full framebuffer dump or just the updated
+	// rectangle. This can help the driver optimize the update process.
+	pub flags: 			u32
+}
+impl FrameBufferUpdateRectArgs {
+	pub const FLAG_FULL_FRAME: u32 = 1;
+}
 //
 // BITMAP OF ASCII CHARACTERS TO DRAW IN RGB VGA MODE
 //

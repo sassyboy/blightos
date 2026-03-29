@@ -12,6 +12,9 @@ use rtlib::task::*;
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 use rtlib::heap::Malloc;
+use rtlib::graphics::framebuffer::*;
+use rtlib::graphics::png::PngImage;
+use rtlib::audio::{Playback, beeper::*, wav::*};
 
 #[no_mangle]
 extern "C" 
@@ -70,7 +73,8 @@ fn main() {
         Task::sleep(core::time::Duration::from_millis(100));
     }
     Task::join(task_c.unwrap().tid);
-    
+
+
     println!("\n[Test 4] Heap test 1: 2MBs of small allocations");
     rtlib::heap::Malloc::init();
     let alloc_size = 64;
@@ -104,6 +108,52 @@ fn main() {
     println!("Physical memory after deallocations:");
     txt_dump("machine:/ram");
 
+    println!("Press Enter to continue...");
+    while stdio_read_byte() != b'\n' {}
+    stdio_clear_screen();
+
+    // Test framebuffer access
+    println!("\n[Test 5] Framebuffer Access Test:");
+    if let Some(mut fb) = Framebuffer::new() {
+        // Backup the current framebuffer content 
+        println!("Saving the current framebuffer content...");
+        if fb.save_frame() {
+            println!("Framebuffer content saved successfully.");
+            // Spawn a new task to draw a pattern on the framebuffer
+            let _fb_task = Task::spawn(framebuff_test, 0, "FrameBufferTest");
+            // Wait for a while to let the user see the pattern
+            Task::join(_fb_task.unwrap().tid);
+            // Restore the original framebuffer content before exiting
+            println!("Restoring the original framebuffer content...");
+            fb.restore_frame();
+            println!("Framebuffer content restored to original state.");
+        } else {
+            println!("Failed to save the framebuffer content.");
+        }
+    } else {
+        println!("Failed to access the framebuffer.");
+    }
+
+    // PNG Loading test
+    println!("\n[Test 6] PNG Loading Test:");
+    if let Some(mut fb) = Framebuffer::new() {
+        png_test(&mut fb, "disk1.0:/blightos/res/test.png",  300 , 0);
+        png_test(&mut fb, "disk1.0:/blightos/res/testp.png", 300, 300);
+        png_test(&mut fb, "disk1.0:/blightos/res/testa.png", 300, 600);
+    } else {
+        println!("Failed to access the framebuffer.");
+    }
+
+    println!("Press Enter to continue...");
+    while stdio_read_byte() != b'\n' {}
+    stdio_clear_screen();
+
+    // Audio Playback test
+    println!("\n[Test 7] Audio Playback Test:");
+    beeper_test(50, 4);
+    wav_audio_test("disk1.0:/blightos/res/sfx/click.wav");
+
+    // All tests done
     println!("\nAll tests completed.");
     proc.get_info();
     println!("{:X?}", proc);
@@ -130,4 +180,152 @@ fn txt_dump(path: &str) {
     }
 }
 
+fn framebuff_test(_arg: usize) {
+    if let Some(mut fb) = Framebuffer::new() {
+        // Draw a simple pattern on the framebuffer
+        for row in 100..200 {
+            for col in 100..200 {
+                let color = if (row / 10 + col / 10) % 2 == 0 {
+                    (255, 0, 0) // Red
+                } else {
+                    (0, 0, 255) // Blue
+                };
+                fb.set_pixel(row, col, color);
+            }
+        }
+        fb.update();
+        println!("Framebuffer Info - Width: {}, Height: {}, BPP: {}, Pitch: {}",
+                    fb.width, fb.height, fb.bpp, fb.pitch);
+        println!("Framebuffer pattern drawn. Check the display output. \
+                    Press Enter to continue...");
+        while stdio_read_byte() != b'\n' {}
+    } else {
+        println!("Failed to access the framebuffer.");
+    }
+}
 
+fn png_test(fb: &mut Framebuffer, path: &str, y: u32, x: u32) {
+    match PngImage::from_path(path) {
+        Ok(mut png) => {
+            println!("Loaded PNG image successfully: {}x{}, color type: {:?}",
+                        png.img.width, png.img.height, png.img.color_type);
+            match png.decode() {
+                Ok(image) => {
+                    let mut idx = 0;
+                    for row in 0..png.img.height {
+                        for col in 0..png.img.width {
+                            let r = image[idx].0;
+                            let g = image[idx].1;
+                            let b = image[idx].2;
+                            let a = image[idx].3;
+                            if a == 0xFF {
+                                fb.set_pixel(row + y, col + x, (r, g, b));
+                            }
+                            idx += 1;
+                        }
+                        fb.update();
+                    }
+                    
+                },
+                Err(e) => {
+                    println!("Failed to get PNG frame: code {}, message: {}",
+                                e.code as usize, e.message);
+                }
+            }
+        },
+        Err(e) => {
+            println!("Failed to load PNG image: code {}, message: {}",
+                        e.code as usize, e.message);
+        }
+    }
+}
+
+fn beeper_test(ms: u32, oct: u8) {
+    let gen = WaveformGenerator::new();
+    let mut playback = Playback::new();
+
+    let capacity = playback.duration_to_bytes(ms * 7); // 7 notes, ms each
+    let mut pcm : Vec<u8> = Vec::with_capacity(capacity);
+
+    // TODO - ENABLE FPU and SIMD
+    println!("Sine wave test - Press Enter to start...");
+    while stdio_read_byte() != b'\n' {}
+    pcm.append(&mut gen.generate(Note::C, oct, ms, Waveform::Sine));
+    pcm.append(&mut gen.generate(Note::D, oct, ms, Waveform::Sine));
+    pcm.append(&mut gen.generate(Note::E, oct, ms, Waveform::Sine));
+    pcm.append(&mut gen.generate(Note::F, oct, ms, Waveform::Sine));
+    pcm.append(&mut gen.generate(Note::G, oct, ms, Waveform::Sine));
+    pcm.append(&mut gen.generate(Note::A, oct, ms, Waveform::Sine));
+    pcm.append(&mut gen.generate(Note::B, oct, ms, Waveform::Sine));
+    if let Err(e) = playback.play(pcm.as_slice(), true) {
+        println!("Failed to play audio: code {}, message: {}",
+                    e.code as usize, e.message);
+    }
+    pcm.clear();
+
+    println!("Square wave test - Press Enter to start...");
+    while stdio_read_byte() != b'\n' {}
+    pcm.append(&mut gen.generate(Note::C, oct, ms, Waveform::Square));
+    pcm.append(&mut gen.generate(Note::D, oct, ms, Waveform::Square));
+    pcm.append(&mut gen.generate(Note::E, oct, ms, Waveform::Square));
+    pcm.append(&mut gen.generate(Note::F, oct, ms, Waveform::Square));
+    pcm.append(&mut gen.generate(Note::G, oct, ms, Waveform::Square));
+    pcm.append(&mut gen.generate(Note::A, oct, ms, Waveform::Square));
+    pcm.append(&mut gen.generate(Note::B, oct, ms, Waveform::Square));
+    if let Err(e) = playback.play(pcm.as_slice(), true) {
+        println!("Failed to play audio: code {}, message: {}",
+                    e.code as usize, e.message);
+    }
+    pcm.clear();
+
+    println!("Triangle wave test - Press Enter to start...");
+    while stdio_read_byte() != b'\n' {}
+    pcm.append(&mut gen.generate(Note::C, oct, ms, Waveform::Triangle));
+    pcm.append(&mut gen.generate(Note::D, oct, ms, Waveform::Triangle));
+    pcm.append(&mut gen.generate(Note::E, oct, ms, Waveform::Triangle));
+    pcm.append(&mut gen.generate(Note::F, oct, ms, Waveform::Triangle));
+    pcm.append(&mut gen.generate(Note::G, oct, ms, Waveform::Triangle));
+    pcm.append(&mut gen.generate(Note::A, oct, ms, Waveform::Triangle));
+    pcm.append(&mut gen.generate(Note::B, oct, ms, Waveform::Triangle));
+    if let Err(e) = playback.play(pcm.as_slice(), true) {
+        println!("Failed to play audio: code {}, message: {}",
+                    e.code as usize, e.message);
+    }
+    pcm.clear();
+
+    println!("Sawtooth wave test - Press Enter to start...");
+    while stdio_read_byte() != b'\n' {}
+    pcm.append(&mut gen.generate(Note::C, oct, ms, Waveform::Sawtooth));
+    pcm.append(&mut gen.generate(Note::D, oct, ms, Waveform::Sawtooth));
+    pcm.append(&mut gen.generate(Note::E, oct, ms, Waveform::Sawtooth));
+    pcm.append(&mut gen.generate(Note::F, oct, ms, Waveform::Sawtooth));
+    pcm.append(&mut gen.generate(Note::G, oct, ms, Waveform::Sawtooth));
+    pcm.append(&mut gen.generate(Note::A, oct, ms, Waveform::Sawtooth));
+    pcm.append(&mut gen.generate(Note::B, oct, ms, Waveform::Sawtooth));
+    if let Err(e) = playback.play(pcm.as_slice(), true) {
+        println!("Failed to play audio: code {}, message: {}",
+                    e.code as usize, e.message);
+    }
+    
+}
+
+fn wav_audio_test(path: &str) {
+    println!("WAV audio test - Press Enter to start...");
+    while stdio_read_byte() != b'\n' {}
+    match WaveAudio::from_path(path) {
+        Ok(wav) => {
+            println!("Loaded WAV audio successfully: {} channels, {} bit depth, \
+                        byte rate: {}, sample count: {}",
+                        wav.channels, wav.bit_depth, wav.byte_rate, wav.sample_count);
+            let mut playback = Playback::new();
+            if let Err(e) = playback.play(&wav.data, true) {
+                println!("Failed to play audio: code {}, message: {}",
+                            e.code as usize, e.message);
+            }
+        },
+        Err(e) => {
+            println!("Failed to load WAV audio: code {}, message: {}",
+                        e.code as usize, e.message);
+        }
+    }
+}

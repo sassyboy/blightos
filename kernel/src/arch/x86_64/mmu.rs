@@ -344,6 +344,9 @@ impl MMUMapping {
     /*
      * DMA
      */
+    /// Converts a physical address in the kernel's address space to a virtual
+    /// address in the kernel's address space that can be used for DMA
+    /// operations by the software.
     pub fn dma_from_kernel_phys(phys_addr: usize) -> usize{
         phys_addr | ((1 as usize) << 32)
     }

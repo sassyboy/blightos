@@ -69,8 +69,9 @@
 //      object offset = bit_index * AU (AU = au_index * 64 bytes) and clear that
 //      bit to mark allocation.
 // 6) If clearing that bit makes the descriptor full (au_bitmap == 0), decrement
-//      the page's free_desc_count (low byte of next) and, if more free descriptors
-//      remain, scan descriptors in the page to update free_desc_index.
+//      the page's free_desc_count (low byte of next) and, if more free
+//      descriptors remain, scan descriptors in the page to update
+//      free_desc_index.
 //
 // Free flow (small requests)
 // - Given a pointer, the allocator scans descriptor pages for the AU class and
@@ -100,8 +101,8 @@
 // Concurrency & invariants
 // - KALLOC_ROOT is protected by a Spinlock during alloc/free entry points to
 //     synchronize access to the root pointers and to ensure safe traversal /
-//     insertion of descriptor pages. Descriptor pages and cluster descriptors are
-//     accessed and mutated under that lock in the current design.
+//     insertion of descriptor pages. Descriptor pages and cluster descriptors
+//     are accessed and mutated under that lock in the current design.
 // - Descriptor pages are page-aligned, permitting the multiplexing of pointer
 //     and small metadata into prev/next fields by using the low byte.
 //
@@ -114,9 +115,9 @@
 // Notes and complexity
 // - Allocation for small objects is fast: it avoids per-object metadata by
 //     using bitmaps and uses per-page hints (free_desc_index/count) to avoid
-//     scanning all descriptors on every allocation. When a page becomes full, a
-//     scan of up to 255 descriptors is performed to find the next free
-//     descriptor.
+//     scanning all descriptors on every allocation. When a cluster gets fully
+//     allocated, a scan of up to 255 descriptors is performed to find the next
+//     free descriptor in the cluster descriptor page.
 // - Free requires a search for the descriptor that owns the pointer; worst-case
 //     cost is linear in number of descriptor pages * 255 descriptors (but pages
 //     without allocated clusters are skipped early by base_addr==0 checks).

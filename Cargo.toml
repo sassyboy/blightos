@@ -5,7 +5,8 @@ members = [
     "programs/rtlib",
     "programs/shell",
     "programs/test",
-    "programs/fileman"
+    "programs/fileman",
+    "programs/tetris"
 ]
 
 [profile.release]

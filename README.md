@@ -39,12 +39,18 @@ any combination of components. Available debug options are:
     - Graphics (minimal fb support + built-in bmp font):
         - x86_64: Basic VESA Graphics
         - Aarch64: Broadcom VideoCore IV (BCM2835)
+    - Audio (Intel HDA):
+        - Dual buffering for single stream of stereo audio @ 48KHz, 16bps
     - Basic i8046 PS/2 Keyboard driver
     - AHCI (SATA) Bus Controller (Read-only)
     - eMMC (SDCard) Controller (Read-only)
     - FAT12/16/32 File System Driver (Read-only)
 - User-space runtime library
     - Basic stdio,fileio and syscall wrappers
+    - FF Heap allocator (explicit free-list + coalescing)
+    - ZLIB decoder
+    - PNG file loader
+    - WAV file loader and Waveform/Note generator
 
 ---
 ## Screenshot

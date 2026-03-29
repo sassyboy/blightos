@@ -83,6 +83,8 @@ KERN_RST_SRC= \
 		src/drivers/storage/mod.rs \
 		src/drivers/storage/ahci.rs \
 		src/drivers/storage/emmc.rs \
+		src/drivers/audio/mod.rs \
+		src/drivers/audio/intel_hda.rs \
 		src/drivers/video/mod.rs \
 		src/drivers/video/framebuffer.rs
 

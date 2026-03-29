@@ -787,7 +787,7 @@ fn syscall_enum(fd: usize, buf: usize, buf_len: usize, ret_ptr: usize) {
 }
 
 
-fn syscall_write(fd: usize, buf: usize, len: usize, _ret_ptr: usize) {
+fn syscall_write(fd: usize, buf: usize, len: usize, ret_ptr: usize) {
     if fd == SyscallRsvdFDs::StandardIO as usize {
         // Standard output - VGA console
         unsafe {
@@ -795,6 +795,34 @@ fn syscall_write(fd: usize, buf: usize, len: usize, _ret_ptr: usize) {
                         core::slice::from_raw_parts(buf as *const u8, len));
             
         }
+        return;
+    }
+    // Normal File Write
+    let pid = Task::current_pid();
+    if let Some(mut fd_obj) = AddressSpace::get_fd(pid, fd) {
+        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
+            unsafe {
+                let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
+                let ioc = mnt.fwrite(fd_obj.fs_handle, fd_obj.write_off, out);
+                let ret_val;
+                if let IOCompletion::Successful(len) = ioc {
+                    fd_obj.write_off += len;
+                    AddressSpace::update_fd(pid, fd, &fd_obj);
+                    ret_val = len;
+                } else {
+                    ret_val = 0;
+                }
+                copy_to_user(ret_ptr, ret_val);
+            }
+        } else {
+            // Invalid Mount Point
+            dbg!("WRITE syscall failed due to invalid Mount Point {}\n", fd);
+            copy_to_user(ret_ptr, 0 as usize);
+        }
+    } else {
+        // Invalid FD
+        dbg!("WRITE syscall failed due to invalid FD {}\n", fd);
+        copy_to_user(ret_ptr, 0 as usize);
     }
     
 }
