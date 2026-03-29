@@ -198,6 +198,9 @@ impl FirstFitHeap {
 
     /// Initialize heap. Call once before allocation.
     fn init(&mut self) {
+        if self.heap_size != 0 {
+            return; // already initialized
+        }
         // Request initial heap memory from kernel via syscall
         if let Some(args) = self.resize_heap(Self::INIT_HEAP_SIZE as isize) {
             self.heap_base = args.heap_base;

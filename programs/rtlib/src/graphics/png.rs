@@ -53,7 +53,7 @@
 
 use crate::{Exception, ErrorCode};
 use crate::graphics::*;
-use crate::fileio::File;
+use crate::fileio::*;
 use crate::zlib::ZlibDecoder;
 use alloc::{vec, vec::Vec};
 use crate::*;
@@ -106,7 +106,7 @@ impl PngImage {
     // Loads a PNG file from the given path, parses its header, and returns a
     // PngImage with the info filled in.
     // This does not decode the image data or validate the IDAT chunks.
-    pub fn from_path(path: &str) -> Result<Self, Exception> {
+    pub fn from_path(path: &Path) -> Result<Self, Exception> {
         let f = File::from_path(path)?;
 
         // Parse PNG signature and chunks, extract IHDR and collect IDAT

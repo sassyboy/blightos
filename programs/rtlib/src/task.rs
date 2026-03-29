@@ -139,6 +139,7 @@ pub struct Process {
     // The following fields are only populated/update when get_info() is called,
     // and are not guaranteed to be up-to-date at all times.
     pub name:               String,
+    pub cmd_line:           String,
     pub task_count:         usize,
     pub fd_count:           usize,
     pub img_base:           usize,
@@ -169,6 +170,7 @@ impl Process {
             pid:            syscall_args.pid,
             main_tid:       syscall_args.main_tid,
             name:           String::new(),
+            cmd_line:       String::new(),
             task_count:     0,
             fd_count:       0,
             img_base:       0,
@@ -185,6 +187,7 @@ impl Process {
         let mut syscall_args = ProcCtlGetInfoArgs {
             pid:        self.pid,
             name:       [0; 64],
+            cmd_line:   [0; 1024],
             main_tid:   0,
             task_count: 0,
             fd_count:   0,
@@ -210,6 +213,9 @@ impl Process {
         self.name.clear();
         self.name.push_str(str::from_utf8(&syscall_args.name).unwrap()
                                             .trim_end_matches(char::from(0)));
+        self.cmd_line.clear();
+        self.cmd_line.push_str(str::from_utf8(&syscall_args.cmd_line).unwrap()
+                                            .trim_end_matches(char::from(0)));
         self.task_count =       syscall_args.task_count;
         self.fd_count =         syscall_args.fd_count;
         self.img_base =         syscall_args.img_base;
@@ -222,16 +228,16 @@ impl Process {
         true
     }
 
-    pub fn spawn(exec_path: &str) -> Option<Self> {
+    pub fn spawn(cmd_line: &str) -> Option<Self> {
         let mut syscall_args = ProcCtlSpawnArgs {
-            path_ptr: 0,
-            path_len: exec_path.len(),
+            cmd_ptr: 0,
+            cmd_len: cmd_line.len(),
             pid: 0,
             m_tid: 0
         };
         let mut retval: usize = 0;
-        let path_bytes = exec_path.as_bytes();
-        syscall_args.path_ptr = path_bytes.as_ptr() as usize;
+        let cmd_bytes = cmd_line.as_bytes();
+        syscall_args.cmd_ptr = cmd_bytes.as_ptr() as usize;
 
         syscall(Syscall::ProcControl {
             opcode: ProcCtlOpCode::Spawn as usize,
@@ -246,6 +252,7 @@ impl Process {
                 pid:            syscall_args.pid,
                 main_tid:       syscall_args.m_tid,
                 name:           String::new(),
+                cmd_line:       String::new(),
                 task_count:     0,
                 fd_count:       0,
                 img_base:       0,

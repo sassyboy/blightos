@@ -104,6 +104,7 @@ pub struct ProcCtlCurrentArgs{
 pub struct ProcCtlGetInfoArgs {
     pub pid:                usize,
     pub name:               [u8; 64],
+    pub cmd_line:           [u8; 1024],
     pub main_tid:           usize,
     pub task_count:         usize,
     pub fd_count:           usize,
@@ -117,12 +118,8 @@ pub struct ProcCtlGetInfoArgs {
 }
 
 pub struct ProcCtlSpawnArgs {
-    pub path_ptr: usize,// Input: Pointer to the path string in user-space
-    pub path_len: usize,// Input: Length of the path string
-    // pub cmd_ptr: usize, // Input: Pointer to the command buffer in user-space (optional)
-    // pub cmd_len: usize, // Input: Length of the command buffer (optional)
-    // pub env_ptr: usize, // Input: Pointer to the environment variables buffer in user-space (optional)
-    // pub env_len: usize, // Input: Length of the environment variables buffer (optional)
+    pub cmd_ptr: usize, // Input: Pointer to the cmd-line string in user-space
+    pub cmd_len: usize, // Input: Length of the cmd-line string
     pub pid:    usize,  // Output
     pub m_tid:  usize,  // Output TID of the main task
 }

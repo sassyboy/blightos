@@ -203,30 +203,37 @@ fn kinit_task(_arg: usize) {
     for d in 0..ndisks {
         let path = format!("disk{}.0:/blightos/shell.box", d);
         // Open the file (if exists)
-        if let Some(mnt) = MountPoint::from_path(path.as_str()) {
-            let fopen_ret = mnt.fopen(path.as_str());
-            if let drivers::storage::IOCompletion::Successful(hnd) = fopen_ret {
-                dbg!("  Found INIT program at {} on disk {} (hnd {})\
-                        (Free frames: {})\n", 
-                        path, d, hnd, crate::mem::phys::pmm_num_free_frames());
-                if let Some(elf) = ELFBinary::from_file(mnt.clone(), hnd) {
-                    // elf.log_header();
-                    // klog!("Segments:\n");
-                    // for i in 0..elf.segments.len() {
-                    //     klog!("  {:X?}\n", elf.segments[i]);
-                    // }
-                    if let Some(pid) = AddressSpace::spawn_from_elf(&elf, "shell.box".to_string()) {
-                        dbg!("  Launching the INIT user-space process.. {}({}) \
-                                (Free frames: {})\n",
-                                Task::name(), Task::current_tid(),
-                                crate::mem::phys::pmm_num_free_frames());
-                        Keyboard::clear_buffer();
-                        AddressSpace::launch_as_main(pid);
-                    }
-                }
-                // ELFBinary goes out of scope and releases closes the file
-            }
-        }
+        let Some(mnt) = MountPoint::from_path(path.as_str()) else {
+            // Invalid mount point - try the next disk
+            continue;
+        };
+        let fopen_ret = mnt.fopen(path.as_str());
+        let drivers::storage::IOCompletion::Successful(hnd) = fopen_ret else {
+            // File not found - try the next disk
+            continue;
+        };
+        dbg!("  Found INIT program at {} on disk {} - Free frames: {}\n", 
+                path, d, crate::mem::phys::pmm_num_free_frames());
+        let Some(elf) = ELFBinary::from_file(mnt.clone(), hnd) else {
+            // Invalid ELF file - try the next disk
+            continue;
+        };
+        // elf.log_header();
+        // klog!("Segments:\n");
+        // for i in 0..elf.segments.len() {
+        //     klog!("  {:X?}\n", elf.segments[i]);
+        // }
+        let pname = "shell.box".to_string();
+        let Some(pid) = AddressSpace::spawn_from_elf(&elf, pname, path) else {
+            // Failed to spawn the process from the ELF file - Panic
+            panic!("Failed to spawn the INIT process from the ELF file!");
+        };
+        dbg!("  Launching the INIT process.. {}({}) - Free frames: {}\n",
+                Task::name(), Task::current_tid(),
+                crate::mem::phys::pmm_num_free_frames());
+        Keyboard::clear_buffer();
+        AddressSpace::launch_as_main(pid);
+        // ELFBinary goes out of scope and releases closes the file        
     }
     panic!("/blightos/shell.box not found on any supported disk partition!");
     
@@ -484,6 +491,7 @@ pub struct ProcCtlCurrentArgs{
 pub struct ProcCtlGetInfoArgs {
     pub pid:                usize,
     pub name:               [u8; 64],
+    pub cmd_line:           [u8; 1024],
     pub main_tid:           usize,
     pub task_count:         usize,
     pub fd_count:           usize,
@@ -497,12 +505,8 @@ pub struct ProcCtlGetInfoArgs {
 }
 
 pub struct ProcCtlSpawnArgs {
-    pub path_ptr: usize,// Input: Pointer to the path string in user-space
-    pub path_len: usize,// Input: Length of the path string
-    // pub cmd_ptr: usize, // Input: Pointer to the command buffer in user-space (optional)
-    // pub cmd_len: usize, // Input: Length of the command buffer (optional)
-    // pub env_ptr: usize, // Input: Pointer to the environment variables buffer in user-space (optional)
-    // pub env_len: usize, // Input: Length of the environment variables buffer (optional)
+    pub cmd_ptr: usize,// Input: Pointer to the cmd-line string in user-space
+    pub cmd_len: usize,// Input: Length of the cmd-line string
     pub pid:    usize,  // Output
     pub m_tid:  usize,  // Output TID of the main task
 }
@@ -563,55 +567,73 @@ fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
         //
         // SPAWN
         //
-        if let Some(mut info) = copy_from_user::<ProcCtlSpawnArgs>(args) {
-            let path;
-            if info.path_ptr == 0 || info.path_len == 0 {
-                // Invalid path
-                copy_to_user(ret_ptr, 0);
-                return;
-            } else {
-                let path_bytes = unsafe {
-                    core::slice::from_raw_parts(info.path_ptr as *const u8, 
-                                                info.path_len)
-                };
-                path = str::from_utf8(path_bytes).unwrap_or("");
-                if path.len() == 0 {
-                    // Invalid path string
-                    copy_to_user(ret_ptr, 0);
-                    return;
-                }
-            }
-            // Valid arguments - Perform the spawn and return the PID back
-            if let Some(mnt) = MountPoint::from_path(path) {
-                let pname = match path.rfind('/') {
-                    Some(idx) => &path[idx + 1..],
-                    None => path
-                };
-                let fopen_ret = mnt.fopen(path);
-                if let IOCompletion::Successful(hnd) = fopen_ret {
-                    if let Some(elf) = ELFBinary::from_file(mnt.clone(), hnd) {
-                        if let Some(pid) = AddressSpace::spawn_from_elf(&elf, pname.to_string()) {
-                            dbg!("  Launching user-space process.. {}({}) \
-                                    (Free frames: {})\n",
-                                Task::name(), Task::current_tid(),
-                                crate::mem::phys::pmm_num_free_frames()
-                            );
-                            // Spawn a main task
-                            info.m_tid = Task::spawn_named(
-                                kuser_proc_launcher, pid,
-                                format!("P[{}].main", pid).to_string());
-                            info.pid = pid;
-                            // Return the PID back to the caller
-                            copy_to_user(args, info);
-                            copy_to_user(ret_ptr, size_of::<ProcCtlSpawnArgs>());
-                            return; // Success
-                        }
-                    }
-                }
-            }
+        let Some(mut info) = copy_from_user::<ProcCtlSpawnArgs>(args) else {
+            // Invalid arguments pointer
+            return;
+        };
+        // Extract the ELF path and executable name from the command line string
+        let cmd_line;
+        let path;
+        let pname;
+        if info.cmd_ptr == 0 || info.cmd_len == 0 {
+            // Null/Empty command line
+            copy_to_user(ret_ptr, 0);
+            return;
         }
-        // Something went wrong
-        copy_to_user(ret_ptr, 0);
+        let cmd_bytes = unsafe {
+            core::slice::from_raw_parts(info.cmd_ptr as *const u8, info.cmd_len)
+        };
+        cmd_line = str::from_utf8(cmd_bytes).unwrap_or("");
+        if cmd_line.len() == 0 {
+            // Invalid command line
+            copy_to_user(ret_ptr, 0);
+            return;
+        }
+        path = match cmd_line.find(' ') {
+            Some(idx) => &cmd_line[0..idx],
+            None => cmd_line
+        };
+        pname = match path.rfind('/') {
+            Some(idx) => &path[idx + 1..],
+            None => path
+        };
+        // Get the fops from the mount-point
+        let Some(mnt) = MountPoint::from_path(path) else {
+            // Invalid Mount Point
+            copy_to_user(ret_ptr, 0);
+            return;
+        };
+        // Open the ELF file
+        let fopen_ret = mnt.fopen(path);
+        let IOCompletion::Successful(hnd) = fopen_ret else {
+            // Couldn't open the file
+            copy_to_user(ret_ptr, 0);
+            return;
+        };
+        // Parse the ELF file
+        let Some(elf) = ELFBinary::from_file(mnt.clone(), hnd) else {
+            // Invalid ELF file
+            copy_to_user(ret_ptr, 0);
+            return;
+        };
+        // Spawn a new process address space
+        let Some(pid) = AddressSpace::spawn_from_elf(&elf,
+                                pname.to_string(), cmd_line.to_string()) else {
+            // Failed to spawn the process from the ELF file
+            copy_to_user(ret_ptr, 0);
+            return;
+        };
+        dbg!("  Launching user-space process.. {}({}) - Free frames: {}\n",
+                Task::name(), Task::current_tid(),
+                crate::mem::phys::pmm_num_free_frames());
+        // Spawn the main task of the new process
+        let tname = format!("P[{}].main", pid).to_string();
+        info.m_tid = Task::spawn_named(kuser_proc_launcher, pid, tname);
+        info.pid = pid;
+        // Return the PID back to the caller
+        copy_to_user(args, info);
+        copy_to_user(ret_ptr, size_of::<ProcCtlSpawnArgs>());
+        return; // Success
     } else if opcode == ProcCtlOpCode::ResizeHeap as usize {
         //
         // RESIZE HEAP
@@ -666,7 +688,11 @@ fn syscall_open(path_ptr: usize, path_len: usize, _mode: usize, ret_ptr: usize) 
     unsafe {
         pathb = core::slice::from_raw_parts(path_ptr as *const u8, path_len);
     }
-    let path = str::from_utf8(pathb).unwrap();
+    let Ok(path) = str::from_utf8(pathb) else {
+        // Invalid path string
+        copy_to_user(ret_ptr, 0 as usize);
+        return;
+    };
     if let Some(mnt) = MountPoint::from_path(path) {
         let fopen_ret = mnt.fopen(path);      
         match fopen_ret {

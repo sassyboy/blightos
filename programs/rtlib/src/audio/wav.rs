@@ -40,7 +40,7 @@
 ///
 use alloc::{vec, vec::Vec};
 use crate::{Exception, ErrorCode};
-use crate::fileio::File;
+use crate::fileio::*;
 
 pub struct WaveAudio {
     pub bit_depth:      u16,
@@ -60,7 +60,7 @@ impl WaveAudio {
             data:           Vec::new(),
         }
     }
-    pub fn from_path(path: &str) -> Result<Self, Exception> {
+    pub fn from_path(path: &Path) -> Result<Self, Exception> {
         let file = File::from_path(path)?;
         // Read RIFF header (12 bytes)
         let mut riff_header = [0u8; 12];

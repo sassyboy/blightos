@@ -1,5 +1,6 @@
 RTLIB_RS_SRC= \
 		../rtlib/src/lib.rs \
+		../rtlib/src/env.rs \
 		../rtlib/src/syscall.rs \
 		../rtlib/src/stdio.rs \
 		../rtlib/src/fileio.rs \

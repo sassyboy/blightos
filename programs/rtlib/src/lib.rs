@@ -1,9 +1,14 @@
+//
+// Standard Runtime Library for User Programs
+// Eventually this will be the basis for a Rust-compatible std.
+// 
+
 #![no_std]
-#![cfg(not(test))]
 extern crate alloc; 
 
 pub mod syscall;
 pub mod stdio;
+pub mod env;
 pub mod fileio;
 pub mod task;
 pub mod heap;
@@ -14,6 +19,9 @@ pub mod audio;
 use crate::stdio::*;
 use crate::syscall::*;
 
+///
+/// Error handling
+/// 
 pub enum ErrorCode {
     NotFound        = 1,
     NotAllowed      = 2,
@@ -38,23 +46,16 @@ impl Exception {
     }
 }
 
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => {
-        let mut stdout = ConsoleOut{};
-        let _ = write!(&mut stdout, $($arg)*);
-    };
-}
-
-#[macro_export]
-macro_rules! println {
-    () => {
-        $crate::print!("\n")
-    };
-    ($($arg:tt)*) => {{
-        $crate::print!($($arg)*);
-        $crate::print!("\n");
-    }};
+///
+/// Program entry, exit and panic handling
+///
+#[no_mangle]
+extern "C" fn _main_stub() -> ! {
+    env::init_proc_env();
+    unsafe extern "Rust" {unsafe fn main();}
+    unsafe { main(); }
+    exit(0);
+    loop {}
 }
 
 #[panic_handler]

@@ -7,7 +7,7 @@
 use core::fmt;
 use core::fmt::Display;
 use alloc::vec::Vec;
-use crate::util::*;
+
 #[cfg(feature="debug_pci")]
 macro_rules! dbg {
     ($($arg:tt)*) => {

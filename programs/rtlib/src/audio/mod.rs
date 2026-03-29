@@ -3,7 +3,7 @@
 ///
 use crate::{Exception};
 use crate::task::Task;
-use crate::fileio::File;
+use crate::fileio::*;
 use core::time::Duration;
 
 pub struct AudioFormat {
@@ -53,7 +53,7 @@ impl Playback {
     /// If `sync` is true, this function will block until playback is complete.
     pub fn play(&mut self, data: &[u8], sync: bool) -> Result<(), Exception> {
         if !self.snd.is_open() {
-            self.snd.open("audio:/output/pcm")?;
+            self.snd.open(&Path::from("audio:/output/pcm"))?;
         }
         // Write 1s worth of audio data at a time to avoid overwhelming the
         // output device. Back off for 20ms in between if the `sync` flag is set.

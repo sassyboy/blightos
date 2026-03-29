@@ -3,7 +3,10 @@
 ///
 
 use crate::{Exception, ErrorCode};
+use crate::env::current_dir;
 use crate::syscall::*;
+use alloc::string::String;
+use crate::*;
 
 pub struct File {
     fd: usize,
@@ -17,16 +20,16 @@ impl File {
         }
     }
 
-    pub fn from_path(path: &str) -> Result<Self, Exception> {
-        if let Some(fd) = fopen(path) {
+    pub fn from_path(path: &Path) -> Result<Self, Exception> {
+        if let Some(fd) = fopen(path.as_str()) {
             Ok(Self { fd, open: true })
         } else {
             Err(Exception::new(ErrorCode::NotFound, "Failed to open file"))
         }
     }
 
-    pub fn open(&mut self, path: &str) -> Result<(), Exception> {
-        if let Some(fd) = fopen(path) {
+    pub fn open(&mut self, path: &Path) -> Result<(), Exception> {
+        if let Some(fd) = fopen(path.as_str()) {
             self.fd = fd;
             self.open = true;
             Ok(())
@@ -107,6 +110,84 @@ pub enum FileSeekCursor {
     Read    = 0,
     Write   = 1,
     Both    = 2
+}
+
+pub struct Path {
+    inner: String
+}
+
+impl Path {
+    pub fn from(path: &str) -> Self {
+        let mut p = Self { inner: String::new() };
+        p.make_full_path(path);
+        p
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.inner.as_str()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn exists(&self) -> bool {
+        match fopen(&self.inner) {
+            None        => {
+                false
+            },
+            Some(fd)   => {
+                fclose(fd);
+                true
+            }
+        }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        if !self.inner.is_empty() && self.inner.ends_with('/') {
+            return true;
+        }
+        false
+    }
+
+    //
+    // Helper methods
+    //
+    fn make_full_path(&mut self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let Ok(cur_dir) = current_dir() else {
+            return;
+        };
+        let is_dir = self.is_dir();
+        self.inner.clear();
+        if path.starts_with("/") {
+            // Full address from the start of the mount point
+            if let Some(collon) = cur_dir.find(":") {
+                self.inner.push_str(&cur_dir[..collon + 1]);
+                self.inner.push_str(path);
+            } else {
+                self.inner.push_str(path);
+            }
+        } else if let Some(_) = path.find(":") {
+            // Absolute address (includes the mount-point name)
+            self.inner.push_str(path);
+            if path.ends_with(":") { // Mount-point-only path
+                self.inner.push_str("/");
+            }
+        } else {
+            // Address relative to the current directory
+            self.inner.push_str(cur_dir.as_str());
+            if !cur_dir.ends_with("/") {
+                self.inner.push('/');
+            }
+            self.inner.push_str(path);
+        }
+        if is_dir && !self.inner.ends_with("/") {
+            self.inner.push_str("/");
+        }
+    }
 }
 
 pub fn fopen(path: &str) -> Option<usize> {

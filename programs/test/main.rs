@@ -4,7 +4,6 @@
 
 #![no_std]
 extern crate alloc; 
-
 use rtlib::*;
 use rtlib::stdio::*;
 use rtlib::fileio::*;
@@ -17,19 +16,75 @@ use rtlib::graphics::png::PngImage;
 use rtlib::audio::{Playback, beeper::*, wav::*};
 
 #[no_mangle]
-extern "C" 
 fn main() {
     println!("This program tests some of the basic functionalities of the \
             BlightOS user-space runtime library.");
-    print!("[Test 1] Current Process/Task Information:");
+    
+    println!("\n[Test 1] Current Process/Task Information:");
+    task_info_test();
+
+    println!("\n[Test 2] Spawning a new task:");
+    task_spawn_test();
+
+    println!("\n[Test 3] Co-operative multitasking test:");
+    co_op_sched_test();
+
+    println!("\n[Test 4] Sleep test:");
+    sleep_test();
+
+    println!("\n[Test 5] Heap test 1: 2MBs of small allocations");
+    heap_test();
+
+    wait_for_enter();
+
+    // Test framebuffer access
+    println!("\n[Test 6] Framebuffer Access Test:");
+    framebuffer_test();
+
+    // PNG Loading test
+    println!("\n[Test 7] PNG Loading Test:");
+    png_test();
+
+    wait_for_enter();
+
+    // Audio Playback test
+    println!("\n[Test 8] Audio Playback Test:");
+    beeper_test(50, 4);
+    wav_audio_test(&Path::from("res/sfx/click.wav"));
+
+    // All tests done
+    println!("\nAll tests completed.");
+    let mut proc = Process::current();
+    proc.get_info();
+    println!("{:X?}", proc);
+    exit(0);
+}
+
+fn task_info_test() {
     let t = Task::current();
     println!("TID: {}, PID: {}, name: {} - Running on CPU {}", t.tid, t.pid,
             t.name(), Task::current_cpu());
     let mut proc = Process::current();
     proc.get_info();
     println!("{:X?}", proc);
+}
 
-    println!("\n[Test 2] Spawning a new task:");
+fn co_op_sched_test() {
+let task_a = Task::spawn(|_arg: usize| {
+    for i in 0..5 {
+            print!("<B, i:{}>", i);
+            Task::yield_now();
+        }
+    }, 5, "TaskB");
+    for i in 0..5 {
+        print!("<A, i:{}>", i);
+        Task::yield_now();
+    }
+    Task::join(task_a.unwrap().tid);
+    println!("");
+}
+
+fn task_spawn_test() {
     let new_task = Task::spawn(|arg: usize| {
         println!("Hello from the new task! arg = {}", arg);
         let t = Task::current();
@@ -44,22 +99,9 @@ fn main() {
     } else {
         println!("\nFailed to spawn the task");
     }
+}
 
-    println!("\n[Test 3] Co-operative multitasking test:");
-    let task_a = Task::spawn(|_arg: usize| {
-        for i in 0..5 {
-            print!("<B, i:{}>", i);
-            Task::yield_now();
-        }
-    }, 5, "TaskB");
-    for i in 0..5 {
-        print!("<A, i:{}>", i);
-        Task::yield_now();
-    }
-    Task::join(task_a.unwrap().tid);
-    println!("");
-
-    println!("\n[Test 4] Sleep test:");
+fn sleep_test() {
     let task_c = Task::spawn(|_arg: usize| {
         println!("<Task C> Sleeping for five 500ms intervals...");
         for i in 0..5 {
@@ -73,9 +115,9 @@ fn main() {
         Task::sleep(core::time::Duration::from_millis(100));
     }
     Task::join(task_c.unwrap().tid);
+}
 
-
-    println!("\n[Test 4] Heap test 1: 2MBs of small allocations");
+fn heap_test() {
     rtlib::heap::Malloc::init();
     let alloc_size = 64;
     let total_alloc_size = 2 * 1024 * 1024; // 2 MB
@@ -85,7 +127,7 @@ fn main() {
                 alloc_count, alloc_size, total_alloc_size);
     println!("Heap base: {:#x}, Heap size: {} bytes", Malloc::heap_base(),
                                                         Malloc::heap_size());
-    txt_dump("machine:/ram");
+    txt_dump(&Path::from("machine:/ram"));
     println!("");
     {
         let mut ptrs: Vec<Box<[u8; 64]>> = Vec::with_capacity(alloc_count);
@@ -106,21 +148,17 @@ fn main() {
     println!("Heap base: {:#x}, Heap size: {} bytes", Malloc::heap_base(),
                                                         Malloc::heap_size());
     println!("Physical memory after deallocations:");
-    txt_dump("machine:/ram");
+    txt_dump(&Path::from("machine:/ram"));
+}
 
-    println!("Press Enter to continue...");
-    while stdio_read_byte() != b'\n' {}
-    stdio_clear_screen();
-
-    // Test framebuffer access
-    println!("\n[Test 5] Framebuffer Access Test:");
-    if let Some(mut fb) = Framebuffer::new() {
+fn framebuffer_test() {
+if let Some(mut fb) = Framebuffer::new() {
         // Backup the current framebuffer content 
         println!("Saving the current framebuffer content...");
         if fb.save_frame() {
             println!("Framebuffer content saved successfully.");
             // Spawn a new task to draw a pattern on the framebuffer
-            let _fb_task = Task::spawn(framebuff_test, 0, "FrameBufferTest");
+            let _fb_task = Task::spawn(fb_test_task, 0, "FrameBufferTest");
             // Wait for a while to let the user see the pattern
             Task::join(_fb_task.unwrap().tid);
             // Restore the original framebuffer content before exiting
@@ -133,54 +171,9 @@ fn main() {
     } else {
         println!("Failed to access the framebuffer.");
     }
-
-    // PNG Loading test
-    println!("\n[Test 6] PNG Loading Test:");
-    if let Some(mut fb) = Framebuffer::new() {
-        png_test(&mut fb, "disk1.0:/blightos/res/test.png",  300 , 0);
-        png_test(&mut fb, "disk1.0:/blightos/res/testp.png", 300, 300);
-        png_test(&mut fb, "disk1.0:/blightos/res/testa.png", 300, 600);
-    } else {
-        println!("Failed to access the framebuffer.");
-    }
-
-    println!("Press Enter to continue...");
-    while stdio_read_byte() != b'\n' {}
-    stdio_clear_screen();
-
-    // Audio Playback test
-    println!("\n[Test 7] Audio Playback Test:");
-    beeper_test(50, 4);
-    wav_audio_test("disk1.0:/blightos/res/sfx/click.wav");
-
-    // All tests done
-    println!("\nAll tests completed.");
-    proc.get_info();
-    println!("{:X?}", proc);
-    exit(0);
 }
 
-fn txt_dump(path: &str) {
-    let mut buff: [u8; 64] = [0; 64];
-    match fopen(path) {
-        Some(fd)    => {
-            loop {
-                let cnt = fread(fd, &mut buff);
-                if cnt > 0 {
-                    print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
-                } else {
-                    break;
-                }
-            }
-            fclose(fd);
-        },
-        None        => {
-            print!("\nPath {} doesn't exist", path);
-        }
-    }
-}
-
-fn framebuff_test(_arg: usize) {
+fn fb_test_task(_arg: usize) {
     if let Some(mut fb) = Framebuffer::new() {
         // Draw a simple pattern on the framebuffer
         for row in 100..200 {
@@ -204,7 +197,17 @@ fn framebuff_test(_arg: usize) {
     }
 }
 
-fn png_test(fb: &mut Framebuffer, path: &str, y: u32, x: u32) {
+fn png_test() {
+    if let Some(mut fb) = Framebuffer::new() {
+        png_test_load(&mut fb, &Path::from("res/test.png"),  300 , 0);
+        png_test_load(&mut fb, &Path::from("res/testp.png"), 300, 300);
+        png_test_load(&mut fb, &Path::from("res/testa.png"), 300, 600);
+    } else {
+        println!("Failed to access the framebuffer.");
+    }
+}
+
+fn png_test_load(fb: &mut Framebuffer, path: &Path, y: u32, x: u32) {
     match PngImage::from_path(path) {
         Ok(mut png) => {
             println!("Loaded PNG image successfully: {}x{}, color type: {:?}",
@@ -309,7 +312,7 @@ fn beeper_test(ms: u32, oct: u8) {
     
 }
 
-fn wav_audio_test(path: &str) {
+fn wav_audio_test(path: &Path) {
     println!("WAV audio test - Press Enter to start...");
     while stdio_read_byte() != b'\n' {}
     match WaveAudio::from_path(path) {
@@ -328,4 +331,27 @@ fn wav_audio_test(path: &str) {
                         e.code as usize, e.message);
         }
     }
+}
+
+fn wait_for_enter() {
+    println!("Press Enter to continue...");
+    while stdio_read_byte() != b'\n' {}
+    stdio_clear_screen();
+}
+
+fn txt_dump(path: &Path) {
+    let mut buff: [u8; 64] = [0; 64];
+    let Ok(file) = File::from_path(path) else {
+        println!("Path {} doesn't exist", path.as_str());
+        return;
+    };
+    loop {
+        let cnt = file.read(&mut buff);
+        if cnt > 0 {
+            print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
+        } else {
+            break;
+        }
+    }
+    println!("");
 }

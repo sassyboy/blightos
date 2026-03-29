@@ -1,9 +1,12 @@
-
+//
+// BlightOS - A Tetris game to test the graphics and audio capabilities
+//
 #![no_std]
 
 use rtlib::*;
 use rtlib::stdio::*;
 use rtlib::task::*;
+use rtlib::fileio::*;
 use rtlib::graphics::RGB;
 use rtlib::graphics::framebuffer::*;
 use rtlib::audio::Playback;
@@ -81,7 +84,6 @@ static INPUT: AtomicU8 = AtomicU8::new(0);
 static VIDEO_LOOP: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
-extern "C" 
 fn main() {
     let fb0 = Framebuffer::new();
     if let Some(mut fb) = fb0 {
@@ -313,75 +315,86 @@ fn clear_full_rows(arena: &mut [[u8; ARENA_WIDTH as usize]; ARENA_HEIGHT as usiz
 
 fn render_loop(_args: usize){
     // Load the WAV audio files
-    let snd_col = WaveAudio::from_path("disk1.0:/blightos/res/sfx/click.wav")
-                                                                .ok().unwrap();
-    let snd_clear = WaveAudio::from_path("disk1.0:/blightos/res/sfx/boom.wav")
-                                                                .ok().unwrap();
-    let snd_gover = WaveAudio::from_path("disk1.0:/blightos/res/sfx/gover.wav")
-                                                                .ok().unwrap();
+    let Ok(snd_col) = WaveAudio::from_path(&Path::from("res/sfx/click.wav"))
+    else {
+        println!("Failed to load res/sfx/click.wav");
+        return;
+    };
+    let Ok(snd_clear) = WaveAudio::from_path(&Path::from("res/sfx/boom.wav"))
+    else {
+        println!("Failed to load res/sfx/boom.wav");
+        return;
+    };
+    let Ok(snd_gover) = WaveAudio::from_path(&Path::from("res/sfx/gover.wav"))
+    else {
+        println!("Failed to load res/sfx/gover.wav");
+        return;
+    };
 
-    let fbopt = Framebuffer::new();
-    if let Some(mut fb) = fbopt {
-        // Calculate the top-left corner of the arena to center it on the screen
-        let x0 = (fb.width - ARENA_WIDTH * BLOCK_SIZE) / 2;
-        let y0 = (fb.height - ARENA_HEIGHT * BLOCK_SIZE) / 2;
-        draw_arena(&mut fb, y0, x0);
+    let Some(mut fb) = Framebuffer::new() else {
+        println!("Failed to access the framebuffer.");
+        return;
+    };
+    // Calculate the top-left corner of the arena to center it on the screen
+    let x0 = (fb.width - ARENA_WIDTH * BLOCK_SIZE) / 2;
+    let y0 = (fb.height - ARENA_HEIGHT * BLOCK_SIZE) / 2;
+    draw_arena(&mut fb, y0, x0);
         
-        let mut arena = [[0; ARENA_WIDTH as usize]; ARENA_HEIGHT as usize];
-        let mut state = GameState::new();
-        let mut game_speed = 1; // up to 10
-        let mut fall_tick = 0;
-        let mut game_tick = 0;
+    let mut arena = [[0; ARENA_WIDTH as usize]; ARENA_HEIGHT as usize];
+    let mut state = GameState::new();
+    let mut game_speed = 1; // up to 10
+    let mut fall_tick = 0;
+    let mut game_tick = 0;
 
-        while VIDEO_LOOP.load(Ordering::Relaxed) {
-            Task::sleep(REFRESH_DURATION);
-            fall_tick += 1;
-            game_tick += 1;
-            if fall_tick >= 200 / game_speed {
-                state.move_down = true;
-                fall_tick = 0;
-            } else {
-                state.move_down = false;
-            }
-            if game_tick % 1000 == 0 && game_speed < 10 {
-                game_speed += 1; // increase speed every 1000 ticks (i.e., 10s)
-            }
-            
-            // Run the game logic
-            match game_logic(&mut arena, &mut state) {
-                StepResult::GameOver => {
-                    play_sfx(&snd_gover, true);
-                    println!("Game Over!");
-                    break;
-                },
-                StepResult::RowCleared => {
-                    play_sfx(&snd_clear, false);
-                },
-                StepResult::BlockPlaced => {
-                    play_sfx(&snd_col, false);
-                },
-                StepResult::Continue => {}
-
-            }
-            if state.redraw {
-                // Draw the current state of the arena
-                for row in 0..ARENA_HEIGHT {
-                    for col in 0..ARENA_WIDTH {
-                        let block_type = arena[row as usize][col as usize];
-                        if block_type != 0 {
-                            draw_block(&mut fb, y0, x0, row, col, COLORS[block_type as usize], true);
-                        } else {
-                            draw_block(&mut fb, y0, x0, row, col, COLOR_BACKGROUND, false);
-                        }
+    while VIDEO_LOOP.load(Ordering::Relaxed) {
+        Task::sleep(REFRESH_DURATION);
+        fall_tick += 1;
+        game_tick += 1;
+        if fall_tick >= 200 / game_speed {
+            state.move_down = true;
+            fall_tick = 0;
+        } else {
+            state.move_down = false;
+        }
+        if game_tick % 1000 == 0 && game_speed < 10 {
+            game_speed += 1; // increase speed every 1000 ticks (i.e., 10s)
+        }
+        
+        // Run the game logic
+        match game_logic(&mut arena, &mut state) {
+            StepResult::GameOver => {
+                play_sfx(&snd_gover, true);
+                println!("Game Over!");
+                break;
+            },
+            StepResult::RowCleared => {
+                play_sfx(&snd_clear, false);
+            },
+            StepResult::BlockPlaced => {
+                play_sfx(&snd_col, false);
+            },
+            StepResult::Continue => {}
+        }
+        if state.redraw {
+            // Draw the current state of the arena
+            for row in 0..ARENA_HEIGHT {
+                for col in 0..ARENA_WIDTH {
+                    let block_type = arena[row as usize][col as usize];
+                    if block_type != 0 {
+                        draw_block(&mut fb, y0, x0, row, col, 
+                                            COLORS[block_type as usize], true);
+                    } else {
+                        draw_block(&mut fb, y0, x0, row, col,
+                                            COLOR_BACKGROUND, false);
                     }
                 }
-                // Put the piece into the SHAPE buffer for the renderer to read
-                draw_tetromino(&mut fb, y0, x0, state.cur_shape, state.cur_rot,
+            }
+            // Put the piece into the SHAPE buffer for the renderer to read
+            draw_tetromino(&mut fb, y0, x0, state.cur_shape, state.cur_rot,
                         state.cur_y as u32, state.cur_x as u32,
                         COLORS[state.cur_shape + 1]);
-                fb.update();
-                state.redraw = false;
-            }
+            fb.update();
+            state.redraw = false;
         }
     }
 }
@@ -459,15 +472,26 @@ fn draw_block(fb: &mut Framebuffer, y0: u32, x0: u32, y: u32, x: u32, fill: RGB,
 
 fn play_sfx(snd: &WaveAudio, sync: bool) {
     let mut playback = Playback::new();
-    playback.play(&snd.data, sync);
+    let _ = playback.play(&snd.data, sync);
 }
 
 fn read_timestamp() -> u64 {
-    let (upper, lower): (u64, u64);
-    unsafe {
-        asm!("rdtsc", out("rdx")upper, out("rax")lower);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (upper, lower): (u64, u64);
+        unsafe {
+            asm!("rdtsc", out("rdx")upper, out("rax")lower);
+        }
+        (upper << 32) | lower
     }
-    (upper << 32) | lower
+    #[cfg(target_arch = "aarch64")]
+    {
+        let cntvct: u64;
+        unsafe {
+            asm!("mrs {}, cntvct_el0", out(reg) cntvct);
+        }
+        cntvct
+    }
 }
 
 fn rand() -> usize {

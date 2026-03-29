@@ -2,8 +2,26 @@
 // Standard Console Input/Output
 //
 pub use core::fmt::Write;
-use crate::*;
 use crate::syscall::*;
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        let mut stdout = ConsoleOut{};
+        let _ = write!(&mut stdout, $($arg)*);
+    };
+}
+
+#[macro_export]
+macro_rules! println {
+    () => {
+        $crate::print!("\n")
+    };
+    ($($arg:tt)*) => {{
+        $crate::print!($($arg)*);
+        $crate::print!("\n");
+    }};
+}
 
 pub struct ConsoleOut;
 impl Write for ConsoleOut {

@@ -1,3 +1,6 @@
+//
+// BlightOS - File Manager
+//
 #![no_std]
 
 use rtlib::*;
@@ -5,7 +8,6 @@ use rtlib::stdio::*;
 use rtlib::fileio::*;
 
 #[no_mangle]
-extern "C" 
 fn main() {
     println!("BlightOS File Manager (Ver:{:.2})!", 0.01);
     print_free_memory();

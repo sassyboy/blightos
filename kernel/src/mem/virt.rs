@@ -79,7 +79,11 @@ impl UserTask {
 // [1st task's stack]: MMUMapping::MAX_VIRTUA (grows down)
 pub struct AddressSpace {
     pid:            usize,
-    name:           String,
+    name:           String, // Name of the process, e.g., shell.box
+    cmd_line:        String,// The command string used to launch this process,
+                            // e.g., "disk0.0:/blightos/shell.box arg1 arg2"
+                            // The first part is always the absolute path of the
+                            // binary used to launch this process
     // Architecture-dependent address-space object
     vmap:           MMUMapping,
     // Program image range in memory
@@ -112,6 +116,7 @@ impl AddressSpace {
         Self {
             pid:            0,
             name:           String::new(),
+            cmd_line:       String::new(),
             vmap:           MMUMapping::new(),
             img_base_pys:   0,
             img_pages:      0,
@@ -145,10 +150,10 @@ impl AddressSpace {
         
         match proc {
             Some(p) => {
-                klog!("get_process_info - PID: {}, name: {}\n", pid, p.name);
                 let mut info = ProcCtlGetInfoArgs {
                     pid:                p.pid,
                     name:               [0 as u8; 64],
+                    cmd_line:           [0 as u8; 1024],
                     main_tid:           p.children[0].tid,
                     task_count:         p.children.len(),
                     fd_count:           p.files.len(),
@@ -163,13 +168,22 @@ impl AddressSpace {
                     meta_mem_usage:     (p.vmap.tlb_page_count()) * 
                                                 MMUMapping::PAGE_SIZE,
                 };
+                // Copy the process name
                 let name_bytes = p.name.as_bytes();
-                let copy_len = if name_bytes.len() < 64 {
+                let name_len = if name_bytes.len() < 64 {
                     name_bytes.len()
                 } else {
                     63
                 };
-                info.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+                info.name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+                // Copy the process command line
+                let cmd_bytes = p.cmd_line.as_bytes();
+                let cmd_len = if cmd_bytes.len() < 1024 {
+                    cmd_bytes.len()
+                } else {
+                    1023
+                };
+                info.cmd_line[..cmd_len].copy_from_slice(&cmd_bytes[..cmd_len]);
                 Some(info)
             },
             None    => None
@@ -183,7 +197,7 @@ impl AddressSpace {
     // Adds the process to the process pool and returns the PID of the new
     // process address space
     pub fn spawn(img_phy_base: usize, img_mem_size: usize, ep_vaddr: usize, 
-                                                name: String) -> Option<usize>
+                                name: String, cmd_line: String) -> Option<usize>
     {
         let mut proc_map = PROCESSES.lock();
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
@@ -192,6 +206,7 @@ impl AddressSpace {
         match proc {
             Some(p) => {
                 p.name          = name;
+                p.cmd_line      = cmd_line;
                 p.ep_vaddr      = ep_vaddr;
                 p.img_base_pys  = img_phy_base;
                 p.img_pages     = div_round_up!(img_mem_size, PHY_FRAME_SIZE);
@@ -209,7 +224,8 @@ impl AddressSpace {
     // Loads a program image in the memory from a given ELF image and calls
     // spawn, which returns the PID of the new process address space.
     //
-    pub fn spawn_from_elf(elf: &ELFBinary, pname: String) -> Option<usize> {
+    pub fn spawn_from_elf(elf: &ELFBinary, pname: String, cmd_line: String) -> 
+                                                                Option<usize> {
         // Calculate the total memory size needed for the program image from the
         // ELF segments
         let mut mem_sz = 0;
@@ -244,7 +260,7 @@ impl AddressSpace {
             // Release the memory
             pfree_continuous(alloc.unwrap(), frame_count);
         }
-        return Self::spawn(alloc.unwrap(), mem_sz, elf.elf_entry, pname);
+        return Self::spawn(alloc.unwrap(), mem_sz, elf.elf_entry, pname, cmd_line);
     }
 
     /// This is called from the context of the kernel task that is going to

@@ -1,75 +1,70 @@
+//
+// BlightOS - User-space text-based shell program
+//
 #![no_std]
-extern crate alloc; 
-
+extern crate alloc;
 use alloc::string::ToString;
 use rtlib::*;
+use rtlib::env::*;
 use rtlib::stdio::*;
 use rtlib::fileio::*;
 use rtlib::task::*;
 use rtlib::syscall::SyscallRsvdFDs;
-use alloc::string::String;
 use alloc::format;
+use alloc::vec::Vec;
 
 #[no_mangle]
-extern "C" 
 fn main() {
     println!("BlightOS Shell (Ver:{:.2}).", 1.0);
     print_system_resources();
-
-    // Check disk[0-9].[0-9]:/blightos/ for the binary path
-    let mut bin_path = String::new();
-    for d in 0..10 {
-        for p in 0..10 {
-            let path = format!("disk{}.{}:/blightos/", d, p);
-            if path_check(&path) {
-                bin_path = path;
-                break;
-            }
-        }
-    }
-    // Command buffer and current working directory
-    let mut cmd_buf: [u8; 512] = [0; 512];
-    let mut cwd = String::new();
-    let mut path: String;
+    let Ok(bin_path) = current_dir() else {
+        println!("Failed to get the current directory!. Exiting...");
+        exit(1);
+        return;
+    };
 
     // Shell prompt loop
+    let mut cmd_buf: [u8; 512] = [0; 512];
+
     loop {
-        print!("\n{} > ", cwd);
+        let cwd = current_dir().unwrap_or_else(|_| "".to_string());
+        print!("{} > ", cwd);
         let cnt = read_line(&mut cmd_buf);
         let cmd = str::from_utf8(&cmd_buf[0..cnt]).unwrap();
+        println!("");
         if      cmd.trim().is_empty() {
-            // Do nothing
+            
         } else if cmd.starts_with("ls ") {
-            println!("");
-            path = make_full_path(cwd.as_str(), &cmd[3..cnt], true);
-            exec_ls(path.as_str());
+            exec_ls(&Path::from(&cmd[3..cnt]));
         }  else if cmd.eq("ls") {
-            println!("");
-            exec_ls(cwd.as_str());
+            exec_ls(&Path::from(cwd.as_str()));
         } else if cmd.eq("cd ..") {
             // Go back
             if let Some(rslash) = cwd[..cwd.len() - 1].rfind("/") {
-                cwd = cwd[..rslash + 1].to_string();
+                let _ = set_current_dir(cwd[..rslash + 1].as_ref());
             }
         }else if   cmd.starts_with("cd ") {
-            let path = make_full_path(cwd.as_str(), &cmd[3..cnt], true);
-            if path_check(path.as_str()) {
-                cwd = path;
+            let path = Path::from(&cmd[3..cnt]);
+            if path.exists() {
+                let _ = set_current_dir(path.as_str());
             } else {
-                print!("\nPath {} doesn't exist", path);
+                println!("Path {} doesn't exist", path.as_str());
             }
         } else if   cmd.starts_with("txtdump ") {
-            let path = make_full_path(cwd.as_str(), &cmd[8..cnt], false);
-            println!("");
-            exec_textdump(path.as_str());
+            let path = Path::from(&cmd[8..cnt]);
+            exec_textdump(&path);
         } else if   cmd.starts_with("hexdump ") {
-            let path = make_full_path(cwd.as_str(), &cmd[8..], false);
-            println!("");
-            exec_hexdump(path.as_str());
-        } else if cmd.starts_with("run ") {
-            let path = make_full_path(cwd.as_str(), &cmd[4..], false);
-            println!("");
-            run_executable(path.as_str());
+            let path = Path::from(&cmd[8..]);
+            exec_hexdump(&path);
+        } else if   cmd.starts_with("wr ") {
+            let parts: Vec<&str> = cmd[3..].splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                println!("Invalid command format. Usage: wr [path] [text]");
+                continue;
+            }
+            let path = Path::from(parts[0]);
+            let text = parts[1];
+            exec_write(&path, text);
         } else if   cmd.starts_with("exit") {
             break;
         } else if   cmd.starts_with("cls") {
@@ -80,36 +75,59 @@ fn main() {
             exec_ktest();
         }
         else if   cmd.starts_with("help"){
-            println!("");
             print_help();
         } else {
-            // Try to find a binary with the <cmd>.elf under the blightos
-            // directory and run that if it exists
-            if path_check(format!("{}{}.box", cwd, cmd.trim()).as_str()) {
-                // Run the binary from the current directory
-                run_executable(format!("{}{}.box", cwd, cmd.trim()).as_str());
-            } else if path_check(format!("{}{}.box", bin_path, cmd.trim()).as_str()) {
-                // Run the binary from the default binary path
-                run_executable(format!("{}{}.box", bin_path, cmd.trim()).as_str());
+            // Try to find a binary with the <cmd>.box in the current path, or
+            // the blightos directory and run that if it exists
+            // Also passes any arguments after the command to the new process
+            let cmd_trim = cmd.trim();
+            let cmd_exec = if let Some(space_idx) = cmd_trim.find(' ') {
+                &cmd_trim[..space_idx]
             } else {
-                println!("\n{} is not a valid command.", cmd);
-                print_help();
+                cmd_trim
+            };
+            let cmd_args = if let Some(space_idx) = cmd_trim.find(' ') {
+                &cmd_trim[space_idx + 1..]
+            } else {
+                ""
+            };
+            // Check for the command in the current directory
+            let exec_path;
+            if cmd_exec.ends_with(".box") {
+                exec_path = Path::from(cmd_exec);
+            } else {
+                exec_path = Path::from(&format!("{}.box", cmd_exec));
             }
+            if exec_path.exists() {
+                // Run the binary from the current directory
+                run_executable(exec_path.as_str(), cmd_args);
+                continue;
+            }
+            // If not found, check for the command in the default binary path
+            if let Some(last_slash) = exec_path.as_str().rfind('/') {
+                let exec_fname = &exec_path.as_str()[last_slash + 1..];
+                let exec_path = Path::from(&format!("{}{}", bin_path, exec_fname));
+                if exec_path.exists() {
+                    run_executable(exec_path.as_str(), cmd_args);
+                    continue;
+                }
+            }
+            println!("{} is not a valid command. Try help", cmd);
         }
     }
     exit(0);
 }
 
 fn print_help() {
-    print!(
-        "help            Prints this message\n\
-         cd              Changes the current directory E.g: cd disk0.0: or cd ..\n\
+    println!(
+        "cd              Changes the current directory E.g: cd disk0.0: or cd ..\n\
          ls              Lists directories/files/devices under the current path\n\
          ls [path]       Similar to ls but looks under the current-directory/path\n\
-         run [path]      Executes the file located in the path as a command\n\
-         [command]       Executes the /blightos/command.box if it exists\n\
+         [command]       Executes command.box in the current directory or in \
+                         blightos/ if it exists\n\
          txtdump [path]  Reads the file located in the path and prints its content\n\
          hexdump [path]  Similar to txtdump but in HEX\n\
+         wr [path] [txt] Writes the text to the file located in the path\n\
          exit            Ends the shell program\n\
          cls             Clears the screen\n\
          reboot          Reboots the machine\n\
@@ -126,168 +144,118 @@ fn print_system_resources() {
     if cnt > 0 && buff[cnt-1] == b'\n' {
         cnt -= 1;
     }
-    print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
+    println!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
 }
 
-fn path_check(path: &str) -> bool {
-    match fopen(path) {
-        None        => {
-            false
-        },
-        Some(fd)   => {
-            fclose(fd);
-            true
-        }
-    }
-}
-
-fn exec_ls(path: &str) {
+fn exec_ls(path: &Path) {
     let mut buff: [u8; 512] = [0; 512];
 
-    match fopen(path) {
-        None        => {
-            print!("Path {} doesn't exist", path);
-        },
-        Some(fd)    => {
-            // println!("Opened {} with FD {}", path, fd);
-            let cnt = fenum(fd, &mut buff);
-            // println!("Enum returned {} bytes:", cnt);
-            if cnt > 0 {
-                if buff[cnt-1] == b'\n' {
-                    print!("{}", str::from_utf8(&buff[0..cnt-1]).unwrap());
-                } else {
-                    println!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
-                }
-                
-            }
-            
-            fclose(fd);
-        }
+    let Ok(dir) = File::from_path(path) else {
+        println!("Path {} doesn't exist", path.as_str());
+        return;
+    };
+    let cnt = dir.enum_dir(&mut buff);
+    if cnt > 0 {
+        // It already ends with a newline
+        print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());  
+    } else {
+        println!("");
     }
-
 }
 
-fn exec_textdump(path: &str) {
+fn exec_textdump(path: &Path) {
     let mut buff: [u8; 64] = [0; 64];
-    match fopen(path) {
-        Some(fd)    => {
-            // let mut total = 0;
-            loop {
-                let cnt = fread(fd, &mut buff);
-                if cnt > 0 {
-                    print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
-                    // total += cnt;
-                } else {
-                    // print!("<<EOF - {} bytes in total>>", total);
-                    break;
-                }
-            }
-            fclose(fd);
-        },
-        None        => {
-            print!("\nPath {} doesn't exist", path);
+    let Ok(file) = File::from_path(path) else {
+        println!("Path {} doesn't exist", path.as_str());
+        return;
+    };
+    loop {
+        let cnt = file.read(&mut buff);
+        if cnt > 0 {
+            print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
+        } else {
+            break;
         }
     }
+    println!("");
 }
 
-fn exec_hexdump(path: &str) {
+fn exec_hexdump(path: &Path) {
     let mut buff: [u8; 16] = [0; 16];
-    match fopen(path) {
-        Some(fd)    => {
-            let mut offset = 0;
-            loop {
-                let cnt = fread(fd, &mut buff);
-                if cnt > 0 {
-                    print!("{:08X}  ", offset);
-                    for i in 0..cnt {
-                        print!("{:02X} ", buff[i]);
-                    }
-                    for _i in cnt..16 {
-                        print!("   ");
-                    }
-                    print!("    ");
-                    for i in 0..cnt {
-                        let b = buff[i];
-                        if b.is_ascii_graphic() || b == b' ' {
-                            print!("{}", b as char);
-                        } else {
-                            print!(".");
-                        }
-                    }
-                    println!("");
-                    offset += cnt;
+    let Ok(file) = File::from_path(path) else {
+        println!("Path {} doesn't exist", path.as_str());
+        return;
+    };
+    let mut offset: usize = 0;
+    loop {
+        let cnt = file.read(&mut buff);
+        if cnt > 0 {
+            print!("{:08X}  ", offset);
+            for i in 0..cnt {
+                print!("{:02X} ", buff[i]);
+            }
+            for _i in cnt..16 {
+                print!("   ");
+            }
+            print!("    ");
+            for i in 0..cnt {
+                let b = buff[i];
+                if b.is_ascii_graphic() || b == b' ' {
+                    print!("{}", b as char);
                 } else {
-                    break;
+                    print!(".");
                 }
             }
-            fclose(fd);
-        },
-        None        => {
-            print!("\nPath {} doesn't exist", path);
+            println!("");
+            offset += cnt;
+        } else {
+            break;
         }
     }
+    println!("");
 }
 
-fn run_executable(path: &str) {
-    println!("\nLaunching {} ...", path);
-    if let Some(proc) = Process::spawn(path) {
+fn exec_write(path: &Path, text: &str) {
+    let Ok(file) = File::from_path(path) else {
+        println!("Path {} doesn't exist", path.as_str());
+        return;
+    };
+    let _ = file.write(text.as_bytes());
+}
+
+fn run_executable(path: &str, args: &str) {
+    let cmd_line;
+    if args.is_empty() {
+        cmd_line = path.to_string();
+        println!("Launching {} ...", path);
+    } else {
+        cmd_line = format!("{} {}", path, args);
+        println!("Launching {} args: '{}' ...", path, args);
+    }
+    
+    if let Some(proc) = Process::spawn(&cmd_line) {
         proc.join();
     } else {
-        println!("\nFailed to execute {}", path);
+        println!("Failed to execute {}", path);
     }
-}
-
-fn make_full_path(cur_dir: &str, path: &str, dir: bool)  -> String {
-    let mut out = String::new();
-    if path.starts_with("/") {
-        // FUll address from the start of the mount point
-        if let Some(collon) = cur_dir.find(":") {
-            out.push_str(&cur_dir[..collon + 1]);
-            out.push_str(path);
-        } else {
-            out.push_str(path);
-        }
-    } else if let Some(_) = path.find(":") {
-        // Absolute address (includes the mount-point name)
-        out.push_str(path);
-    } else {
-        // Address relative to the current directory
-        out.push_str(cur_dir);
-        if !cur_dir.ends_with("/") {
-            out.push('/');
-        }
-        out.push_str(path);
-    }
-    if dir && !out.ends_with("/") {
-        out.push_str("/");
-    }
-    out
 }
 
 fn exec_reboot() {
-    match fopen("machine:/") {
-        Some(fd) => {
-            let mut buf: [u8; 8] = [0; 8];
-            fexec(fd, 1, &mut buf);
-            fclose(fd);
-        },
-        None => {
-            print!("Could not open the machine:/ file");
-        }
-    }
+    let Ok(file) = File::from_path(&Path::from("machine:/")) else {
+        println!("Could not open the machine:/ file");
+        return;
+    };
+    let mut buf: [u8; 8] = [0; 8];
+    let _= file.exec(1, &mut buf);
 }
 
 fn exec_ktest() {
-    match fopen("machine:/") {
-        Some(fd) => {
-            let mut buf: [u8; 8] = [0; 8];
-            fexec(fd, 2, &mut buf);
-            fclose(fd);
-        },
-        None => {
-            print!("Could not open the machine:/ file");
-        }
-    }
+    let Ok(file) = File::from_path(&Path::from("machine:/")) else {
+        println!("Could not open the machine:/ file");
+        return;
+    };
+    let mut buf: [u8; 8] = [0; 8];
+    let _= file.exec(2, &mut buf);
 }
 
 

@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+#![allow(dead_code)]
 ///
 /// BlightOS kernel
 ///
@@ -29,8 +29,7 @@ use core::fmt::Debug;
 ///           responsesinstead of immediate command interface.
 /// 
 
-
-use core::{hint, ptr};
+use core::{hint, ptr, fmt::Debug};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
