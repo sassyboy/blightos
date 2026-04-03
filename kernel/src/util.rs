@@ -5,9 +5,66 @@
 ///   Use this in the absence of the std library.
 ///
 
+pub use crate::{ErrorCode, Error};
+pub use core::fmt::Write;
 use crate::arch::*;
 use crate::sched::Preemption;
-pub use core::fmt::Write;
+
+//
+// Convenient Error Handling macros and implementations
+// 
+impl From<usize> for ErrorCode {
+    fn from(code: usize) -> Self {
+        match code {
+            0   => ErrorCode::NoError,
+            1   => ErrorCode::OutOfMemory,
+            2   => ErrorCode::NotSupported,
+            3   => ErrorCode::NotFound,
+            4   => ErrorCode::NotIssued,
+            5   => ErrorCode::UnexpectedEoF,
+            6   => ErrorCode::InvalidPID,
+            7   => ErrorCode::InvalidTID,
+            8   => ErrorCode::InvalidFD,
+            9   => ErrorCode::InvalidOp,
+            10  => ErrorCode::InvalidBus,
+            11  => ErrorCode::InvalidDrive,
+            12  => ErrorCode::InvalidMountPoint,
+            13  => ErrorCode::InvalidPath,
+            14  => ErrorCode::InvalidHandle,
+            15  => ErrorCode::InvalidBuffer,
+            16  => ErrorCode::InvalidArgument,
+            17  => ErrorCode::InvalidFormat,
+            18  => ErrorCode::NotAllowed,
+            19  => ErrorCode::OutOfBoundIO,
+            20  => ErrorCode::IOError,
+            _   => ErrorCode::Other,
+        }
+    }
+}
+macro_rules! error {
+    ($err_code:expr) => {
+        Error {
+            code: $err_code,
+            file: core::file!(),
+            line: core::line!(),
+            message: ""
+        }
+    };
+}
+macro_rules! error_msg {
+    ($err_code:expr, $msg:expr) => {
+        Error {
+            code: $err_code,
+            file: core::file!(),
+            line: core::line!(),
+            message: $msg
+        }
+    };
+}
+
+//
+// Kernel Logging and Debugging
+//
 
 pub struct ConsoleOut;
 impl Write for ConsoleOut {
@@ -280,10 +337,9 @@ impl<'a, T> DerefMut for SpinlockCriticalSection<'a, T> {
 /// ELF Loader
 ///
 ///
-use alloc::{slice, sync::Arc};
+use alloc::slice;
 use alloc::vec::Vec;
-use crate::fs::MountPoint;
-use crate::drivers::storage::IOCompletion;
+use crate::fs::{File, FileSeekOrigin, FileSeekCursor};
 
 #[derive(Debug)]
 pub struct ELFSegment {
@@ -304,9 +360,8 @@ impl ELFSegment {
     pub const P_FLAGS_WRITE:    u32 = 2;
     pub const P_FLAGS_READ:     u32 = 4;
 }
-pub struct ELFBinary{
-    mnt:            Arc<MountPoint>,
-    hnd:            usize,
+pub struct ELFBinary {
+    file:               File,
     // From ELF Header
     elf_type:           u16,
     elf_machine:        u16,
@@ -361,7 +416,7 @@ impl ELFBinary {
     const ELF_MACHINE_ARM:  u16 = 0xB7;
     
     // Owns the file handle and closes it when goes out of scope
-    pub fn from_file(mnt: Arc<MountPoint>, file_handle: usize) -> Option<Self> {
+    pub fn from_path(path: &str) -> Result<Self, Error> {
         // klog!("Loading ELF from mnt {}, file handle: {})\n", mnt.name, file_handle);
         // Read and decode the header
         let mut buf = [0 as u8; 512];
@@ -369,87 +424,81 @@ impl ELFBinary {
         unsafe {
             u64b = core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u64, 512);
         }
-        let ioc = mnt.fread(file_handle, 0, &mut buf);
-        if let IOCompletion::Successful(_len) = ioc {
-            if !(buf[0] == 0x7f && buf[1] == b'E' && buf[2] == b'L' &&
-                buf[3] == b'F' && buf[4] == Self::ELF_CLASS_64) {
-                klog!("Not an ELF-64 file!\n");
-                return None;
-            }
-            let elf_type = (u64b[2] & 0xFFFF) as u16;
-            let elf_machine = ((u64b[2] >> 16) & 0xFFFF) as u16;
-
-            if elf_type != Self::ELF_TYPE_EXE {
-                klog!("Not an Executable ELF-64\n");
-                return None;
-            }
-            #[cfg(target_arch = "x86_64")]
-            if elf_machine != Self::ELF_MACHINE_X64 {
-                klog!("Not an x86_64 Executable!\n");
-                return None;
-            }
-            #[cfg(target_arch = "aarch64")]
-            if elf_machine != Self::ELF_MACHINE_ARM {
-                klog!("Not an AARCH64 Executable!\n");
-                return None;
-            }
-
-            let entry   = u64b[3];
-            let phoff   = u64b[4];
-            let shoff   = u64b[5];
-            let ehsz    = (u64b[6] >> 32) & 0xFFFF;
-            let phentsz = (u64b[6] >> 48) & 0xFFFF;
-            let phcnt   = u64b[7] & 0xFFFF;
-            let shensz  = (u64b[7] >> 16) & 0xFFFF;
-            let shcnt   = (u64b[7] >> 32) & 0xFFFF;
-            // Enumerate the loadable segments
-            let mut segments: Vec<ELFSegment> = Vec::new();
-            let ioc = mnt.fread(file_handle, phoff as usize, &mut buf);
-            if let IOCompletion::Successful(len) = ioc {
-                // TODO Consider checking for the end of buffer and reading more
-                // if necessary
-                if phcnt * phentsz > len as u64 {
-                    panic!("Too many ELF segments! Support not implemented");
-                }
-                // klog!("Read {} bytes of the program headers\n", len);
-                for i in 0..phcnt {
-                    let offset = (i * (phentsz / 8)) as usize;
-                    segments.push(ELFSegment {
-                        p_type:     (u64b[offset + 0] & 0xFFFFFFFF) as u32,
-                        p_flags:    (u64b[offset + 0] >> 32) as u32,
-                        p_offset:   u64b[offset + 1] as usize,
-                        p_vaddr:    u64b[offset + 2] as usize,
-                        p_paddr:    u64b[offset + 3] as usize,
-                        p_filesz:   u64b[offset + 4] as usize,
-                        p_memsz:    u64b[offset + 5] as usize,
-                        p_align:    u64b[offset + 6] as usize,
-                    });
-                }
-                
-            }
-            // Return
-            return Some(
-                Self {
-                    mnt:                mnt,
-                    hnd:                file_handle,
-                    elf_type:           elf_type,
-                    elf_machine:        elf_machine,
-                    elf_entry:          entry as usize,
-                    elf_hdr_sz:         ehsz as u16,
-                    elf_prg_hdr_off:    phoff as usize,
-                    elf_prg_hdr_entsz:  phentsz as u16,
-                    elf_prg_hdr_cnt:    phcnt as u16,
-                    elf_sec_hdr_off:    shoff as usize,
-                    elf_sec_hdr_entsz:  shensz as u16,
-                    elf_sec_hdr_cnt:    shcnt as u16,
-                    segments:           segments
-                }
-            );
+        let mut file = File::open(path, File::MODE_READ)?;
+        let _len = file.read(&mut buf)?;
+        if !(buf[0] == 0x7f && buf[1] == b'E' && buf[2] == b'L' &&
+            buf[3] == b'F' && buf[4] == Self::ELF_CLASS_64) {
+            return Err(error_msg!(ErrorCode::InvalidFormat,
+                                    "Not an ELF-64 file!"));
         }
-        None 
+        let elf_type = (u64b[2] & 0xFFFF) as u16;
+        let elf_machine = ((u64b[2] >> 16) & 0xFFFF) as u16;
+
+        if elf_type != Self::ELF_TYPE_EXE {
+            klog!("\n");
+            return Err(error_msg!(ErrorCode::InvalidFormat,
+                                    "Not an Executable ELF-64"));
+        }
+        #[cfg(target_arch = "x86_64")]
+        if elf_machine != Self::ELF_MACHINE_X64 {
+            return Err(error_msg!(ErrorCode::InvalidFormat,
+                                    "Not an x86-64 Executable!"));
+        }
+        #[cfg(target_arch = "aarch64")]
+        if elf_machine != Self::ELF_MACHINE_ARM {
+            return Err(error_msg!(ErrorCode::InvalidFormat,
+                                    "Not an AARCH64 Executable!"));
+        }
+
+        let entry   = u64b[3];
+        let phoff   = u64b[4];
+        let shoff   = u64b[5];
+        let ehsz    = (u64b[6] >> 32) & 0xFFFF;
+        let phentsz = (u64b[6] >> 48) & 0xFFFF;
+        let phcnt   = u64b[7] & 0xFFFF;
+        let shensz  = (u64b[7] >> 16) & 0xFFFF;
+        let shcnt   = (u64b[7] >> 32) & 0xFFFF;
+        // Enumerate the loadable segments
+        let mut segments: Vec<ELFSegment> = Vec::new();
+        file.seek(phoff as isize, FileSeekOrigin::Start, FileSeekCursor::Read)?;
+        let len = file.read(&mut buf)? as u64;
+        // TODO Consider checking for the end of buffer and reading more
+        // if necessary
+        if phcnt * phentsz > len {
+            panic!("Too many ELF segments! Support not implemented");
+        }
+        // klog!("Read {} bytes of the program headers\n", len);
+        for i in 0..phcnt {
+            let offset = (i * (phentsz / 8)) as usize;
+            segments.push(ELFSegment {
+                p_type:     (u64b[offset + 0] & 0xFFFFFFFF) as u32,
+                p_flags:    (u64b[offset + 0] >> 32) as u32,
+                p_offset:   u64b[offset + 1] as usize,
+                p_vaddr:    u64b[offset + 2] as usize,
+                p_paddr:    u64b[offset + 3] as usize,
+                p_filesz:   u64b[offset + 4] as usize,
+                p_memsz:    u64b[offset + 5] as usize,
+                p_align:    u64b[offset + 6] as usize,
+            });
+        }
+        Ok(Self {
+                file,
+                elf_type:           elf_type,
+                elf_machine:        elf_machine,
+                elf_entry:          entry as usize,
+                elf_hdr_sz:         ehsz as u16,
+                elf_prg_hdr_off:    phoff as usize,
+                elf_prg_hdr_entsz:  phentsz as u16,
+                elf_prg_hdr_cnt:    phcnt as u16,
+                elf_sec_hdr_off:    shoff as usize,
+                elf_sec_hdr_entsz:  shensz as u16,
+                elf_sec_hdr_cnt:    shcnt as u16,
+                segments:           segments
+        })
     }
 
-    pub fn load_segment(&self, seg_index: usize, dest_addr: usize) -> usize {
+    pub fn load_segment(&mut self, seg_index: usize, dest_addr: usize) -> 
+                                                        Result<usize, Error> {
         let mut xfer_len = 0;
         let mut left = self.segments[seg_index].p_filesz;
         let mut foff = self.segments[seg_index].p_offset;
@@ -460,16 +509,14 @@ impl ELFBinary {
             unsafe {
                 buf = slice::from_raw_parts_mut(dest as *mut u8, bufsz);
             }
-            let ioc = self.mnt.fread(self.hnd, foff, buf);
-            if let IOCompletion::Successful(len) = ioc {
-                // klog!("<{:X}->{:X} len:{}>", foff, dest, len);
-                foff    += len;
-                dest    += len;
-                xfer_len+= len;
-                left    -= len;
-            } else {
-                break; // IO Error
-            }
+            self.file.seek(foff as isize, FileSeekOrigin::Start,
+                                                        FileSeekCursor::Read)?;
+            let len = self.file.read(buf)?;
+            // klog!("<{:X}->{:X} len:{}>", foff, dest, len);
+            foff    += len;
+            dest    += len;
+            xfer_len+= len;
+            left    -= len;
         }
         // If memsz > filesz, the remaining bytes should be zero-initialized. 
         for i in xfer_len..self.segments[seg_index].p_memsz {
@@ -478,7 +525,7 @@ impl ELFBinary {
             }
             xfer_len += 1;
         }
-        xfer_len
+        Ok(xfer_len)
     }
     pub fn log_header(&self) {
         klog!("ELF: Type: {:X}, Machine: {:X}, Entry: {:X}, HeaderSz: {}\n", 
@@ -489,10 +536,4 @@ impl ELFBinary {
             self.elf_sec_hdr_cnt, self.elf_sec_hdr_off, self.elf_sec_hdr_entsz);
     }
     
-}
-
-impl Drop for ELFBinary {
-    fn drop(&mut self) {
-        self.mnt.fclose(self.hnd);
-    }
 }

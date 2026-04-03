@@ -34,12 +34,11 @@ use core::time::Duration;
 use alloc::boxed::Box;
 use alloc::{format, str};
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use util::*;
 use crate::arch::*;
-use crate::drivers::storage::{IOCompletion, num_disks};
-use crate::fs::{DirectoryEntry, MountPoint, enumerate_filesystems};
-use crate::mem::virt::{AddressSpace, FileDescriptor};
+use crate::drivers::storage::num_disks;
+use crate::fs::*;
+use crate::mem::virt::AddressSpace;
 use crate::sched::{SCHEDULER, Scheduler, Task};
 use crate::drivers::input::Keyboard;
 
@@ -58,9 +57,49 @@ macro_rules! dbg {
 }
 
 unsafe extern "C" {
-    static _KERNEL_START: usize;
-    static _KERNEL_END: usize;
+    unsafe static _KERNEL_START: usize;
+    unsafe static _KERNEL_END: usize;
 }
+
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum ErrorCode {
+    NoError             = 0,    // No error, the operation was successful
+    OutOfMemory         = 1,    // Ran out of memory
+    NotSupported        = 2,   // Feature/Operation not supported/implemented
+    NotFound            = 3,    // The requested resource was not found
+    NotIssued           = 4,    // The request couldn't be issued
+    UnexpectedEoF       = 5,    // An unexpected end of file was reached
+    InvalidPID          = 6,    // Invalid Process ID
+    InvalidTID          = 7,    // Invalid Task ID
+    InvalidFD           = 8,    // Invalid File Descriptor
+    InvalidOp           = 9,    // Invalid operation for the target resource
+    InvalidBus          = 10,    // Invalid Bus (e.g., AHCI[1])
+    InvalidDrive        = 11,   // Invalid drive/device
+    InvalidMountPoint   = 12,   // Invalid mount point
+    InvalidPath         = 13,   // Invalid path
+    InvalidHandle       = 14,   // Invalid device handle
+    InvalidBuffer       = 15,   // Invalid buffer pointer/length
+    InvalidArgument     = 16,   // Invalid argument
+    InvalidFormat       = 17,   // Invalid file/data/buffer/etc. format
+    NotAllowed          = 18,   // The operation is not permitted on the resource
+    OutOfBoundIO        = 19,   // The IO is out-of-bound for the resource
+    IOError             = 20,   // An error occurred during IO on the resource
+    Other               = 255,  // Other errors
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Error {
+    pub code: ErrorCode,
+    pub file: &'static str,
+    pub line: u32,
+    pub message: &'static str,
+}
+impl Error {
+    pub const fn new(code: ErrorCode) -> Self {
+        Self { code, file: "", line: 0, message: "" }
+    }
+}
+
 
 static BSP_INITIALIZED : AtomicBool = AtomicBool::new(false);
 
@@ -198,42 +237,42 @@ fn kinit_task(_arg: usize) {
     // Kernel Self-Test - Moved to an fexec call on the machine: file
     // klog!("calling test::kself_test\n");
     // test::kself_test();
-
+    let mut pidopt: Option<usize> = None;
     // Find the initial binary (disk%d.0:/blightos/shell.box) to load
     for d in 0..ndisks {
         let path = format!("disk{}.0:/blightos/shell.box", d);
         // Open the file (if exists)
-        let Some(mnt) = MountPoint::from_path(path.as_str()) else {
-            // Invalid mount point - try the next disk
-            continue;
-        };
-        let fopen_ret = mnt.fopen(path.as_str());
-        let drivers::storage::IOCompletion::Successful(hnd) = fopen_ret else {
-            // File not found - try the next disk
-            continue;
-        };
-        dbg!("  Found INIT program at {} on disk {} - Free frames: {}\n", 
-                path, d, crate::mem::phys::pmm_num_free_frames());
-        let Some(elf) = ELFBinary::from_file(mnt.clone(), hnd) else {
-            // Invalid ELF file - try the next disk
-            continue;
-        };
-        // elf.log_header();
-        // klog!("Segments:\n");
-        // for i in 0..elf.segments.len() {
-        //     klog!("  {:X?}\n", elf.segments[i]);
-        // }
-        let pname = "shell.box".to_string();
-        let Some(pid) = AddressSpace::spawn_from_elf(&elf, pname, path) else {
-            // Failed to spawn the process from the ELF file - Panic
-            panic!("Failed to spawn the INIT process from the ELF file!");
-        };
-        dbg!("  Launching the INIT process.. {}({}) - Free frames: {}\n",
-                Task::name(), Task::current_tid(),
-                crate::mem::phys::pmm_num_free_frames());
-        Keyboard::clear_buffer();
-        AddressSpace::launch_as_main(pid);
-        // ELFBinary goes out of scope and releases closes the file        
+        match ELFBinary::from_path(path.as_str()) {
+            Ok(mut elf) => {
+                dbg!("  Found INIT program at {} on disk {} - Free frames: {}\n", 
+                    path.as_str(), d, crate::mem::phys::pmm_num_free_frames());
+                // elf.log_header();
+                // klog!("Segments:\n");
+                // for i in 0..elf.segments.len() {
+                //     klog!("  {:X?}\n", elf.segments[i]);
+                // }
+                let pname = "shell.box".to_string();
+                let pidr = AddressSpace::spawn_from_elf(
+                                                &mut elf, pname, path.clone());
+                if pidr.is_err() {
+                    klog!("  Failed to launch the INIT process from {} due to \
+                        {:?}\n", path.as_str(), pidr.err());
+                    continue;
+                }
+                pidopt = Some(pidr.unwrap());
+                break;
+            },
+            Err(_e) => {
+                continue;
+            }
+        }
+    }
+    if let Some(pid) = pidopt {
+        dbg!("  {}({}) is launching the INIT process ({}) - Free frames: {}\n",
+                        Task::name(), Task::current_tid(), pid,
+                        crate::mem::phys::pmm_num_free_frames());
+                Keyboard::clear_buffer();
+                AddressSpace::launch_as_main(pid);
     }
     panic!("/blightos/shell.box not found on any supported disk partition!");
     
@@ -268,20 +307,7 @@ pub enum SyscallRsvdFDs {
     SystemResources = 2,
     Max             = 3,
 }
-pub enum Syscall {
-    // Task/Process control
-    TaskControl{opcode: usize, args: usize, ret_code: usize},
-    ProcControl{opcode: usize, args: usize, ret_code: usize},
 
-    // Device/File control
-    Open{path_ptr: usize, path_len: usize, mode: usize, ret_ptr: usize},
-    // Enum returns file/directory/device information
-    Enum{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
-    Read{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
-    Write{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
-    Exec{fd: usize, cmd_buf_ptr: usize, cmd_buf_len: usize, ret_ptr: usize},
-    Close{fd: usize},
-}
 pub type SyscallHandlerFn = fn(usize, usize, usize, usize);
 
 fn copy_to_user<T>(dst_ptr: usize, ret_val: T) {
@@ -597,27 +623,14 @@ fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
             Some(idx) => &path[idx + 1..],
             None => path
         };
-        // Get the fops from the mount-point
-        let Some(mnt) = MountPoint::from_path(path) else {
-            // Invalid Mount Point
-            copy_to_user(ret_ptr, 0);
-            return;
-        };
-        // Open the ELF file
-        let fopen_ret = mnt.fopen(path);
-        let IOCompletion::Successful(hnd) = fopen_ret else {
-            // Couldn't open the file
-            copy_to_user(ret_ptr, 0);
-            return;
-        };
-        // Parse the ELF file
-        let Some(elf) = ELFBinary::from_file(mnt.clone(), hnd) else {
+        // Open/parse the ELF file
+        let Ok(mut elf) = ELFBinary::from_path(path) else {
             // Invalid ELF file
             copy_to_user(ret_ptr, 0);
             return;
         };
         // Spawn a new process address space
-        let Some(pid) = AddressSpace::spawn_from_elf(&elf,
+        let Ok(pid) = AddressSpace::spawn_from_elf(&mut elf,
                                 pname.to_string(), cmd_line.to_string()) else {
             // Failed to spawn the process from the ELF file
             copy_to_user(ret_ptr, 0);
@@ -659,6 +672,49 @@ fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
 //
 // Virtual File System Control System Calls
 //
+#[repr(C, packed)]
+pub struct VfsOpenArgs {
+    // Inputs from user-space
+    pub path_ptr: usize,  // Pointer to the file path string in user-space
+    pub path_len: usize,  // Length of the file path string
+    pub mode:     usize,  // A combination of File::MODE_* flags
+    // Output to user-space
+    pub fd:       usize,  // File descriptor for the opened file (0 if failed)
+    pub attr:     usize,  // A combination of DirectoryEntry::FLG_* flags
+    pub size:     usize,  // Size of the file in bytes (0 if failed)
+}
+
+#[repr(C, packed)]
+pub struct VfsEnumArgs {
+    // Inputs from user-space
+    pub fd:       usize,  // The target file/directory/device to enumerate
+    pub buf_ptr:  usize,  // Pointer to the output buffer in user-space
+    pub buf_len:  usize,  // Length of the output buffer
+    pub skip:     usize,  // Number of entries to skip for pagination 
+                          // (0 for the first call)
+    // Output to user-space:
+    pub count:    usize,  // Number of entries enumerated
+}
+
+#[repr(C, packed)]
+pub struct VfsReadWriteArgs {
+    pub fd:       usize,  // The target file/device to read/write
+    pub offset:   usize,  // Offset in the file/device to read/write
+    pub buf_ptr:  usize,  // Pointer to the buffer in user-space
+    pub buf_len:  usize,  // Length of the buffer
+    // Output to user-space:
+    pub bytes:    usize,  // Number of bytes actually read/written
+}
+
+#[repr(C, packed)]
+pub struct VfsExecArgs {
+    pub fd:         usize,  // The target file/device to execute
+    pub func_code:  usize,  // The command/function code to execute
+    pub args_ptr:   usize,  // Pointer to the command buffer in user-space
+    pub args_len:   usize,  // Length of the command buffer
+    // Output to user-space
+    pub ret_val:    usize,  // Return value from the executed command
+}
 
 // ret_code = 0 no error
 fn syscall_read_resources(out_buffer: &mut [u8], _offset: usize) -> usize {
@@ -683,225 +739,331 @@ fn syscall_read_resources(out_buffer: &mut [u8], _offset: usize) -> usize {
     out_index
 }
 
-fn syscall_open(path_ptr: usize, path_len: usize, _mode: usize, ret_ptr: usize) {
+fn syscall_open(args_ptr: usize, args_len: usize, _: usize, ret_ptr: usize) {
+    if ret_ptr == 0 {
+        // Invalid return pointer
+        return;
+    } 
+    if args_ptr == 0 || args_len != size_of::<VfsOpenArgs>() {
+        // Invalid arguments pointer/length
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    }
+    let Some(mut args) = copy_from_user::<VfsOpenArgs>(args_ptr) else {
+        // Invalid arguments pointer
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    };
     let pathb;
     unsafe {
-        pathb = core::slice::from_raw_parts(path_ptr as *const u8, path_len);
+        pathb = core::slice::from_raw_parts(args.path_ptr as *const u8,
+                                            args.path_len);
     }
     let Ok(path) = str::from_utf8(pathb) else {
         // Invalid path string
-        copy_to_user(ret_ptr, 0 as usize);
+        copy_to_user(ret_ptr, ErrorCode::InvalidPath);
         return;
     };
-    if let Some(mnt) = MountPoint::from_path(path) {
-        let fopen_ret = mnt.fopen(path);      
-        match fopen_ret {
-            drivers::storage::IOCompletion::Successful(hnd)  => {
-                // let fd = AddressSpace::add_file_object(pid, f);
-                // klog!("OPEN syscall successful for {} hnd={}\n", path, hnd);
-                let pid = Task::current_pid();
-                let fd_obj = FileDescriptor {
-                                fs_handle: hnd,
-                                mount_name: mnt.name.clone(),
-                                read_off: 0,
-                                write_off: 0,
-                };
-                let fd = AddressSpace::add_fd(pid, fd_obj);
-                if ret_ptr != 0 {
-                    // For now just add 4 to the hnd to obtain an FD
-                    copy_to_user(ret_ptr, fd);
-                }
-            },
-            _                   => {
-                dbg!("OPEN syscall failed for {} w\\ {:?}\n", path, fopen_ret);
-                copy_to_user(ret_ptr, 0 as usize);
-            }
+    
+    match File::open(path, args.mode) {
+        Ok(file) => {
+            let pid = Task::current_pid();
+            args.attr = file.dir_entry.flags;
+            args.size = file.dir_entry.size;
+            let fd = AddressSpace::add_file(pid, file);
+            args.fd = fd;
+            copy_to_user(args_ptr, args);
+            copy_to_user(ret_ptr, ErrorCode::NoError);
+        },
+        Err(e) => {
+            // Failed to open the file
+            dbg!("OPEN syscall failed for {} due to {:?}\n", path, e);
+            copy_to_user(ret_ptr, e);
         }
-    } else {
-        // Device not found
-        // TODO need a way to pass different error codes
-        copy_to_user(ret_ptr, 0 as usize);
     }
-    // klog!("\nSyscall: OPEN({}, {}, {}) by PID:{} TID:{}\n{:?}", 
-    //         path, path_len, mode, Task::current_pid(), Task::current_tid());
 }
 
-fn syscall_read(fd: usize, buf: usize, len: usize, ret_ptr: usize) {
-    if fd == SyscallRsvdFDs::StandardIO as usize && len >= 1 {
+fn syscall_enum(args_ptr: usize, args_len: usize, _: usize, ret_ptr: usize) {
+    if ret_ptr == 0 {
+        // Invalid return pointer
+        return;
+    }
+    if args_ptr == 0 || args_len != size_of::<VfsEnumArgs>() {
+        // Invalid arguments pointer/length
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    }
+    let Some(mut args) = copy_from_user::<VfsEnumArgs>(args_ptr) else {
+        // Invalid arguments pointer
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    };
+    if args.fd <= SyscallRsvdFDs::SystemResources as usize {
+        //Enum not supported on special FDs!
+        copy_to_user(ret_ptr, ErrorCode::NotAllowed);
+        return;
+    }
+
+    let pid = Task::current_pid();
+    match AddressSpace::get_file(pid, args.fd) {
+        Ok(file) => {
+            // Enum the file if it's a directory
+            match file.enumerate() {
+                Ok(entries) => {
+                    let mut serialized = String::new();
+                    // Todo - implement the skip mode
+                    // Todo - return a well-structured data instead of a string
+                    //args.count = entries.len();
+                    for item in entries {
+                        serialized += format!("{}, {}, 0x{:X}\n",
+                                    item.name, item.size, item.flags).as_str();
+                    }
+                    let len = min(args.buf_len, serialized.len());
+                    unsafe {
+                        let out = core::slice::from_raw_parts_mut(
+                                                args.buf_ptr as *mut u8, len);
+                        out[0..len].copy_from_slice(serialized.as_bytes());
+                    }
+                    args.count = len;
+                    copy_to_user(args_ptr, args);
+                    copy_to_user(ret_ptr, ErrorCode::NoError);
+                },
+                Err(e) => {
+                    // Enum failed/not-supported
+                    dbg!("ENUM syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                            e, pid, args.fd);
+                    copy_to_user(ret_ptr, e.code);
+                }
+            }
+        },
+        Err(e) => {
+            // Invalid PID/FD
+            dbg!("ENUM syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                    e, pid, args.fd);
+            copy_to_user(ret_ptr, e.code);
+        }
+    } 
+}
+
+fn syscall_read(args_ptr: usize, args_len: usize, _: usize, ret_ptr: usize) {
+    if ret_ptr == 0 {
+        // Invalid return pointer
+        return;
+    }
+    if args_ptr == 0 || args_len != size_of::<VfsReadWriteArgs>() {
+        // Invalid arguments pointer/length
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    }
+    let Some(mut args) = copy_from_user::<VfsReadWriteArgs>(args_ptr) else {
+        // Invalid arguments pointer
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    };
+    if args.fd == SyscallRsvdFDs::StandardIO as usize && args.buf_len >= 1 {
         // Standard input - keyboard
         unsafe {
             // return the last keychar to the user-space
-            let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
+            let out = core::slice::from_raw_parts_mut(args.buf_ptr as *mut u8,
+                                                                args.buf_len);
             out[0] = Keyboard::pop_ascii();
-                
         }
+        args.bytes = 1;
+        copy_to_user(args_ptr, args);
+        copy_to_user(ret_ptr, ErrorCode::NoError);
         return;
-    } else if fd == SyscallRsvdFDs::SystemResources as usize {
+    }
+    if args.fd == SyscallRsvdFDs::SystemResources as usize {
         // Resource Enumeration
-        let out = unsafe {core::slice::from_raw_parts_mut(buf as *mut u8, len)};
-        let ret_val = syscall_read_resources(out, 0);
-        copy_to_user(ret_ptr, ret_val);
+        unsafe {
+            let out = core::slice::from_raw_parts_mut(args.buf_ptr as *mut u8,
+                                                                args.buf_len);
+            let len = syscall_read_resources(out, 0);
+            args.bytes = len;
+        }
+        copy_to_user(args_ptr, args);
+        copy_to_user(ret_ptr, ErrorCode::NoError);
         return;
     }
-    // Normal File Read
+    // Normal File/Device Read
     let pid = Task::current_pid();
-    if let Some(mut fd_obj) = AddressSpace::get_fd(pid, fd) {
-        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
+    let fd = args.fd;
+    match AddressSpace::get_file(pid, fd) {
+        Ok(mut file) => {
+            let seekr = file.seek(args.offset as isize, 
+                            FileSeekOrigin::Start, FileSeekCursor::Read);
+            if let Err(e) = seekr {
+                // Invalid offset
+                dbg!("READ syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                                                            pid, fd, e);
+                copy_to_user(ret_ptr, e.code);
+                return;
+            };
+            let rr;
             unsafe {
-                let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
-                let ioc = mnt.fread(fd_obj.fs_handle, fd_obj.read_off, out);
-                let ret_val;
-                if let IOCompletion::Successful(len) = ioc {
-                    fd_obj.read_off += len;
-                    AddressSpace::update_fd(pid, fd, &fd_obj);
-                    ret_val = len;
-                } else {
-                    ret_val = 0;
+                let out = core::slice::from_raw_parts_mut(
+                                        args.buf_ptr as *mut u8, args.buf_len);
+                rr = file.read(out);
+            };
+            match rr {
+                Ok(bytes_read) => {
+                    args.bytes = bytes_read;
+                    copy_to_user(args_ptr, args);
+                    copy_to_user(ret_ptr, ErrorCode::NoError);
+                },
+                Err(e) => {
+                    // Read failed
+                    dbg!("READ syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                                                            pid, fd, e);
+                    copy_to_user(ret_ptr, e.code);
                 }
-                copy_to_user(ret_ptr, ret_val);
             }
-        } else {
-            // Invalid Mount Point
-            dbg!("READ syscall failed due to invalid Mount Point {}\n", fd);
-            copy_to_user(ret_ptr, 0 as usize);
+        },
+        Err(e) => {
+            // Invalid PID/FD
+            dbg!("READ syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                                                            pid, args.fd, e);
+            copy_to_user(ret_ptr, e.code);
+            return;
         }
-    } else {
-        // Invalid FD
-        dbg!("READ syscall failed due to invalid FD {}\n", fd);
-        copy_to_user(ret_ptr, 0 as usize);
     }
 }
 
-fn syscall_enum(fd: usize, buf: usize, buf_len: usize, ret_ptr: usize) {
-    if fd <= SyscallRsvdFDs::SystemResources as usize {
-        //Enum not supported on special FDs!
-        copy_to_user(ret_ptr, 0 as usize);
+
+fn syscall_write(args_ptr: usize, args_len: usize, _: usize, ret_ptr: usize) {
+    if ret_ptr == 0 {
+        // Invalid return pointer
         return;
     }
-
-    let pid = Task::current_pid();
-    if let Some(fd_obj) = AddressSpace::get_fd(pid, fd) {
-        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
-            let mut out_vec: Vec<DirectoryEntry> = Vec::new();
-            let ioc = mnt.fenum(fd_obj.fs_handle, &mut out_vec);
-            if let IOCompletion::Successful(_cnt) = ioc {
-                let mut serialized = String::new();
-                for item in out_vec {
-                    serialized += format!("{}, {}, 0x{:X}\n",
-                                    item.name, item.size, item.flags).as_str();
-                }
-                let len = min(buf_len, serialized.len());
-                unsafe {
-                    let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
-                    out[0..len].copy_from_slice(serialized.as_bytes());
-                }
-                copy_to_user(ret_ptr, len);
-            } else {
-                // Enum failed/not-supported
-                copy_to_user(ret_ptr, 0 as usize);
-            }
-        } else {
-            // Invalid Mount Point
-            dbg!("ENUM syscall failed due to invalid Mount Point {}\n", fd);
-            copy_to_user(ret_ptr, 0 as usize);
-        }
-    } else {
-        // Invalid FD
-        dbg!("ENUM syscall failed due to invalid FD {}\n", fd);
-        copy_to_user(ret_ptr, 0 as usize);
-    }    
-}
-
-
-fn syscall_write(fd: usize, buf: usize, len: usize, ret_ptr: usize) {
-    if fd == SyscallRsvdFDs::StandardIO as usize {
+    if args_ptr == 0 || args_len != size_of::<VfsReadWriteArgs>() {
+        // Invalid arguments pointer/length
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    }
+    let Some(mut args) = copy_from_user::<VfsReadWriteArgs>(args_ptr) else {
+        // Invalid arguments pointer
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    };
+    // Special FDs
+    if args.fd == SyscallRsvdFDs::StandardIO as usize {
         // Standard output - VGA console
         unsafe {
-            kearly_console::print_str(
-                        core::slice::from_raw_parts(buf as *const u8, len));
-            
+            let buf = core::slice::from_raw_parts(args.buf_ptr as *const u8,
+                                                    args.buf_len);
+            // Todo - support cursor movement
+            kearly_console::print_str(buf);
+            args.bytes = args.buf_len;
         }
+        copy_to_user(args_ptr, args);
+        copy_to_user(ret_ptr, ErrorCode::NoError);
         return;
     }
     // Normal File Write
     let pid = Task::current_pid();
-    if let Some(mut fd_obj) = AddressSpace::get_fd(pid, fd) {
-        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
+    let fd = args.fd;
+    match AddressSpace::get_file(pid, fd) {
+        Ok(mut file) => {
+            let seekr = file.seek(args.offset as isize, 
+                            FileSeekOrigin::Start, FileSeekCursor::Write);
+            if let Err(e) = seekr {
+                // Invalid offset
+                dbg!("WRITE syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                                                            pid, fd, e);
+                copy_to_user(ret_ptr, e.code);
+                return;
+            };
+            let wr;
             unsafe {
-                let out = core::slice::from_raw_parts_mut(buf as *mut u8, len);
-                let ioc = mnt.fwrite(fd_obj.fs_handle, fd_obj.write_off, out);
-                let ret_val;
-                if let IOCompletion::Successful(len) = ioc {
-                    fd_obj.write_off += len;
-                    AddressSpace::update_fd(pid, fd, &fd_obj);
-                    ret_val = len;
-                } else {
-                    ret_val = 0;
+                let buf = core::slice::from_raw_parts(
+                                    args.buf_ptr as *const u8, args.buf_len);
+                wr = file.write(buf);
+            };
+            match wr {
+                Ok(bytes_written) => {
+                    args.bytes = bytes_written;
+                    copy_to_user(args_ptr, args);
+                    copy_to_user(ret_ptr, ErrorCode::NoError);
+                },
+                Err(e) => {
+                    // Write failed
+                    dbg!("WRITE syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                                                            pid, fd, e);
+                    copy_to_user(ret_ptr, e.code);
                 }
-                copy_to_user(ret_ptr, ret_val);
             }
-        } else {
-            // Invalid Mount Point
-            dbg!("WRITE syscall failed due to invalid Mount Point {}\n", fd);
-            copy_to_user(ret_ptr, 0 as usize);
+        },
+        Err(e) => {
+            // Invalid PID/FD
+            dbg!("WRITE syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                                                            pid, fd, e);
+            copy_to_user(ret_ptr, e.code);
+            return;
         }
-    } else {
-        // Invalid FD
-        dbg!("WRITE syscall failed due to invalid FD {}\n", fd);
-        copy_to_user(ret_ptr, 0 as usize);
-    }
-    
+    }    
 }
 
-fn syscall_exec(fd: usize, cmd_ptr: usize, cmd_len: usize, fr_ptr: usize) {
+fn syscall_exec(args_ptr: usize, args_len: usize, _: usize, ret_ptr: usize) {
+    if ret_ptr == 0 {
+        // Invalid return pointer
+        return;
+    }
+    if args_ptr == 0 || args_len != size_of::<VfsExecArgs>() {
+        // Invalid arguments pointer/length
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    }
+    let Some(mut args) = copy_from_user::<VfsExecArgs>(args_ptr) else {
+        // Invalid arguments pointer
+        copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+        return;
+    };
     let pid = Task::current_pid();
-    if fd == SyscallRsvdFDs::StandardIO as usize {
+    // Special FDs
+    if args.fd == SyscallRsvdFDs::StandardIO as usize {
         // Exec the command on the shell
-        if cmd_ptr == 1 && cmd_len == 0 {
+        if args.func_code == 1 {
             // Clear screen
             kearly_console::init();
-        }
-    } else if let Some(fd_obj) = AddressSpace::get_fd(pid, fd) {
-        // Normal files/devices
-        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
-            let cmd_func;
-            let mut ret_val: usize = 0;
-            unsafe {
-                cmd_func = (fr_ptr as *mut usize).read();
-                let cmd_buf = core::slice::from_raw_parts_mut(cmd_ptr as *mut u8, cmd_len);
-
-                dbg!("syscall_exec called on fd:{}, mnt:{}, func:{}\n",
-                    fd, mnt.name, cmd_func
-                    );
-
-                let ioc = mnt.fexec(fd_obj.fs_handle, cmd_func, cmd_buf);
-                if let IOCompletion::Successful(len) = ioc {
-                    ret_val = len;
-                }
-                copy_to_user(fr_ptr, ret_val);
-            }
+            copy_to_user(ret_ptr, ErrorCode::NoError);
         } else {
-            // Invalid Mount Point
-            dbg!("EXEC syscall failed due to invalid Mount Point {}\n", fd);
-            copy_to_user(fr_ptr, 0 as usize);
+            copy_to_user(ret_ptr, ErrorCode::InvalidOp);
         }
-    } else {
-        // Invalid FD
-        dbg!("EXEC syscall failed due to invalid FD {}\n", fd);
-        copy_to_user(fr_ptr, 0 as usize);
-    }    
+        return;
+    }
+    // Normal Device File Command Execution
+    match AddressSpace::get_file(pid, args.fd) {
+        Ok(mut file) => {
+            let cmd_buf;
+            unsafe {
+                cmd_buf = core::slice::from_raw_parts_mut(
+                                    args.args_ptr as *mut u8, args.args_len);
+            }
+            let exr = file.execute(args.func_code, cmd_buf);
+            match exr {
+                Ok(func_ret) => {
+                    args.ret_val = func_ret;
+                    copy_to_user(args_ptr, args);
+                    copy_to_user(ret_ptr, ErrorCode::NoError);
+                },
+                Err(e) => {
+                    // Exec failed/not-supported
+                    dbg!("EXEC syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                                                            pid, args.fd, e);
+                    copy_to_user(ret_ptr, e.code);
+                }
+            }
+        },
+        Err(e) => {
+            // Invalid PID/FD
+            dbg!("EXEC syscall failed (PID: {}, FD: {}) due to {:?}\n",
+                                                            pid, args.fd, e);
+            copy_to_user(ret_ptr, e.code);
+        }
+    }
 }
 
 fn syscall_close(fd: usize, _: usize, _: usize, _: usize) {
     let pid = Task::current_pid();
-    let mut closed = false;
-    if let Some(fd_obj) = AddressSpace::get_fd(pid, fd) {
-        if let Some(mnt) = MountPoint::from_path(&fd_obj.mount_name) {
-            mnt.fclose(fd_obj.fs_handle);
-            closed = true;
-        }
-    }
-    if closed {
-        AddressSpace::rem_file_object(pid, fd);
-    }
+    AddressSpace::remove_file(pid, fd);
 }

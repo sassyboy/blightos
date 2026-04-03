@@ -14,13 +14,13 @@ use core::time::Duration;
 use alloc::collections::linked_list::LinkedList;
 use alloc::{format, vec::*};
 use crate::arch::{self, SystemTimer, SystemTimerTrait};
-use crate::drivers::storage::{BusType, DISK_LIST, Disk, IOCompletion, IOOperation, IORequest};
+use crate::drivers::storage::{BusType, DISK_LIST, Disk, IOOperation, IORequest};
 use crate::drivers::*;
 use crate::drivers::pci::*;
 use crate::mem::phys::*;
 use crate::sched::Task;
 use crate::util::*;
-
+use crate::Error;
 pub static AHCI_BUS: Spinlock<AHCIBus> = Spinlock::new(AHCIBus::new());
 
 #[cfg(feature="debug_ahci")]
@@ -525,9 +525,9 @@ impl AHCIBus {
             None    => {
                 // Immediate failure -> add the completion object now
                 if iorq.op == IOOperation::Read {
-                    iorq.completion_code = IOCompletion::NotIssued;
+                    iorq.completion = Err(error!(ErrorCode::NotIssued));
                 } else {
-                    iorq.completion_code = IOCompletion::InvalidOp;
+                    iorq.completion = Err(error!(ErrorCode::InvalidOp));
                 }
                 ahci.drives[drive_id as usize].completed_queue.push_back(iorq);
             },
@@ -547,12 +547,12 @@ impl AHCIBus {
         let mut cpyrq = iorq.clone();
         cpyrq.ts_issued = SystemTimer::current_timestamp();
         if dsk.bus != BusType::AHCI || dsk.bus_id != 0 {
-            cpyrq.completion_code = IOCompletion::InvalidBus;
+            cpyrq.completion = Err(error!(ErrorCode::InvalidBus));
             (iorq.completion_cb)(cpyrq);
             return;
         }
         if iorq.lba + iorq.sectors as u64 > dsk.sector_count {
-            cpyrq.completion_code = IOCompletion::OutOfBoundIO;
+            cpyrq.completion = Err(error!(ErrorCode::OutOfBoundIO));
             (iorq.completion_cb)(cpyrq);
             return;
             
@@ -560,7 +560,7 @@ impl AHCIBus {
         { // CRITICAL SECTION!
             let mut ahci = AHCI_BUS.lock();
             if dsk.drive_id as usize >= ahci.drives.len() {
-                cpyrq.completion_code = IOCompletion::InvalidDrive; 
+                cpyrq.completion = Err(error!(ErrorCode::InvalidDrive));
                 (iorq.completion_cb)(cpyrq);
                 return;
             }
@@ -601,7 +601,7 @@ impl AHCIBus {
                                             .expect("IO Submission Queue Bug!");
                 let cmd_index = ioreq.driver_priv;
                 if cmd_issue & (1 << cmd_index) == 0 {
-                    ioreq.completion_code = IOCompletion::Successful(
+                    ioreq.completion = Ok(
                         ahci.drives[drv].read_cmd_header(cmd_index).xfered_bytes
                         as usize
                     );

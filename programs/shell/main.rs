@@ -45,13 +45,19 @@ fn main() {
             }
         }else if   cmd.starts_with("cd ") {
             let path = Path::from(&cmd[3..cnt]);
-            if path.exists() {
-                let _ = set_current_dir(path.as_str());
+            let fort = File::from_path(&path, File::MODE_READ);
+            let Ok(file) = fort else {
+                let e = fort.err().unwrap();
+                println!("Path {} doesn't exist - {:?}", path.as_str(), e);
+                continue;
+            };
+            if !file.is_dir() {
+                println!("Path {} is not a directory", path.as_str());
             } else {
-                println!("Path {} doesn't exist", path.as_str());
+                let _ = set_current_dir(path.as_str());
             }
-        } else if   cmd.starts_with("txtdump ") {
-            let path = Path::from(&cmd[8..cnt]);
+        } else if   cmd.starts_with("rd ") {
+            let path = Path::from(&cmd[3..cnt]);
             exec_textdump(&path);
         } else if   cmd.starts_with("hexdump ") {
             let path = Path::from(&cmd[8..]);
@@ -98,7 +104,7 @@ fn main() {
             } else {
                 exec_path = Path::from(&format!("{}.box", cmd_exec));
             }
-            if exec_path.exists() {
+            if let Ok(_) = File::from_path(&exec_path, File::MODE_RX) {
                 // Run the binary from the current directory
                 run_executable(exec_path.as_str(), cmd_args);
                 continue;
@@ -107,7 +113,8 @@ fn main() {
             if let Some(last_slash) = exec_path.as_str().rfind('/') {
                 let exec_fname = &exec_path.as_str()[last_slash + 1..];
                 let exec_path = Path::from(&format!("{}{}", bin_path, exec_fname));
-                if exec_path.exists() {
+                let fort = File::from_path(&exec_path, File::MODE_RX);
+                if let Ok(_) = fort {
                     run_executable(exec_path.as_str(), cmd_args);
                     continue;
                 }
@@ -125,9 +132,9 @@ fn print_help() {
          ls [path]       Similar to ls but looks under the current-directory/path\n\
          [command]       Executes command.box in the current directory or in \
                          blightos/ if it exists\n\
-         txtdump [path]  Reads the file located in the path and prints its content\n\
-         hexdump [path]  Similar to txtdump but in HEX\n\
          wr [path] [txt] Writes the text to the file located in the path\n\
+         rd [path]       Reads the file located in the path and prints its content\n\
+         hexdump [path]  Similar to rd but in HEX\n\
          exit            Ends the shell program\n\
          cls             Clears the screen\n\
          reboot          Reboots the machine\n\
@@ -138,41 +145,65 @@ fn print_help() {
 
 
 fn print_system_resources() {
-    let mut buff: [u8; 64] = [0; 64];
-    let mut cnt = fread(SyscallRsvdFDs::SystemResources as usize, &mut buff);  
-    println!("Available system resources ({}):", cnt);
-    if cnt > 0 && buff[cnt-1] == b'\n' {
-        cnt -= 1;
+    let mut buff: [u8; 256] = [0; 256];
+    match fread(SyscallRsvdFDs::SystemResources as usize, 0, &mut buff) {
+        Ok(mut cnt) => {
+            println!("Available system resources ({}):", cnt);
+            if cnt > 0 && buff[cnt-1] == b'\n' {
+                cnt -= 1;
+            }
+            println!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
+        }
+        Err(e) => {
+            println!("Failed to read system resources - {:?}", e);
+            return;
+        }
     }
-    println!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
 }
 
 fn exec_ls(path: &Path) {
     let mut buff: [u8; 512] = [0; 512];
 
-    let Ok(dir) = File::from_path(path) else {
-        println!("Path {} doesn't exist", path.as_str());
-        return;
-    };
-    let cnt = dir.enum_dir(&mut buff);
-    if cnt > 0 {
-        // It already ends with a newline
-        print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());  
-    } else {
-        println!("");
+    match File::from_path(path, File::MODE_READ) {
+        Ok(dir) => {
+            match dir.enum_dir(&mut buff) {
+                Ok(cnt) => {
+                    if cnt > 0 && buff[cnt-1] == b'\n' {
+                        // It already ends with a newline
+                        print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());  
+                    } else {
+                        println!("");
+                    }
+                },
+                Err(e) => {
+                    println!("Failed to read directory {} - {:?}",
+                                                path.as_str(), e);
+                }
+            }
+        },
+        Err(e) => {
+            println!("Path {} doesn't exist - {:?}", path.as_str(), e);
+        }
     }
 }
 
 fn exec_textdump(path: &Path) {
     let mut buff: [u8; 64] = [0; 64];
-    let Ok(file) = File::from_path(path) else {
-        println!("Path {} doesn't exist", path.as_str());
+    let fort = File::from_path(path, File::MODE_READ);
+    let Ok(mut file) = fort else {
+        let e = fort.err().unwrap();
+        println!("Can't open {} - {:?}", path.as_str(), e);
         return;
     };
     loop {
-        let cnt = file.read(&mut buff);
-        if cnt > 0 {
-            print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
+        let rdrt = file.read(&mut buff);
+        let Ok(len) = rdrt else {
+            let e = rdrt.err().unwrap();
+            println!("Can't read from {} - {:?}", path.as_str(), e);
+            return;
+        };
+        if len > 0 {
+            print!("{}", str::from_utf8(&buff[0..len]).unwrap());
         } else {
             break;
         }
@@ -182,13 +213,20 @@ fn exec_textdump(path: &Path) {
 
 fn exec_hexdump(path: &Path) {
     let mut buff: [u8; 16] = [0; 16];
-    let Ok(file) = File::from_path(path) else {
-        println!("Path {} doesn't exist", path.as_str());
+    let fort = File::from_path(path, File::MODE_READ);
+    let Ok(mut file) = fort else {
+        let e = fort.err().unwrap();
+        println!("Can't open {} - {:?}", path.as_str(), e);
         return;
     };
     let mut offset: usize = 0;
     loop {
-        let cnt = file.read(&mut buff);
+        let rdrt = file.read(&mut buff);
+        let Ok(cnt) = rdrt else {
+            let e = rdrt.err().unwrap();
+            println!("Can't read from {} - {:?}", path.as_str(), e);
+            return;
+        };
         if cnt > 0 {
             print!("{:08X}  ", offset);
             for i in 0..cnt {
@@ -216,11 +254,19 @@ fn exec_hexdump(path: &Path) {
 }
 
 fn exec_write(path: &Path, text: &str) {
-    let Ok(file) = File::from_path(path) else {
-        println!("Path {} doesn't exist", path.as_str());
+    let fort = File::from_path(path, File::MODE_WRITE);
+    let Ok(mut file) = fort else {
+        let e = fort.err().unwrap();
+        println!("Can't open {} - {:?}", path.as_str(), e);
         return;
     };
-    let _ = file.write(text.as_bytes());
+    let wrrt = file.write(text.as_bytes());
+    let Ok(len) = wrrt else {
+        let e = wrrt.err().unwrap();
+        println!("Can't write to {} - {:?}", path.as_str(), e);
+        return;
+    };
+    println!("Successfully wrote {} bytes to {}", len, path.as_str());
 }
 
 fn run_executable(path: &str, args: &str) {
@@ -241,21 +287,37 @@ fn run_executable(path: &str, args: &str) {
 }
 
 fn exec_reboot() {
-    let Ok(file) = File::from_path(&Path::from("machine:/")) else {
-        println!("Could not open the machine:/ file");
+    let fort = File::from_path(&Path::from("machine:/"), File::MODE_EXEC);
+    let Ok(file) = fort else {
+        let e = fort.err().unwrap();
+        println!("Can't open the machine:/ - {:?}", e);
         return;
     };
     let mut buf: [u8; 8] = [0; 8];
-    let _= file.exec(1, &mut buf);
+    let fxrt = file.exec(1, &mut buf);
+    let Ok(func_ret) = fxrt else {
+        let e = fxrt.err().unwrap();
+        println!("Failed to execute reboot - {:?}", e);
+        return;
+    };
+    println!("Reboot function returned: {}", func_ret);
 }
 
 fn exec_ktest() {
-    let Ok(file) = File::from_path(&Path::from("machine:/")) else {
-        println!("Could not open the machine:/ file");
+    let fort = File::from_path(&Path::from("machine:/"), File::MODE_EXEC);
+    let Ok(file) = fort else {
+        let e = fort.err().unwrap();
+        println!("Can't open the machine:/ - {:?}", e);
         return;
     };
     let mut buf: [u8; 8] = [0; 8];
-    let _= file.exec(2, &mut buf);
+    let fxrt = file.exec(2, &mut buf);
+    let Ok(func_ret) = fxrt else {
+        let e = fxrt.err().unwrap();
+        println!("Failed to execute kernel test - {:?}", e);
+        return;
+    };
+    println!("Kernel test function returned: {}", func_ret);
 }
 
 

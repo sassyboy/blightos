@@ -22,20 +22,62 @@ use crate::syscall::*;
 ///
 /// Error handling
 /// 
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
 pub enum ErrorCode {
-    NotFound        = 1,
-    NotAllowed      = 2,
-    InvalidInput    = 3,
-    InvalidHandle   = 4,
-    InvalidData     = 5,
-    InvalidOp       = 6,
-    Unsupported     = 7,
-    UnexpectedEoF   = 8,
-    IOError         = 9,
-    OutOfMemory     = 10,
-    Other           = 255
+    NoError             = 0,    // No error, the operation was successful
+    OutOfMemory         = 1,    // Ran out of memory
+    NotSupported        = 2,   // Feature/Operation not supported/implemented
+    NotFound            = 3,    // The requested resource was not found
+    NotIssued           = 4,    // The request couldn't be issued
+    UnexpectedEoF       = 5,    // An unexpected end of file was reached
+    InvalidPID          = 6,    // Invalid Process ID
+    InvalidTID          = 7,    // Invalid Task ID
+    InvalidFD           = 8,    // Invalid File Descriptor
+    InvalidOp           = 9,    // Invalid operation for the target resource
+    InvalidBus          = 10,    // Invalid Bus (e.g., AHCI[1])
+    InvalidDrive        = 11,   // Invalid drive/device
+    InvalidMountPoint   = 12,   // Invalid mount point
+    InvalidPath         = 13,   // Invalid path
+    InvalidHandle       = 14,   // Invalid device handle
+    InvalidBuffer       = 15,   // Invalid buffer pointer/length
+    InvalidArgument     = 16,   // Invalid argument
+    InvalidFormat       = 17,   // Invalid file/data/buffer/etc. format
+    NotAllowed          = 18,   // The operation is not permitted on the resource
+    OutOfBoundIO        = 19,   // The IO is out-of-bound for the resource
+    IOError             = 20,   // An error occurred during IO on the resource
+    Other               = 255,  // Other errors
+}
+impl From<usize> for ErrorCode {
+    fn from(code: usize) -> Self {
+        match code {
+            0   => ErrorCode::NoError,
+            1   => ErrorCode::OutOfMemory,
+            2   => ErrorCode::NotSupported,
+            3   => ErrorCode::NotFound,
+            4   => ErrorCode::NotIssued,
+            5   => ErrorCode::UnexpectedEoF,
+            6   => ErrorCode::InvalidPID,
+            7   => ErrorCode::InvalidTID,
+            8   => ErrorCode::InvalidFD,
+            9   => ErrorCode::InvalidOp,
+            10  => ErrorCode::InvalidBus,
+            11  => ErrorCode::InvalidDrive,
+            12  => ErrorCode::InvalidMountPoint,
+            13  => ErrorCode::InvalidPath,
+            14  => ErrorCode::InvalidHandle,
+            15  => ErrorCode::InvalidBuffer,
+            16  => ErrorCode::InvalidArgument,
+            17  => ErrorCode::InvalidFormat,
+            18  => ErrorCode::NotAllowed,
+            19  => ErrorCode::OutOfBoundIO,
+            20  => ErrorCode::IOError,
+            _   => ErrorCode::Other,
+        }
+    }
 }
 
+#[derive(Debug)]
 pub struct Exception {
     pub code: ErrorCode,
     pub message: &'static str

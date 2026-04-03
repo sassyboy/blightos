@@ -13,11 +13,11 @@ use alloc::vec::Vec;
 use alloc::{format, slice};
 use alloc::string::String;
 use crate::arch::cpu_count;
-use crate::drivers::storage::IOCompletion;
 use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
 use crate::mem::phys::{PHY_FRAME_SIZE, pmm_num_free_frames, pmm_num_total_frames};
 use crate::sched::Task;
 use crate::{test, util::*};
+use crate::Error;
 
 pub struct Machine {
 
@@ -53,11 +53,11 @@ impl Machine {
 
     }
 
-    fn fops_handler(op: FileOperation) -> IOCompletion {
+    fn fops_handler(op: FileOperation) -> Result<usize, Error> {
         match op {
             FileOperation::Exec { hnd, func, buff: _ }         => {
                 if hnd != Self::DEV_HANDLE_DEFAULT {
-                    return  IOCompletion::InvalidHandle;
+                    return Err(error!(ErrorCode::InvalidHandle));
                 }
                 match func {
                     Self::FUNC_REBOOT           => {
@@ -67,35 +67,43 @@ impl Machine {
                         Self::exec_ktest();
                     },
                     _       => {
-                        return  IOCompletion::InvalidHandle;
+                        return Err(error!(ErrorCode::InvalidHandle));
                     }
                 }
             },
-            FileOperation::Open { path }                 => {
-                let mpath = MountPoint::device_relative_path(path);
+            FileOperation::Open { full_path, mode: _, dent } => {
+                let mpath = MountPoint::device_relative_path(full_path);
                 if mpath.eq("/") {
-                    return IOCompletion::Successful(Self::DEV_HANDLE_DEFAULT);
+                    dent.name = String::from("");
+                    dent.size = 0;
+                    dent.flags = DirectoryEntry::DEV_RX_DIR_FLAGS;
+                    return Ok(Self::DEV_HANDLE_DEFAULT);
                 } else if mpath.starts_with("/cpu") {
                     if let Ok(cpu_num) = mpath[4..].parse::<usize>() {
                         if cpu_num < cpu_count() {
-                            return IOCompletion::Successful(cpu_num);
+                            dent.name = format!("cpu{}", cpu_num);
+                            dent.size = 0;
+                            dent.flags = DirectoryEntry::DEV_R_FILE_FLAGS;
+                            return Ok(cpu_num);
                         }
                     }
-                    return IOCompletion::InvalidPath;
+                    return Err(error!(ErrorCode::InvalidPath));
                 } else if mpath.eq("/ram") {
-                    return IOCompletion::Successful(Self::DEV_HANDLE_RAM);
+                    dent.name = String::from("ram");
+                    dent.size = 128; // Enough to hold the stats string
+                    dent.flags = DirectoryEntry::DEV_R_FILE_FLAGS;
+                    return Ok(Self::DEV_HANDLE_RAM);
                 } else {
-                    klog!("unknown path: machine:{}", mpath);
-                    return IOCompletion::InvalidPath;
+                    return Err(error!(ErrorCode::InvalidPath));
                 }
                 
             },
             FileOperation::Close { hnd }                    => {
                 if hnd == Self::DEV_HANDLE_DEFAULT ||
                    hnd == Self::DEV_HANDLE_RAM {
-                    return IOCompletion::Successful(0);
+                    return Ok(0);
                 }
-                return  IOCompletion::InvalidHandle;
+                return  Err(error!(ErrorCode::InvalidHandle));
             },
             FileOperation::Enum { hnd, out }                => {
                 return Self::fenum(hnd, out);
@@ -104,10 +112,10 @@ impl Machine {
                 return Self::fread(hnd, off, buff);
             }
             _                                               => {
-                return IOCompletion::InvalidOp;
+                return Err(error!(ErrorCode::InvalidOp));
             }
         }
-        IOCompletion::Successful(1209)
+        Ok(0)
     }
 
     fn exec_reboot() {
@@ -123,10 +131,10 @@ impl Machine {
         
     }
 
-    fn fenum(hnd: usize, out: &mut Vec<DirectoryEntry>) -> IOCompletion {
+    fn fenum(hnd: usize, out: &mut Vec<DirectoryEntry>) -> Result<usize, Error>{
         if hnd != Self::DEV_HANDLE_DEFAULT {
             // Only the root (machine:/) provides a list
-            return IOCompletion::InvalidOp;   
+            return Err(error!(ErrorCode::InvalidOp));
         }
         // List the CPU Entries
         let num_cpus = cpu_count();
@@ -135,9 +143,7 @@ impl Machine {
                 DirectoryEntry {
                     name: format!("cpu{}", i),
                     size:  0,
-                    flags:  DirectoryEntry::FLG_SYSTEM |
-                            DirectoryEntry::FLG_PERM_READ |
-                            DirectoryEntry::FLG_DEVICE
+                    flags: DirectoryEntry::DEV_R_FILE_FLAGS
                 }
             );
         }
@@ -145,15 +151,13 @@ impl Machine {
             DirectoryEntry {
                 name: String::from("ram"),
                 size:  0,
-                flags: DirectoryEntry::FLG_SYSTEM |
-                       DirectoryEntry::FLG_PERM_READ |
-                       DirectoryEntry::FLG_DEVICE
+                flags: DirectoryEntry::DEV_R_FILE_FLAGS
             }
         );
-        IOCompletion::Successful(out.len())
+        Ok(out.len())
     }
 
-    fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> IOCompletion {
+    fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> Result<usize, Error> {
         if hnd == Self::DEV_HANDLE_RAM {
             let out = format!(
                 "Total: {} Frames, {:.3} MB\n\
@@ -168,9 +172,9 @@ impl Machine {
             unsafe {
                 buff[0..len].copy_from_slice(slice::from_raw_parts(ptr, len));
             }
-            return IOCompletion::Successful(len);
+            return Ok(len);
         }
-        IOCompletion::InvalidOp
+        Err(error!(ErrorCode::InvalidOp))
     }
 
 

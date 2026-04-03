@@ -53,7 +53,7 @@ impl Playback {
     /// If `sync` is true, this function will block until playback is complete.
     pub fn play(&mut self, data: &[u8], sync: bool) -> Result<(), Exception> {
         if !self.snd.is_open() {
-            self.snd.open(&Path::from("audio:/output/pcm"))?;
+            self.snd.open(&Path::from("audio:/output/pcm"), File::MODE_WRITE)?;
         }
         // Write 1s worth of audio data at a time to avoid overwhelming the
         // output device. Back off for 20ms in between if the `sync` flag is set.
@@ -63,7 +63,7 @@ impl Playback {
         let mut tries = 0;
         while total_written < data.len() {
             let end = usize::min(total_written + chunk_size, data.len());
-            let written = self.snd.write(&data[total_written..end]);
+            let written = self.snd.write(&data[total_written..end]).unwrap_or(0);
             if written == 0 {
                 // If we fail to write any data, try a few more times before
                 // giving up

@@ -11,9 +11,9 @@ use core::mem::size_of;
 use core::cmp::min;
 use alloc::{format, slice};
 use alloc::string::String;
-use crate::fs::{FileOperation, MountPoint};
-use crate::drivers::storage::IOCompletion;
+use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
 use crate::util::*;
+use crate::Error;
 
 pub type RGB = (u8, u8, u8);
 
@@ -215,30 +215,32 @@ impl FrameBuffer {
 	// by user-space. The user-space buffer should contain pixel data for the
 	// specified rectangle (width * height * bpp/8 bytes).
 	pub const FUNC_UPDATE_RECT: 		usize = 4;
-	fn fops_handler(op: FileOperation) -> IOCompletion {
+	fn fops_handler(op: FileOperation) -> Result<usize, Error> {
         match op {
-            FileOperation::Open { path }                 => {
-                let mpath = MountPoint::device_relative_path(path);
+            FileOperation::Open { full_path, mode: _, dent } => {
+                let mpath = MountPoint::device_relative_path(full_path);
                 if mpath.eq("/") {
-                    return IOCompletion::Successful(Self::DEV_HANDLE_DEFAULT);
+					dent.name = String::from("");
+					dent.size = 0; // TODO: return the actual size
+					dent.flags = DirectoryEntry::DEV_RWX_DIR_FLAGS;
+                    return Ok(Self::DEV_HANDLE_DEFAULT);
                 } else {
-                    klog!("unknown path: machine:{}", mpath);
-                    return IOCompletion::InvalidPath;
+                    return Err(error!(ErrorCode::InvalidPath));
                 }
                 
             },
             FileOperation::Close { hnd }                    => {
                 if hnd == Self::DEV_HANDLE_DEFAULT {
-                    return IOCompletion::Successful(0);
+                    return Ok(0);
                 }
-                return  IOCompletion::InvalidHandle;
+                return  Err(error!(ErrorCode::InvalidHandle));
             },
             FileOperation::Read { hnd, off, buff } 	=> {
                 return Self::fread(hnd, off, buff);
             },
 			FileOperation::Exec { hnd, func, buff }         	=> {
                 if hnd != Self::DEV_HANDLE_DEFAULT {
-                    return  IOCompletion::InvalidHandle;
+                    return  Err(error!(ErrorCode::InvalidHandle));
                 }
                 match func {
                     Self::FUNC_GET_INFO           => {
@@ -254,20 +256,20 @@ impl FrameBuffer {
 						return Self::fexec_update_rect(hnd, buff);
 					},
                     _       => {
-                        return  IOCompletion::InvalidOp;
+                        return  Err(error!(ErrorCode::InvalidOp));
                     }
                 }
             },
             _                                               => {
-                return IOCompletion::InvalidOp;
+                return Err(error!(ErrorCode::InvalidOp));
             }
         }
     }
 
-	fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> IOCompletion {
+	fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> Result<usize, Error> {
 		let fb = DEFAULT_FB.lock();
 		if !fb.enabled {
-			return IOCompletion::IOError
+			return Err(error!(ErrorCode::IOError));
 		}
         if hnd == Self::DEV_HANDLE_DEFAULT {
             let out = format!(
@@ -282,19 +284,19 @@ impl FrameBuffer {
             unsafe {
                 buff[0..len].copy_from_slice(slice::from_raw_parts(ptr, len));
             }
-            return IOCompletion::Successful(len);
+            return Ok(len);
         }
-        IOCompletion::InvalidOp
+        Err(error!(ErrorCode::InvalidOp))
     }
 
-	fn fexec_get_info(hnd: usize, buff: &mut [u8]) -> IOCompletion {
+	fn fexec_get_info(hnd: usize, buff: &mut [u8]) -> Result<usize, Error> {
 		let fb = DEFAULT_FB.lock();
 		if !fb.enabled {
-			return IOCompletion::IOError
+			return Err(error!(ErrorCode::IOError));
 		}
 		if hnd == Self::DEV_HANDLE_DEFAULT {
 			if buff.len() < size_of::<FrameBufferInfo>() {
-				return IOCompletion::InvalidBuffer;
+				return Err(error!(ErrorCode::InvalidBuffer));
 			}
 			let info = FrameBufferInfo {
 				height: fb.height,
@@ -307,23 +309,23 @@ impl FrameBuffer {
 				buff[0..size_of::<FrameBufferInfo>()].copy_from_slice(
 					slice::from_raw_parts(ptr, size_of::<FrameBufferInfo>()));
 			}
-			return IOCompletion::Successful(size_of::<FrameBufferInfo>());
+			return Ok(size_of::<FrameBufferInfo>());
 		}
-		IOCompletion::InvalidOp
+		Err(error!(ErrorCode::InvalidOp))
 	}
 
-	fn fexec_save_frame(hnd: usize, buff: &mut [u8]) -> IOCompletion {
+	fn fexec_save_frame(hnd: usize, buff: &mut [u8]) -> Result<usize, Error> {
 		if hnd != Self::DEV_HANDLE_DEFAULT {
-			return IOCompletion::InvalidHandle;
+			return Err(error!(ErrorCode::InvalidHandle));
 		}
 		let fb = DEFAULT_FB.lock();
 		if !fb.enabled {
-			return IOCompletion::IOError
+			return Err(error!(ErrorCode::IOError));
 		}
 
 		let frame_size = (fb.pitch * fb.height) as usize;
 		if buff.len() < frame_size {
-			return IOCompletion::InvalidBuffer;
+			return Err(error!(ErrorCode::InvalidBuffer));
 		}
 
 		unsafe {
@@ -331,21 +333,21 @@ impl FrameBuffer {
 			let dst = buff.as_mut_ptr() as *mut u8;
 			core::ptr::copy_nonoverlapping(src, dst, frame_size);
 		}
-		IOCompletion::Successful(frame_size)
+		Ok(frame_size)
 	}
 
-	fn fexec_restore_frame(hnd: usize, buff: &mut [u8]) -> IOCompletion {
+	fn fexec_restore_frame(hnd: usize, buff: &mut [u8]) -> Result<usize, Error>{
 		if hnd != Self::DEV_HANDLE_DEFAULT {
-			return IOCompletion::InvalidHandle;
+			return Err(error!(ErrorCode::InvalidHandle));
 		}
 		let fb = DEFAULT_FB.lock();
 		if !fb.enabled {
-			return IOCompletion::IOError
+			return Err(error!(ErrorCode::IOError));
 		}
 
 		let frame_size = (fb.pitch * fb.height) as usize;
 		if buff.len() < frame_size {
-			return IOCompletion::InvalidBuffer;
+			return Err(error!(ErrorCode::InvalidBuffer));
 		}
 
 		unsafe {
@@ -353,15 +355,15 @@ impl FrameBuffer {
 			let dst = fb.base_address as *mut u8;
 			core::ptr::copy_nonoverlapping(src, dst, frame_size);
 		}
-		IOCompletion::Successful(frame_size)
+		Ok(frame_size)
 	}
 
-	fn fexec_update_rect(hnd: usize, buff: &mut [u8]) -> IOCompletion {
+	fn fexec_update_rect(hnd: usize, buff: &mut [u8]) -> Result<usize, Error> {
 		if hnd != Self::DEV_HANDLE_DEFAULT {
-			return IOCompletion::InvalidHandle;
+			return Err(error!(ErrorCode::InvalidHandle));
 		}
 		if buff.len() < size_of::<FrameBufferUpdateRectArgs>() {
-			return IOCompletion::InvalidBuffer;
+			return Err(error!(ErrorCode::InvalidBuffer));
 		}
 		let args = unsafe {
 			(buff.as_ptr() as *const FrameBufferUpdateRectArgs).read()
@@ -373,11 +375,11 @@ impl FrameBuffer {
 
 		let mut fb = DEFAULT_FB.lock();
 		if !fb.enabled {
-			return IOCompletion::IOError
+			return Err(error!(ErrorCode::IOError));
 		}
 
 		if buffer_size < (rect.height * rect.width * (fb.bpp / 8) as u32) {
-			return IOCompletion::InvalidBuffer;
+			return Err(error!(ErrorCode::InvalidBuffer));
 		}
 
 		let pixel_data = unsafe {
@@ -404,7 +406,7 @@ impl FrameBuffer {
 					idx = ((r * rect.width + c) * 4) as usize;
 				}
 				if idx + 3 >= pixel_data.len() {
-					return IOCompletion::InvalidBuffer;
+					return Err(error!(ErrorCode::InvalidBuffer));
 				}
 				let rgb = (
 					pixel_data[idx],
@@ -415,7 +417,7 @@ impl FrameBuffer {
 			}
 		}
 
-		return IOCompletion::Successful(0);
+		return Ok(0);
 	}
 }
 

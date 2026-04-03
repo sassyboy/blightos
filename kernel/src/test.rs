@@ -17,10 +17,8 @@ use crate::arch::*;
 use crate::drivers::storage::*;
 use crate::mem::phys::{pfree, pmm_num_free_frames};
 use crate::sched::{Task, WaitChannel};
-use crate::fs::{DirectoryEntry, MountPoint};
-use crate::drivers::storage::IOCompletion;
+use crate::fs::{MountPoint, File};
 use crate::drivers::input::{Keyboard, KeyboardEvent};
-
 
 static BSP_T1_TID: AtomicUsize = AtomicUsize::new(0);
 static BSP_T2_TID: AtomicUsize = AtomicUsize::new(0);
@@ -306,8 +304,8 @@ fn task3_exec(_arg: usize) {
                 let ts_handled = SystemTimer::current_timestamp();
                 match ret {
                     Some(comp_req) => {
-                        match comp_req.completion_code {
-                            IOCompletion::Successful(len)   => {
+                        match comp_req.completion {
+                            Ok(len)   => {
                                 klog!("IoReq {} Successful: LBA:{:02}, bytes {}, \
                                     T: issue={:.2}, submit={:.2}, comp={:.2}, \
                                     handled={:.2}, Total:{:06.2}ms\n",
@@ -324,7 +322,7 @@ fn task3_exec(_arg: usize) {
                                             ts_handled - comp_req.ts_issued).as_micros() as f64 / 1000.0
                                 );
                             },
-                            _   => {
+                            Err(_e)   => {
                                 klog!("FAILED IoReq: {:?}\n", comp_req);
                             }
                         }
@@ -342,16 +340,23 @@ fn task3_exec(_arg: usize) {
     // Always return the disk%d.%d resources back
     klog!("Available mount-points: {:?}\n", MountPoint::list_names());
     // Root directory of disk0.0
-    if let Some(mnt) = MountPoint::from_path("disk0.0:/") {
-        klog!("disk0.0: Root directory content:\n");
-        if let IOCompletion::Successful(hnd) = mnt.fopen("disk0.0:/") {
-            let mut out_vec: Vec<DirectoryEntry> = Vec::new();
-            let ioc = mnt.fenum(hnd, &mut out_vec);
-            if let IOCompletion::Successful(_cnt) = ioc {
-                for item in out_vec {
-                    klog!("{}, {}, 0x{:X}\n", item.name, item.size, item.flags);
-                }  
+    match File::open("disk0.0:/", File::MODE_READ) {
+        Ok(root_dir) => {
+            klog!("disk0.0: Root directory content:\n");
+            match root_dir.enumerate() {
+                Ok(entries) => {
+                    for entry in entries {
+                        klog!("  {}, {}, 0x{:X}\n",
+                            entry.name, entry.size, entry.flags);
+                    }
+                },
+                Err(e) => {
+                    klog!("Failed to enumerate disk0.0:/ - {:?}\n", e);
+                }
             }
+        },
+        Err(e) => {
+            klog!("Failed to open disk0.0:/ - {:?}\n", e);
         }
     }
     // FINISHED TESTING --------------------------------------------------------

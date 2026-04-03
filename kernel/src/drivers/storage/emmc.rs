@@ -4,6 +4,7 @@
 // embedded MultiMedia Card (eMMC) Interface
 //
 //
+#![allow(dead_code)]
 use core::time::Duration;
 use crate::arch::*;
 use crate::drivers::storage::*;
@@ -645,18 +646,18 @@ impl BCM2835SDHost {
         let mut cpyrq = iorq.clone();
         cpyrq.ts_issued = SystemTimer::current_timestamp();
         if dsk.bus != BusType::EMMC || dsk.bus_id != 0 {
-            cpyrq.completion_code = IOCompletion::InvalidBus;
+            cpyrq.completion = Err(error!(ErrorCode::InvalidBus));
             (iorq.completion_cb)(cpyrq);
             return;
         }
         if iorq.lba + iorq.sectors as u64 > dsk.sector_count {
-            cpyrq.completion_code = IOCompletion::OutOfBoundIO;
+            cpyrq.completion = Err(error!(ErrorCode::OutOfBoundIO));
             (iorq.completion_cb)(cpyrq);
             return;
             
         }
         if dsk.drive_id as usize >= 1 { // Only 1 SD card per eMMC
-            cpyrq.completion_code = IOCompletion::InvalidDrive; 
+            cpyrq.completion = Err(error!(ErrorCode::InvalidDrive));
             (iorq.completion_cb)(cpyrq);
             return;
         }
@@ -668,13 +669,13 @@ impl BCM2835SDHost {
                                                     iorq.sectors as u32);
             cpyrq.ts_completed = SystemTimer::current_timestamp();
             if ret > 0 {
-                cpyrq.completion_code = IOCompletion::Successful(ret as usize);
+                cpyrq.completion = Ok(ret as usize);
             } else {
-                cpyrq.completion_code = IOCompletion::IOError;
+                cpyrq.completion = Err(error!(ErrorCode::IOError));
             }
         } else {
             // TODO: support write
-            cpyrq.completion_code = IOCompletion::InvalidOp;
+            cpyrq.completion = Err(error!(ErrorCode::InvalidOp));
         }
         drop(sdhc);
         (cpyrq.completion_cb)(cpyrq);

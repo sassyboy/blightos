@@ -4,10 +4,11 @@
 // Mass Storage Interface
 //
 
-use core::sync::atomic::AtomicU64;
-use core::sync::atomic::Ordering::Relaxed;
+use core::{ptr::slice_from_raw_parts, ptr::slice_from_raw_parts_mut};
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use crate::{mem::phys::{palloc, pfree}, util::Spinlock};
+use crate::util::*;
 
 #[cfg(target_arch = "x86_64")]
 pub mod ahci;
@@ -51,7 +52,7 @@ pub struct IORequest {
     pub buffer:         usize, // physical address - TODO replace with a list
 
     pub waiter_tid:     usize, // Set to the TID of the task that issued the IO
-    pub completion_code:IOCompletion,
+    pub completion:     Result<usize, Error>,
     pub completion_cb:  fn(IORequest),
 
     pub driver_priv:    usize,
@@ -73,7 +74,7 @@ impl IORequest {
             sectors:        0,
             buffer:         0,
             waiter_tid:     0,
-            completion_code:IOCompletion::NotIssued,
+            completion:     Err(error!(ErrorCode::NotIssued)),
             completion_cb:  (|_: IORequest| {}),
             driver_priv:    0,
             ts_issued:      0,
@@ -89,18 +90,24 @@ pub enum IOOperation {
     Read,
     Write
 }
-#[derive(Clone, Copy, Debug)]
-pub enum IOCompletion {
-    Successful(usize),
-    NotIssued,
-    InvalidOp,
-    InvalidBus,
-    InvalidDrive,
-    InvalidPath,
-    InvalidHandle,
-    InvalidBuffer,
-    OutOfBoundIO,
-    IOError
+
+///
+/// Encapsulates a memory buffer that can be read from or written to
+/// 
+pub struct IOBuffer {
+    pub vaddr: usize,
+    pub size: usize
+}
+impl IOBuffer {
+    pub fn new(vaddr: usize, size: usize) -> Self {
+        Self { vaddr, size }
+    }
+    pub unsafe fn as_slice(&self) -> &[u8] {
+        &*slice_from_raw_parts(self.vaddr as *const u8, self.size)
+    }
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut *slice_from_raw_parts_mut(self.vaddr as *mut u8, self.size)
+    }
 }
 
 ///
@@ -145,7 +152,6 @@ pub enum DiskAddress {
     }
 }
 
-///
 /// BufferedDiskIO
 /// A convenience struct that performs IO against a Disk and maintains an
 /// internal memory buffer
@@ -208,11 +214,11 @@ impl BufferedDiskIO {
     
     }
 
-    // Returns a virtual memory address (from the internal buffer) where the
-    // data can be found. The caller can cast the address and read from it
+    // Returns a tuple of (vaddr, bytes_read) if successful.
+    // The returned virtual memory address (from the internal buffer) is where
+    // the data can be found. The caller can cast the address and read from it.
     pub fn read(&mut self, addr: DiskAddress, bytes: usize)
-        -> (usize, IOCompletion)
-    {
+                                                    -> Result<IOBuffer, Error> {
         // Is the requested range covered by the cached IO?
         let first_addr = self.first_lba * self.disk.sector_size as u64;
         let last_addr  = first_addr + 
@@ -244,10 +250,9 @@ impl BufferedDiskIO {
         let off = (disk_byte_addr - first_addr) as u64;
         if bytes as u64 > bufsz - off {
             // TODO: support requests larger than buffer - multiple fetches
-            return (0, IOCompletion::NotIssued);
+            return Err(error!(ErrorCode::NotIssued));
         }
-
-        (self.buffer + off as usize, IOCompletion::Successful(bytes))
+        Ok(IOBuffer::new(self.buffer + off as usize, bytes))
     }
 }
 

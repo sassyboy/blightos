@@ -29,8 +29,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
+use crate::fs::{File, DirectoryEntry, FileOperation, MountPoint};
 use crate::util::*;
+use crate::Error;
 
 use crate::drivers::storage::*;
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -150,7 +151,8 @@ pub struct FATFile {
 }
 impl FATFile {
 
-    pub fn from_dir_entry(vol: &FATVolume, dir: DirEntry) -> Self {
+    pub fn from_dir_entry(vol: &FATVolume, dir: DirEntry)
+                                                        -> Result<Self, Error> {
         let au_map: AUMap;
         // Load and cache all the mappings
         let mut cur_cluster = (dir.first_cluster_hi as u32) << 16 | 
@@ -167,7 +169,8 @@ impl FATFile {
             let mut clst: Vec<u32> = Vec::new();
             loop {
                 clst.push(cur_cluster);
-                let fat_ent = vol.load_fat_entry(&mut bdio, cur_cluster as usize);
+                let fat_ent = vol.load_fat_entry(&mut bdio,
+                                                cur_cluster as usize)?;
                 if let FATEntry::InUse(next_cluster) = fat_ent {
                     cur_cluster = next_cluster;
                 } else {
@@ -177,7 +180,7 @@ impl FATFile {
             
             au_map = AUMap::FATFile { cluster_list: clst };
         }
-        Self {
+        Ok(Self {
             dir_entry:          dir,
             au_map:             au_map,
             disk_index:         vol.disk_index,
@@ -186,10 +189,10 @@ impl FATFile {
             cluster_sectors:    vol.cluster_sectors,
             cluster_size:       vol.cluster_size,
             data_start_sector:  vol.data_start_sector
-        }
+        })
     }
 
-    pub fn from_root(vol: &FATVolume) -> Self {
+    pub fn from_root(vol: &FATVolume) -> Result<Self, Error> {
         let dir_entry = DirEntry {
             access_date:    0,
             attr:           DirEntry::ATTR_DIRECTORY,
@@ -207,7 +210,7 @@ impl FATFile {
         FATFile::from_dir_entry(vol, dir_entry)
     }
 
-    pub fn from_path(vol: &FATVolume, in_path: &str) -> Option<Self>{
+    pub fn from_path(vol: &FATVolume, in_path: &str) -> Result<Self, Error>{
         let mut path = in_path;
         // skip the initial / if the path starts with one
         if path.starts_with("/") {
@@ -216,7 +219,7 @@ impl FATFile {
 
         let nodes = path.split('/');
         // klog!("nodes = {:?}\n", nodes);
-        let mut cur_file = FATFile::from_root(vol);
+        let mut cur_file = FATFile::from_root(vol)?;
         for fname in nodes {
             if fname.is_empty() {
                 break;
@@ -224,63 +227,58 @@ impl FATFile {
             if cur_file.is_directory() {
                 // klog!("path traversal: {:?}\n", cur_file);
                 // Look for the entry named fname (TODO - Support Long Names)
-                if let Some(dent) = cur_file.find_child_by_name(fname) {
-                    // klog!("  FOUND {:?}\n", dent);
-                    cur_file = FATFile::from_dir_entry(vol, dent);
-                } else {
-                    return None;
-                }
+                let dent = cur_file.find_child_by_name(fname)?;
+                // klog!("  FOUND {:?}\n", dent);
+                cur_file = FATFile::from_dir_entry(vol, dent)?;
             }
         }
-        Some(cur_file)
+        Ok(cur_file)
     }
 
-    pub fn find_child_by_name(&self, sfn: &str) -> Option<DirEntry> {
+    pub fn find_child_by_name(&self, sfn: &str) -> Result<DirEntry, Error> {
         if self.is_directory() == false {
-            return None;
+            return Err(error!(ErrorCode::InvalidOp));
         }
 
         let mut bdio = BufferedDiskIO::new(self.disk_index).unwrap();
-        let mut file_off = 0;
+        let mut f_off = 0;
         loop {
-            let (memaddr, ioc) = self.read_int(&mut bdio, file_off, 
-                                                        size_of::<DirEntry>());
-            if let IOCompletion::Successful(_) = ioc{
+            let buf = self.read_int(&mut bdio, f_off, size_of::<DirEntry>())?;
+            if buf.size == size_of::<DirEntry>() {
                 unsafe {
-                    let dir_ent = (memaddr as *const DirEntry).read();
+                    let dir_ent = (buf.vaddr as *const DirEntry).read();
                     if dir_ent.name[0] != DirEntry::NAME_0_FREE_ENTRY &&
                        dir_ent.name[0] != DirEntry::NAME_0_LAST_ENTRY &&
                        dir_ent.attr & DirEntry::ATTR_LONG_FILE_NAME == 0 && 
                        dir_ent.sfn_match(sfn) == true
                     {
                         // Found it!
-                        return Some(dir_ent);
+                        return Ok(dir_ent);
                     } else if dir_ent.name[0] == DirEntry::NAME_0_LAST_ENTRY {
                         break;
                     }
                 }
-                file_off += size_of::<DirEntry>();
+                f_off += size_of::<DirEntry>();
             } else {
-                // Hit the end of the directory content 
-                break;
+                return Err(error!(ErrorCode::InvalidFormat));
             }    
         }
-        None
+        Err(error!(ErrorCode::InvalidPath))
     }
 
-    pub fn dir_entries(&self) -> Option<Vec<DirEntry>> {
+    pub fn dir_entries(&self) -> Result<Vec<DirEntry>, Error> {
         if self.is_directory() == false {
-            return None;
+            return Err(error!(ErrorCode::InvalidOp));
         }
 
         let mut v: Vec<DirEntry> = Vec::new();
-        let mut file_off = 0;
+        let mut f_off = 0;
         let mut bdio = BufferedDiskIO::new(self.disk_index).unwrap();
         loop {
-            let (memaddr, ioc) = self.read_int(&mut bdio, file_off, size_of::<DirEntry>());
-            if let IOCompletion::Successful(_len) = ioc {
+            let buf = self.read_int(&mut bdio, f_off, size_of::<DirEntry>())?;
+            if buf.size == size_of::<DirEntry>() {
                 unsafe {
-                    let dir_ent = (memaddr as *const DirEntry).read();
+                    let dir_ent = (buf.vaddr as *const DirEntry).read();
                     if dir_ent.name[0] != DirEntry::NAME_0_FREE_ENTRY &&
                             dir_ent.name[0] != DirEntry::NAME_0_LAST_ENTRY &&
                             dir_ent.attr & DirEntry::ATTR_LONG_FILE_NAME == 0{
@@ -289,20 +287,23 @@ impl FATFile {
                         break;
                     }
                 }
-                file_off += size_of::<DirEntry>();
+                f_off += size_of::<DirEntry>();
             } else {
                 // Hit the end of the directory content 
                 break;
             }    
         }
-        Some(v)
+        Ok(v)
     }
 
+    /// Returns the capacity of the file/dir in bytes, which is the size of the
+    /// allocated disk space for the file or directory.
     pub fn capacity(&self) -> usize {
         match &self.au_map {
             AUMap::FAT1216Root {start_sec: _, entry_count}  => {
-                ((32 * entry_count + self.sector_size - 1) / 
-                                    self.sector_size) as usize
+                let sect_count = ((32 * entry_count + self.sector_size - 1) / 
+                                    self.sector_size) as usize;
+                sect_count * self.sector_size as usize
             },
             AUMap::FATFile { cluster_list }                 => {
                 cluster_list.len() * self.cluster_size as usize
@@ -318,15 +319,68 @@ impl FATFile {
         self.dir_entry.attr & DirEntry::ATTR_DIRECTORY > 0
     }
 
+    pub fn is_readable(&self) -> bool {
+        true
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.dir_entry.attr & DirEntry::ATTR_READ_ONLY == 0
+    }
+
+    pub fn is_executable(&self) -> bool {
+        if self.dir_entry.attr & DirEntry::ATTR_DIRECTORY != 0 {
+            return false;
+        }
+        // Our OS is special! ;)
+        if self.dir_entry.name.ends_with(b"BOX") {
+            return true;
+        }
+        false
+    }
+
+    pub fn get_directory_entry(&self) -> DirectoryEntry {
+        let mut ret = DirectoryEntry {
+            name: self.dir_entry.name(),
+            size: self.size_bytes(),
+            flags: 0
+        };
+        if self.is_directory() {
+            ret.flags |= DirectoryEntry::FLG_DIRECTORY;
+        }
+        if self.dir_entry.attr & DirEntry::ATTR_ARCHIVE > 0 {
+            ret.flags |= DirectoryEntry::FLG_ARCHIVE;
+        }
+        if self.dir_entry.attr & DirEntry::ATTR_HIDDEN > 0 {
+            ret.flags |= DirectoryEntry::FLG_HIDDEN;
+        }
+        if self.dir_entry.attr & DirEntry::ATTR_SYSTEM > 0 {
+            ret.flags |= DirectoryEntry::FLG_SYSTEM;
+        }
+        if self.is_executable() {
+            ret.flags |= DirectoryEntry::FLG_PERM_EXEC;
+        }
+        if self.dir_entry.attr & DirEntry::ATTR_READ_ONLY > 0 {
+            ret.flags |= DirectoryEntry::FLG_PERM_READ;
+        } else {
+            ret.flags |= DirectoryEntry::FLG_PERM_READ |
+                         DirectoryEntry::FLG_PERM_WRITE;
+        }
+        ret
+    }
+
     pub fn first_sector_of_cluster(&self, cluster: u32) -> u64 {
         self.data_start_sector as u64 + 
             (cluster - 2) as u64 * self.cluster_sectors as u64
     }
 
+    /// Reads the content of the file starting from the given file offset.
+    /// Returns an IO buffer {vaddr, size} if successful.
+    /// vaddr is the virtual memory address (from the internal buffer) where the
+    /// data can be found.
     fn read_int(&self, bdio: &mut BufferedDiskIO, file_offset: usize,
-                                    num_bytes: usize) -> (usize, IOCompletion) {
+                                num_bytes: usize) -> Result<IOBuffer, Error> {
         if file_offset >= self.capacity() {
-            return (0, IOCompletion::OutOfBoundIO);
+            return Err(error!(ErrorCode::OutOfBoundIO));
         }
         // Adjust the length if the request hits EOF
         let mut len: usize;
@@ -359,15 +413,17 @@ impl FATFile {
         let disk_off = (self.first_lba + first_sector_index) * 
                         self.sector_size as u64 + cluster_offset as u64;
 
-        // klog!("File offset: {}, cluster index: {}, cluster offset: {}, #bytes: {}, first_sector_index: {}, disk_off: {}\n",
+        // klog!("File offset: {}, cluster index: {}, cluster offset: {}, \
+        //         #bytes: {}, first_sector_index: {}, disk_off: {}\n",
         //         file_offset, cluster_index, cluster_offset, len,
         //         first_sector_index, disk_off
         // );
-        let (mem_addr, ioc) = bdio.read(
-                                DiskAddress::ByteAddr { addr: disk_off }, len);
-        (mem_addr, ioc)
+        let buf = bdio.read(
+                                DiskAddress::ByteAddr { addr: disk_off }, len)?;
+        Ok(buf)
     }
-    pub fn read(&self, file_offset: usize, num_bytes: usize) -> (usize, IOCompletion) {
+    pub fn read(&self, file_offset: usize, num_bytes: usize)
+                                                -> Result<IOBuffer, Error> {
         let mut bdio = BufferedDiskIO::new(self.disk_index).unwrap();
         self.read_int(&mut bdio, file_offset, num_bytes)
     }
@@ -432,20 +488,17 @@ impl FATVolume {
     // Returns None if the partition is not FAT12/16/32.
     // Creates an internal copy of the disk for further IO operations
     pub fn mount(disk_index: usize, part_index: usize,
-                start_lba: u64, end_lba: u64) -> bool {
+                start_lba: u64, end_lba: u64) -> Result<(), Error> {
         if !(end_lba > start_lba && end_lba - start_lba > 2) {
-            return false;
+            return Err(error!(ErrorCode::InvalidArgument));
         }
         let mut bdio = BufferedDiskIO::new(disk_index).unwrap();
         
         // Is it FAT12/16?
         let bs: *const BootSector16;
-        let (buff, _) = bdio.read(
-                        DiskAddress::LBA { lba: start_lba, block_offset: 0 },
-                        size_of::<BootSector16>());
-        bs = buff as *const BootSector16;
-
-        
+        let buf = bdio.read(DiskAddress::LBA{ lba: start_lba, block_offset: 0 },
+                            size_of::<BootSector16>())?;
+        bs = buf.vaddr as *const BootSector16;
         let mut fatkind = FATKind::Unknown;
         unsafe {
         if str::from_utf8(&(*bs).fs_type) == str::from_utf8(b"FAT12   ") {
@@ -498,7 +551,7 @@ impl FATVolume {
             if MountPoint::mount(mnt_obj) {
                 // Mount-point added successfully. Register the Volume here
                 FAT_VOLUMES.lock().insert(mnt_name, Arc::new(vol));
-                return true;
+                return Ok(());
             } else {
                 panic!("Mount-point {} not registered with VFS\n", mnt_name);
             }
@@ -507,10 +560,9 @@ impl FATVolume {
 
         // Is it FAT32?
         let bs: *const BootSector32;
-        let (buff, _) = bdio.read(
-                        DiskAddress::LBA { lba: start_lba, block_offset: 0 },
-                        size_of::<BootSector32>());
-        bs = buff as *const BootSector32;
+        let buf = bdio.read(DiskAddress::LBA{ lba: start_lba, block_offset: 0 },
+                            size_of::<BootSector32>())?;
+        bs = buf.vaddr as *const BootSector32;
         unsafe {
         if str::from_utf8(&(*bs).fs_type) == str::from_utf8(b"FAT32   ") {
             fatkind = FATKind::FAT32;
@@ -556,13 +608,13 @@ impl FATVolume {
             if MountPoint::mount(mnt_obj) {
                 // Mount-point added successfully. Register the Volume here
                 FAT_VOLUMES.lock().insert(mnt_name, Arc::new(vol));
-                return true;
+                return Ok(());
             } else {
                 panic!("Mount-point {} not registered with VFS\n", mnt_name);
             }
         }
         }
-        false
+        Err(error!(ErrorCode::InvalidFormat))
     }
 
     fn fat_entry_from_value(&self, value: u32) -> FATEntry {
@@ -595,7 +647,8 @@ impl FATVolume {
         }
     }
 
-    fn load_fat_entry(&self, bdio: &mut BufferedDiskIO, i: usize) -> FATEntry {
+    fn load_fat_entry(&self, bdio: &mut BufferedDiskIO, i: usize)
+                                                -> Result<FATEntry, Error> {
         let entry;
         match self.kind {
             FATKind::FAT12  => {
@@ -609,23 +662,23 @@ impl FATVolume {
                 //          |----------+----------|
                 //        2 |MSB    FAT[1]        |
                 //          |---------------------|
-                let (addr, _) = bdio.read(DiskAddress::LBA {
+                let buf = bdio.read(DiskAddress::LBA {
                         lba: self.first_lba + self.fat_start_sector as u64 +
                         (i + (i / 2)) as u64 / self.sector_size as u64,
                         block_offset: (i + (i / 2)) as u32 %
                                         self.sector_size as u32
-                }, 2);
+                }, 2)?;
                 if i & 1 == 0 {
                     // Even entry
                     unsafe {
-                        let ptr = addr as *const u8;
+                        let ptr = buf.vaddr as *const u8;
                         entry = ptr.add(0).read() as u32 |
                                 ((ptr.add(1).read() as u32) & 0x0F) << 8;
                     }
                 } else {
                     // Odd entry
                     unsafe {
-                        let ptr = addr as *const u8;
+                        let ptr = buf.vaddr as *const u8;
                         entry = (ptr.add(0).read() as u32) >> 4 |
                                 (ptr.add(1).read() as u32) << 4;
                     }
@@ -633,35 +686,35 @@ impl FATVolume {
             },
             FATKind::FAT16  => {
                 // FAT area is an array of 16-bit entries
-                let (addr, _) = bdio.read(DiskAddress::LBA {
+                let buf = bdio.read(DiskAddress::LBA {
                         lba:
                             self.first_lba + self.fat_start_sector as u64 +
                             (i as u64 * 2 / self.sector_size as u64),
                         block_offset:
                             ((i * 2) % self.sector_size as usize) as u32
-                }, 2);
+                }, 2)?;
                 unsafe {
-                    entry = (addr as *const u16).read() as u32;
+                    entry = (buf.vaddr as *const u16).read() as u32;
                 }
             },
             FATKind::FAT32  => {
                 // FAT area is an array of 32-bit entries
-                let (addr, _) = bdio.read(DiskAddress::LBA {
+                let buf = bdio.read(DiskAddress::LBA {
                         lba:
                             self.first_lba + self.fat_start_sector as u64 +
                             (i as u64 * 4 / self.sector_size as u64),
                         block_offset:
                             ((i * 4) % self.sector_size as usize) as u32
-                }, 4);
+                }, 4)?;
                 unsafe {
-                    entry = (addr as *const u32).read() & 0x0FFFFFFF;
+                    entry = (buf.vaddr as *const u32).read() & 0x0FFFFFFF;
                 }
             },
             _   => {
                 panic!("load_fat_entry on unknown volume.");
             }
         }
-        self.fat_entry_from_value(entry)
+        Ok(self.fat_entry_from_value(entry))
     }
 }
 
@@ -734,24 +787,24 @@ static NEXT_HANDLE: AtomicUsize = AtomicUsize::new(0);
 static OPEN_FILES:  Spinlock<BTreeMap< usize, Arc<FATFile> > > =
                         Spinlock::new(BTreeMap::new());
 
-fn fat_fops_handler(op: FileOperation) -> IOCompletion {
+fn fat_fops_handler(op: FileOperation) -> Result<usize, Error> {
     match op {
-        FileOperation::Open { path }                        => {
-            match MountPoint::get_mntname_devpath(path) {
+        FileOperation::Open { full_path, mode, dent } => {
+            match MountPoint::get_mntname_devpath(full_path) {
                 Some((mnt_name, fpath))  => {
                     let vol;
                     let volumes = FAT_VOLUMES.lock();
                     if let Some(vol_ptr) = volumes.get(mnt_name){
                         vol = vol_ptr.clone();
                         drop(volumes); // unlock
-                        fopen(&vol, fpath)
+                        fopen(&vol, fpath, mode, dent)
                     } else {
                         // Volume not found
-                        IOCompletion::InvalidDrive
+                        Err(error!(ErrorCode::InvalidDrive))
                     }
                 },
-                None                        => {
-                    IOCompletion::InvalidPath
+                None => {
+                    Err(error!(ErrorCode::InvalidPath))
                 }
             }
         },
@@ -773,109 +826,110 @@ fn fat_fops_handler(op: FileOperation) -> IOCompletion {
     }
 }
 
-fn fopen(vol: &FATVolume, fpath: &str) -> IOCompletion {
-    let file_opt = FATFile::from_path(vol, fpath);
-    {
-        let mut file_list = OPEN_FILES.lock(); // WRITE LOCK
-        if let Some(fobj) = file_opt {
-            let hnd = NEXT_HANDLE.fetch_add(1, Relaxed);
-            file_list.insert(hnd, Arc::new(fobj));
-            return IOCompletion::Successful(hnd);
-        }
+fn fopen(vol: &FATVolume, fpath: &str, mode: usize, dent: &mut DirectoryEntry)
+                                                    -> Result<usize, Error> {
+    let fobj = FATFile::from_path(vol, fpath)?;
+    // Check permissions
+    if !fobj.is_readable() && mode & File::MODE_READ != 0 ||
+       !fobj.is_writable() && mode & File::MODE_WRITE != 0 ||
+       !fobj.is_executable() && mode & File::MODE_EXEC != 0 {
+        return Err(error!(ErrorCode::NotAllowed));
     }
-    IOCompletion::InvalidPath
+    let fden = fobj.get_directory_entry();
+    dent.name = fden.name;
+    dent.size = fden.size;
+    dent.flags = fden.flags;
+    let hnd = NEXT_HANDLE.fetch_add(1, Relaxed);
+    OPEN_FILES.lock().insert(hnd, Arc::new(fobj)); // WRITE LOCK ?
+    Ok(hnd)
 }
 
-fn fenum(hnd: usize, out: &mut Vec<DirectoryEntry>) -> IOCompletion {
+fn fenum(hnd: usize, out: &mut Vec<DirectoryEntry>) -> Result<usize, Error> {
     let file;
     {
         let file_list = OPEN_FILES.lock();
         if let Some(fobj) = file_list.get(&hnd) {
             file = fobj.clone();
         } else {
-            return IOCompletion::InvalidHandle;
+            return Err(error!(ErrorCode::InvalidHandle));
         }
-    }    
-
-    if file.is_directory() {
-        let dentry_lst = file.dir_entries().unwrap();
-        for child in dentry_lst {
-            let mut item = DirectoryEntry {
-                name: child.name(),
-                size: child.size_bytes(),
-                flags: 0
-            };
-            if child.attr & DirEntry::ATTR_DIRECTORY > 0 {
-                item.flags |= DirectoryEntry::FLG_DIRECTORY;
-            }
-            if child.attr & DirEntry::ATTR_ARCHIVE > 0 {
-                item.flags |= DirectoryEntry::FLG_ARCHIVE;
-            }
-            if child.attr & DirEntry::ATTR_HIDDEN > 0 {
-                item.flags |= DirectoryEntry::FLG_HIDDEN;
-            }
-            if child.attr & DirEntry::ATTR_SYSTEM > 0 {
-                item.flags |= DirectoryEntry::FLG_SYSTEM;
-            }
-            if child.attr & DirEntry::ATTR_READ_ONLY > 0 {
-                item.flags |= DirectoryEntry::FLG_PERM_READ |
-                                DirectoryEntry::FLG_PERM_EXEC;
-            } else {
-                item.flags |= DirectoryEntry::FLG_PERM_READ |
-                                DirectoryEntry::FLG_PERM_WRITE |
-                                DirectoryEntry::FLG_PERM_EXEC;
-            }
-            out.push(item);
-        }
-    } else {
-        // Not a directory
-        return IOCompletion::InvalidOp;
     }
-    IOCompletion::Successful(out.len())
+
+    if !file.is_directory() {
+        return Err(error!(ErrorCode::InvalidOp));
+    }
+    let dentry_lst = file.dir_entries()?;
+    for child in dentry_lst {
+        let mut item = DirectoryEntry {
+            name: child.name(),
+            size: child.size_bytes(),
+            flags: 0
+        };
+        if child.attr & DirEntry::ATTR_DIRECTORY > 0 {
+            item.flags |= DirectoryEntry::FLG_DIRECTORY;
+        }
+        if child.attr & DirEntry::ATTR_ARCHIVE > 0 {
+            item.flags |= DirectoryEntry::FLG_ARCHIVE;
+        }
+        if child.attr & DirEntry::ATTR_HIDDEN > 0 {
+            item.flags |= DirectoryEntry::FLG_HIDDEN;
+        }
+        if child.attr & DirEntry::ATTR_SYSTEM > 0 {
+            item.flags |= DirectoryEntry::FLG_SYSTEM;
+        }
+        if child.attr & DirEntry::ATTR_READ_ONLY > 0 {
+            item.flags |= DirectoryEntry::FLG_PERM_READ |
+                            DirectoryEntry::FLG_PERM_EXEC;
+        } else {
+            item.flags |= DirectoryEntry::FLG_PERM_READ |
+                            DirectoryEntry::FLG_PERM_WRITE |
+                            DirectoryEntry::FLG_PERM_EXEC;
+        }
+        out.push(item);
+    }
+    Ok(out.len())
 }
 
-fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> IOCompletion {
-    
+fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> Result<usize, Error>  {
     let file;
     {
         let mut file_list = OPEN_FILES.lock();
         if let Some(fobj) = file_list.get_mut(&hnd) {
             file = fobj.clone();
         } else {
-            return IOCompletion::InvalidHandle;
+            return Err(error!(ErrorCode::InvalidHandle));
         }
     }
 
-    if file.is_directory() == false {
-        // Normal File Read
-        let (memaddr, ioc) = file.read(off, buff.len());
-        if let IOCompletion::Successful(len) = ioc {
-            let ptr = memaddr as *const u8;
-            // dump_memory_ascii(memaddr, 100);
-            // Calculate size and create a slice
-            unsafe {
-                buff[0..len].copy_from_slice(slice::from_raw_parts(ptr, len));
-            }
-        }
-        return ioc;
+    if file.is_directory() {
+        return Err(error!(ErrorCode::InvalidOp));
     }
-    IOCompletion::InvalidOp
 
+    // Normal File Read
+    let buf = file.read(off, buff.len())?;
+    let ptr = buf.vaddr as *const u8;
+    // dump_memory_ascii(memaddr, 100);
+    // Calculate size and create a slice
+    unsafe {
+        buff[0..buf.size].copy_from_slice(slice::from_raw_parts(ptr, buf.size));
+    }
+    Ok(buf.size)
 }
 
-fn fwrite(_hnd: usize, _off: usize, _buff: &[u8]) -> IOCompletion {
-    IOCompletion::InvalidOp
+fn fwrite(_hnd: usize, _off: usize, _buff: &[u8]) -> Result<usize, Error> {
+    // TODO
+    Err(error!(ErrorCode::NotSupported))
 }
 
-fn fexec(_hnd: usize, _func: usize, _buff: &mut [u8]) -> IOCompletion {
+fn fexec(_hnd: usize, _func: usize, _buff: &mut [u8]) -> Result<usize, Error> {
     // Things like delete, move and copy for the FS driver go here
-    IOCompletion::InvalidOp
+    Err(error!(ErrorCode::NotSupported))
 }
 
-fn fclose(hnd: usize) -> IOCompletion {
+fn fclose(hnd: usize) -> Result<usize, Error> {
     let mut file_list = OPEN_FILES.lock();
     if let Some(_) = file_list.remove(&hnd) {
-        return IOCompletion::Successful(0);
+        return Ok(0);
     }
-    IOCompletion::InvalidHandle
+    Err(error!(ErrorCode::InvalidHandle))
 }

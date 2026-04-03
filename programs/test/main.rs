@@ -341,14 +341,21 @@ fn wait_for_enter() {
 
 fn txt_dump(path: &Path) {
     let mut buff: [u8; 64] = [0; 64];
-    let Ok(file) = File::from_path(path) else {
-        println!("Path {} doesn't exist", path.as_str());
+    let fort = File::from_path(path, File::MODE_READ);
+    let Ok(mut file) = fort else {
+        let e = fort.err().unwrap();
+        println!("Can't open {} - {:?}", path.as_str(), e);
         return;
     };
     loop {
-        let cnt = file.read(&mut buff);
-        if cnt > 0 {
-            print!("{}", str::from_utf8(&buff[0..cnt]).unwrap());
+        let rdrt = file.read(&mut buff);
+        let Ok(len) = rdrt else {
+            let e = rdrt.err().unwrap();
+            println!("Can't read from {} - {:?}", path.as_str(), e);
+            return;
+        };
+        if len > 0 {
+            print!("{}", str::from_utf8(&buff[0..len]).unwrap());
         } else {
             break;
         }

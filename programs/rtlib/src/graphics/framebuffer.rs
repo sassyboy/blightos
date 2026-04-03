@@ -5,6 +5,7 @@ use core::mem::size_of;
 use crate::heap::*;
 use crate::fileio::*;
 use crate::graphics::RGB;
+use crate::*;
 
 pub struct Framebuffer {
     pub base_address: usize, // User-space buffer allocated on the heap
@@ -13,8 +14,8 @@ pub struct Framebuffer {
     pub bpp: 	u8,
     pub pitch: 	u32,
     // Private fields for internal use
-    fhnd:       usize,
-    buffer_size: usize,
+    fb_file:    File, // Framebuffer device file
+    buffer_size:usize,
     // Modified region since the last update
     modified_region: FrameBufferRect,
 }
@@ -34,38 +35,43 @@ impl Framebuffer {
     pub fn new() -> Option<Self> {
         // Get the framebuffer info from the kernel via syscall
         let mut instance = Self {
-            base_address: 0,
-            height: 0,
-            width: 0,
-            bpp: 0,
-            pitch: 0,
-            fhnd: 0,
-            buffer_size: 0,
-            modified_region: FrameBufferRect { 
+            base_address:   0,
+            height:         0,
+            width:          0,
+            bpp:            0,
+            pitch:          0,
+            fb_file:        File::new(),
+            buffer_size:    0,
+            modified_region:FrameBufferRect { 
                 row: u32::MAX, col: u32::MAX,
                 height: 0, width: 0
             }
         };
-        if let Some(fhnd) = fopen("framebuffer:/") {
-            instance.fhnd = fhnd;
-            let mut info_buffer = [0u8; size_of::<FrameBufferInfo>()];
-            let bytes_read = fexec(fhnd, Self::FUNC_GET_INFO, &mut info_buffer);
-            if bytes_read == size_of::<FrameBufferInfo>() {
-                // SAFETY: We trust the kernel to provide valid framebuffer info
-                let fb_info: FrameBufferInfo = unsafe { 
-                    (info_buffer.as_ptr() as *const FrameBufferInfo).read()
-                };
-                instance.height = fb_info.height;
-                instance.width = fb_info.width;
-                instance.bpp = fb_info.bpp;
-                instance.pitch = fb_info.pitch;
-                // Allocate a user-space buffer for the framebuffer content
-                instance.buffer_size = (instance.pitch * instance.height) as usize;
-                // SAFETY: We trust the kernel to allocate a valid buffer
-                instance.base_address = Malloc::malloc(instance.buffer_size) as usize;
-                if instance.base_address != 0 {
-                    return Some(instance);
-                }
+        let fb_path = Path::from("framebuffer:/");
+        let fbfopen = File::from_path(&fb_path, File::MODE_RWX);
+        let Ok(fb_file) = fbfopen else {
+            println!("Can't framebuffer:/ - {:?}", fbfopen.err());
+            return None;
+        };
+        let mut info_buffer = [0u8; size_of::<FrameBufferInfo>()];
+        let bytes_read = fb_file.exec(Self::FUNC_GET_INFO, &mut info_buffer)
+                                                                .unwrap_or(0);
+        if bytes_read == size_of::<FrameBufferInfo>() {
+            // SAFETY: We trust the kernel to provide valid framebuffer info
+            let fb_info: FrameBufferInfo = unsafe { 
+                (info_buffer.as_ptr() as *const FrameBufferInfo).read()
+            };
+            instance.height = fb_info.height;
+            instance.width = fb_info.width;
+            instance.bpp = fb_info.bpp;
+            instance.pitch = fb_info.pitch;
+            // Allocate a user-space buffer for the framebuffer content
+            instance.buffer_size = (instance.pitch * instance.height) as usize;
+            // SAFETY: We trust the kernel to allocate a valid buffer
+            instance.base_address = Malloc::malloc(instance.buffer_size) as usize;
+            if instance.base_address != 0 {
+                instance.fb_file = fb_file;
+                return Some(instance);
             }
         }
         None
@@ -73,14 +79,14 @@ impl Framebuffer {
     pub fn save_frame(&mut self) -> bool {
         let mut buffer = unsafe { core::slice::from_raw_parts_mut(
                             self.base_address as *mut u8, self.buffer_size) };
-        return fexec(self.fhnd, Self::FUNC_SAVE_FRAME, &mut buffer) 
-                                                            == self.buffer_size;
+        return self.fb_file.exec(Self::FUNC_SAVE_FRAME, &mut buffer)
+                                .unwrap_or(0) == self.buffer_size;
     }
     pub fn restore_frame(&mut self) -> bool {
         let mut buffer = unsafe { core::slice::from_raw_parts_mut(
                             self.base_address as *mut u8, self.buffer_size) };
-        return fexec(self.fhnd, Self::FUNC_RESTORE_FRAME, &mut buffer) 
-                                                            == self.buffer_size;
+        return self.fb_file.exec(Self::FUNC_RESTORE_FRAME, &mut buffer) 
+                                .unwrap_or(0) == self.buffer_size;
     }
 
     pub fn set_pixel(&mut self, row: u32, col: u32, color: RGB) {
@@ -88,7 +94,8 @@ impl Framebuffer {
             let pixel_offset = (row * self.pitch + col * (self.bpp as u32 / 8)) as usize;
             let pixel_ptr = (self.base_address + pixel_offset) as *mut u8;
             unsafe {
-                // Assuming the framebuffer uses RGB format, we write the color components
+                // Assuming the framebuffer uses RGB format, we write the color
+                // components
                 core::ptr::write_volatile(pixel_ptr, color.0); // Red
                 core::ptr::write_volatile(pixel_ptr.add(1), color.1); // Green
                 core::ptr::write_volatile(pixel_ptr.add(2), color.2); // Blue
@@ -96,8 +103,12 @@ impl Framebuffer {
             // Update the modified region
             self.modified_region.row = self.modified_region.row.min(row);
             self.modified_region.col = self.modified_region.col.min(col);
-            self.modified_region.height = (self.modified_region.height.max(row - self.modified_region.row + 1)).min(self.height);
-            self.modified_region.width = (self.modified_region.width.max(col - self.modified_region.col + 1)).min(self.width);
+            self.modified_region.height = (self.modified_region.height.max(
+                                            row - self.modified_region.row + 1))
+                                            .min(self.height);
+            self.modified_region.width = (self.modified_region.width.max(
+                                            col - self.modified_region.col + 1))
+                                            .min(self.width);
         }
     }
 
@@ -115,7 +126,7 @@ impl Framebuffer {
                 (&mut update_args as *mut FrameBufferUpdateRectArgs) as *mut u8, 
                 size_of::<FrameBufferUpdateRectArgs>()
             ) };
-            let _ = fexec(self.fhnd, Self::FUNC_UPDATE_RECT, &mut buffer);
+            let _ = self.fb_file.exec(Self::FUNC_UPDATE_RECT, &mut buffer);
             // Reset modified region after update
             self.modified_region = FrameBufferRect {
                 row: u32::MAX, col: u32::MAX,
@@ -128,7 +139,7 @@ impl Framebuffer {
 impl Drop for Framebuffer {
     fn drop(&mut self) {
         // Clean up resources, if necessary
-        fclose(self.fhnd);
+        // The fb file auto closes
         if self.base_address != 0 {
             Malloc::free(self.base_address as *mut u8, self.buffer_size);
         }

@@ -43,17 +43,24 @@ pub fn enumerate_partitions(disk_index: usize) -> usize {
                     .expect("BufferedDiskIO::new() failed!");
 
     let hdr : GPTHeader;
-    let (bdio_buf, comp) = bdio.read(DiskAddress::LBA { lba: 1, block_offset: 0 },
-                                size_of::<GPTHeader>());
-    if let IOCompletion::Successful(sz) = comp {
-        if sz < size_of::<GPTHeader>() {
+    let hdr_rd = bdio.read(DiskAddress::LBA { lba: 1, block_offset: 0 },
+                                                        size_of::<GPTHeader>());
+    match hdr_rd {
+        Ok(buf) => {
+            if buf.size < size_of::<GPTHeader>() {
+                klog!("Failed to fully read the GPT header from disk index {} \
+                        ({} bytes)!\n", disk_index, buf.size);
+                return 0;
+            }
+            unsafe {
+                hdr = (buf.vaddr as *mut GPTHeader).read_volatile();
+            }
+        },
+        Err(e) => {
+            klog!("Failed to read GPT header from disk index {} due to {:?}!\n",
+                    disk_index, e);
             return 0;
         }
-    } else {
-        return 0;
-    }
-    unsafe {
-        hdr = (bdio_buf as *mut GPTHeader).read_volatile();
     }
 
     let disk = get_disk(disk_index).expect("Disk not found!");
@@ -70,18 +77,31 @@ pub fn enumerate_partitions(disk_index: usize) -> usize {
         for _i in 0..entries {
             // Read the entry
             let part_ent : GPTEntry;
-            let (bdio_buf, _) = 
-                    bdio.read(DiskAddress::ByteAddr { addr: cur_off },
-                                                        size_of::<GPTHeader>());
-            unsafe {
-                part_ent = (bdio_buf as *mut GPTEntry).read_volatile();
+            let ent_rd = bdio.read(DiskAddress::ByteAddr { addr: cur_off },
+                                                    size_of::<GPTEntry>());
+            match ent_rd {
+                Ok(buf) => {
+                    if buf.size < size_of::<GPTEntry>() {
+                        klog!("Failed to fully read GPT entry from disk index {} \
+                                ({} bytes)\n", disk_index, buf.size);
+                        break;
+                    }
+                    unsafe {
+                        part_ent = (buf.vaddr as *mut GPTEntry).read_volatile();
+                    }
+                },
+                Err(e) => {
+                    klog!("Failed to read GPT entry from disk index {} due to \
+                            {:?}\n", disk_index, e);
+                    break;
+                }
             }
-
             if part_ent.part_type_guid != 0 {
                 // FAT12/16/32
-                if FATVolume::mount(disk_index, num_parts,
-                                    part_ent.part_start_lba,
-                                    part_ent.part_last_lba) {
+                let mnt_ret = FATVolume::mount(disk_index, num_parts,
+                                                part_ent.part_start_lba,
+                                                part_ent.part_last_lba);
+                if mnt_ret.is_ok() {
                     // FATVolume::mount registers a mount point with the VFS
                     num_parts += 1;
                 }

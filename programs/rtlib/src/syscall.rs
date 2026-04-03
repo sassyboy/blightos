@@ -22,16 +22,25 @@ pub enum Syscall {
     TaskControl{opcode: usize, args: usize, ret_code: usize},
     ProcControl{opcode: usize, args: usize, ret_code: usize},
 
-    // Device/File control
-    Open{path_ptr: usize, path_len: usize, mode: usize, ret_ptr: usize},
+    // Virtual File System - Device/File control
+    // Open returns a File object to the user-space which includes a file
+    // descriptor (FD) and some basic information about the directory entry of
+    // the file such as attributes, size, etc. The calling process adress space
+    // will own the original file object if successful.
+    Open{args_ptr: usize, args_len: usize, arg3: usize, ret_ptr: usize},
     // Enum returns file/directory/device information
-    Enum{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
-    Read{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
-    Write{fd: usize, buf_ptr: usize, buf_len: usize, ret_ptr: usize},
-    Exec{fd: usize, cmd_buf_ptr: usize, cmd_buf_len: usize, ret_ptr: usize},
+    Enum{args_ptr: usize, args_len: usize, arg3: usize, ret_ptr: usize},
+    // Reads buf_len bytes of data from the file/device into the buffer pointed
+    // by buf_ptr
+    Read{args_ptr: usize, args_len: usize, arg3: usize, ret_ptr: usize},
+    // Writes buf_len bytes of data from the buffer pointed by buf_ptr into the
+    // file/device
+    Write{args_ptr: usize, args_len: usize, arg3: usize, ret_ptr: usize},
+    // Executes a command on the file/device represented by fd with the command
+    Exec{args_ptr: usize, args_len: usize, arg3: usize, ret_ptr: usize},
+    // Closes the file/device represented by fd
     Close{fd: usize},
 }
-
 #[repr(usize)]
 #[derive(PartialEq, PartialOrd)]
 pub enum SyscallRsvdFDs {
@@ -131,6 +140,53 @@ pub struct ProcCtlResizeHeapArgs {
 }
 
 //
+// VFS System call structures
+//
+#[repr(C, packed)]
+pub struct VfsOpenArgs {
+    // Inputs from user-space
+    pub path_ptr: usize,  // Pointer to the file path string in user-space
+    pub path_len: usize,  // Length of the file path string
+    pub mode:     usize,  // A combination of File::MODE_* flags
+    // Output to user-space
+    pub fd:       usize,  // File descriptor for the opened file (0 if failed)
+    pub attr:     usize,  // A combination of DirectoryEntry::FLG_* flags
+    pub size:     usize,  // Size of the file in bytes (0 if failed)
+}
+
+#[repr(C, packed)]
+pub struct VfsEnumArgs {
+    // Inputs from user-space
+    pub fd:       usize,  // The target file/directory/device to enumerate.
+    pub buf_ptr:  usize,  // Pointer to the output buffer in user-space
+    pub buf_len:  usize,  // Length of the output buffer
+    pub skip:     usize,  // Number of entries to skip for pagination 
+                          // (0 for the first call)
+    // Output to user-space:
+    pub count:    usize,  // Number of entries enumerated (0 if failed)
+}
+
+#[repr(C, packed)]
+pub struct VfsReadWriteArgs {
+    pub fd:       usize,  // The target file/device to read/write
+    pub offset:   usize,  // Offset in the file/device to read/write
+    pub buf_ptr:  usize,  // Pointer to the buffer in user-space
+    pub buf_len:  usize,  // Length of the buffer
+    // Output to user-space:
+    pub bytes:    usize,  // Number of bytes actually read/written
+}
+
+#[repr(C, packed)]
+pub struct VfsExecArgs {
+    pub fd:         usize,  // The target file/device to execute
+    pub func_code:  usize,  // The command/function code to execute
+    pub args_ptr:   usize,  // Pointer to the command buffer in user-space
+    pub args_len:   usize,  // Length of the command buffer
+    // Output to user-space
+    pub ret_val:    usize,  // Return value from the executed command
+}
+
+//
 // Low level system call interface
 //
 
@@ -144,25 +200,25 @@ pub fn syscall(params: Syscall) {
             syscall_trigger_int(SyscallOpCode::ProcCtl as usize,
                                 opcode, args, ret_code, 0);
         },
-        Syscall::Open { path_ptr, path_len, mode, ret_ptr }             => {
+        Syscall::Open { args_ptr, args_len, arg3, ret_ptr }             => {
             syscall_trigger_int(SyscallOpCode::Open as usize,
-                                path_ptr, path_len, mode, ret_ptr);
+                                args_ptr, args_len, arg3, ret_ptr);
         },
-        Syscall::Enum { fd, buf_ptr, buf_len, ret_ptr }                 => {
+        Syscall::Enum { args_ptr, args_len, arg3, ret_ptr }             => {
             syscall_trigger_int(SyscallOpCode::Enum as usize,
-                                fd, buf_ptr, buf_len, ret_ptr);
-        }
-        Syscall::Read { fd, buf_ptr, buf_len, ret_ptr }                 => {
+                                args_ptr, args_len, arg3, ret_ptr);
+        },
+        Syscall::Read { args_ptr, args_len, arg3, ret_ptr }             => {
             syscall_trigger_int(SyscallOpCode::Read as usize,
-                                fd, buf_ptr, buf_len, ret_ptr);
+                                args_ptr, args_len, arg3, ret_ptr);
         },
-        Syscall::Write { fd, buf_ptr, buf_len, ret_ptr }                => {
+        Syscall::Write { args_ptr, args_len, arg3, ret_ptr }            => {
             syscall_trigger_int(SyscallOpCode::Write as usize,
-                                fd, buf_ptr, buf_len, ret_ptr);
+                                args_ptr, args_len, arg3, ret_ptr);
         },
-        Syscall::Exec { fd, cmd_buf_ptr, cmd_buf_len, ret_ptr }         => {
+        Syscall::Exec { args_ptr, args_len, arg3, ret_ptr }             => {
             syscall_trigger_int(SyscallOpCode::Exec as usize,
-                                fd, cmd_buf_ptr, cmd_buf_len, ret_ptr);
+                                args_ptr, args_len, arg3, ret_ptr);
         },
         Syscall::Close { fd }                                           => {
             syscall_trigger_int(SyscallOpCode::Close as usize , fd, 0, 0, 0);

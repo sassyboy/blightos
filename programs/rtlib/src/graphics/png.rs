@@ -107,13 +107,13 @@ impl PngImage {
     // PngImage with the info filled in.
     // This does not decode the image data or validate the IDAT chunks.
     pub fn from_path(path: &Path) -> Result<Self, Exception> {
-        let f = File::from_path(path)?;
+        let mut f = File::from_path(path, File::MODE_READ)?;
 
         // Parse PNG signature and chunks, extract IHDR and collect IDAT
         let mut sig = [0u8; 8];
-        f.read(&mut sig);
+        f.read(&mut sig)?;
         if sig != [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
-            return Err(Exception::new(ErrorCode::InvalidData,
+            return Err(Exception::new(ErrorCode::InvalidFormat,
                                             "invalid PNG signature"));
         }
 
@@ -123,14 +123,14 @@ impl PngImage {
         loop {
             // Read the chunk's length
             let mut len_b = [0u8; 4];
-            if f.read(&mut len_b) != 4 {
+            if f.read(&mut len_b).unwrap_or(0) != 4 {
                 return Err(Exception::new(ErrorCode::IOError,
                                 "IO Error while reading chunk length"));
             }
             let len = u32::from_be_bytes(len_b) as usize;
             // Read the chunk's type
             let mut typ = [0u8; 4];
-            if f.read(&mut typ) != 4 {
+            if f.read(&mut typ).unwrap_or(0) != 4 {
                 return Err(Exception::new(ErrorCode::IOError,
                                 "IO Error while reading chunk type"));
             }
@@ -138,7 +138,7 @@ impl PngImage {
             // Read chunk's data
             let mut data = vec![0u8; len];
             if len > 0 {
-                let ret = f.read(&mut data);
+                let ret = f.read(&mut data).unwrap_or(0);
                 if ret != len {
                     println!("IO Error while reading chunk data: {} != {}", ret, len);
                     return Err(Exception::new(ErrorCode::IOError,
@@ -147,7 +147,7 @@ impl PngImage {
             }
             // Read CRC (skip verification)
             let mut crc = [0u8; 4];
-            if f.read(&mut crc) != 4 {
+            if f.read(&mut crc).unwrap_or(0) != 4 {
                 return Err(Exception::new(ErrorCode::IOError,
                                 "IO Error while reading chunk CRC"));
             }
@@ -155,7 +155,7 @@ impl PngImage {
             match typ_s {
             b"IHDR" => {
                 if len != 13 {
-                    return Err(Exception::new(ErrorCode::InvalidData, 
+                    return Err(Exception::new(ErrorCode::InvalidFormat, 
                                                         "invalid IHDR length"));
                 }
                 png.img.width = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
@@ -170,20 +170,20 @@ impl PngImage {
                     3 => ColorType::Indexed,
                     4 => ColorType::GrayscaleAlpha,
                     6 => ColorType::RGBA,
-                    _ => return Err(Exception::new(ErrorCode::Unsupported, 
+                    _ => return Err(Exception::new(ErrorCode::NotSupported, 
                                                     "unsupported color type")),
                 };
                 // Support verification
                 if png.comp != 0 || png.filt != 0 {
-                    return Err(Exception::new(ErrorCode::Unsupported, 
+                    return Err(Exception::new(ErrorCode::NotSupported, 
                                     "unsupported compression/filter method"));
                 }
                 if png.img.width == 0 || png.img.height == 0 {
-                    return Err(Exception::new(ErrorCode::InvalidData, 
+                    return Err(Exception::new(ErrorCode::InvalidFormat, 
                                                 "invalid image dimensions"));
                 }
                 if png.img.bit_depth != 8 {
-                    return Err(Exception::new(ErrorCode::Unsupported,
+                    return Err(Exception::new(ErrorCode::NotSupported,
                                             "only 8-bit PNGs are supported"));
                 }
                 valid_ihdr = true;
@@ -198,7 +198,7 @@ impl PngImage {
             b"PLTE" => {
                 png.plte = data;
                 if png.plte.len() % 3 != 0 {
-                    return Err(Exception::new(ErrorCode::InvalidData,
+                    return Err(Exception::new(ErrorCode::InvalidFormat,
                                             "invalid PLTE length"));
                 }
             },
@@ -212,7 +212,7 @@ impl PngImage {
         } // End of the chunk-reading loop
 
         if !valid_ihdr {
-            return Err(Exception::new(ErrorCode::InvalidData, "Invalid IHDR"));
+            return Err(Exception::new(ErrorCode::InvalidFormat, "Invalid IHDR"));
         }
         png.idat.shrink_to_fit();
         Ok(png)
@@ -223,7 +223,7 @@ impl PngImage {
     pub fn decode(&mut self) -> Result<Vec<RGBA>, Exception> {
         // Validate the PNG format
         if self.img.interlaced {
-            return Err(Exception::new(ErrorCode::Unsupported,
+            return Err(Exception::new(ErrorCode::NotSupported,
                                             "interlaced PNGs not supported"));
         }
         
@@ -245,7 +245,7 @@ impl PngImage {
         ColorType::RGBA => {
             // Already RGBA8: copy directly (sizes must match)
             if data.len() != num_pixels * 4 {
-                return Err(Exception::new(ErrorCode::InvalidData, 
+                return Err(Exception::new(ErrorCode::InvalidFormat, 
                                                     "unexpected data size"));
             }
             for (i, pixel) in out_buf.iter_mut().enumerate() {
@@ -259,7 +259,7 @@ impl PngImage {
         ColorType::RGB => {
             // Expand RGB -> RGBA (alpha = 255)
             if data.len() != num_pixels * 3 {
-                return Err(Exception::new(ErrorCode::InvalidData, 
+                return Err(Exception::new(ErrorCode::InvalidFormat, 
                                                     "unexpected RGB size"));
             }
             for (i, pixel) in out_buf.iter_mut().enumerate() {
@@ -273,7 +273,7 @@ impl PngImage {
         ColorType::Grayscale => {
             // Gray -> RGBA (replicate gray into RGB, alpha=255)
             if data.len() != num_pixels {
-                return Err(Exception::new(ErrorCode::InvalidData, 
+                return Err(Exception::new(ErrorCode::InvalidFormat, 
                                                 "unexpected grayscale size"));
             }
             for (i, pixel) in out_buf.iter_mut().enumerate() {
@@ -287,7 +287,7 @@ impl PngImage {
         ColorType::GrayscaleAlpha => {
             // Gray+Alpha -> RGBA (gray -> R,G,B ; keep A)
             if data.len() != num_pixels * 2 {
-                return Err(Exception::new(ErrorCode::InvalidData, 
+                return Err(Exception::new(ErrorCode::InvalidFormat, 
                                                 "unexpected gray+alpha size"));
             }
             for (i, pixel) in out_buf.iter_mut().enumerate() {
@@ -302,19 +302,19 @@ impl PngImage {
         ColorType::Indexed => {
             // Map palette indices -> RGBA using the PLTE chunk.
             if self.plte.is_empty() {
-                return Err(Exception::new(ErrorCode::InvalidData, 
+                return Err(Exception::new(ErrorCode::InvalidFormat, 
                                             "missing PLTE for indexed PNG"));
             }
             // Each palette entry is 3 bytes (R,G,B)
             let entries = self.plte.len() / 3;
             if data.len() != num_pixels {
-                return Err(Exception::new(ErrorCode::InvalidData, 
+                return Err(Exception::new(ErrorCode::InvalidFormat, 
                                             "unexpected indexed image size"));
             }
             for (i, pixel) in out_buf.iter_mut().enumerate() {
                 let idx = data[i] as usize;
                 if idx >= entries {
-                    return Err(Exception::new(ErrorCode::InvalidData,
+                    return Err(Exception::new(ErrorCode::InvalidFormat,
                                                 "palette index out of range"));
                 }
                 let p = idx * 3;
@@ -344,15 +344,19 @@ impl PngImage {
         let bpp = self.img.color_type.bytes_per_pixel();
         let row_bytes = width * bpp;
         let expected_len = height.checked_mul(1 + row_bytes)
-                .ok_or_else(|| Exception::new(ErrorCode::InvalidData, "image too large"))?;
+                .ok_or_else(|| Exception::new(ErrorCode::InvalidFormat,
+                                                        "image too large"))?;
         if decompressed.len() < expected_len {
-            return Err(Exception::new(ErrorCode::InvalidData, "decompressed data too short"));
+            return Err(Exception::new(ErrorCode::InvalidFormat,
+                                                "decompressed data too short"));
         }
 
         let out_len = height.checked_mul(row_bytes)
-                .ok_or_else(|| Exception::new(ErrorCode::InvalidData, "image too large"))?;
+                .ok_or_else(|| Exception::new(ErrorCode::InvalidFormat,
+                                                        "image too large"))?;
         if out.len() < out_len {
-            return Err(Exception::new(ErrorCode::InvalidData, "output buffer too small"));
+            return Err(Exception::new(ErrorCode::InvalidFormat,
+                                                    "output buffer too small"));
         }
 
         // Process each scanline: first byte is filter type
@@ -418,7 +422,8 @@ impl PngImage {
                     }
                 }
                 _ => {
-                    return Err(Exception::new(ErrorCode::Unsupported, "unsupported filter type"));
+                    return Err(Exception::new(ErrorCode::NotSupported,
+                                                    "unsupported filter type"));
                 }
             }
 

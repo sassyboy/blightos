@@ -61,12 +61,12 @@ impl WaveAudio {
         }
     }
     pub fn from_path(path: &Path) -> Result<Self, Exception> {
-        let file = File::from_path(path)?;
+        let mut file = File::from_path(path, File::MODE_READ)?;
         // Read RIFF header (12 bytes)
         let mut riff_header = [0u8; 12];
-        file.read(&mut riff_header);
+        file.read(&mut riff_header)?;
         if &riff_header[0..4] != b"RIFF" || &riff_header[8..12] != b"WAVE" {
-            return Err(Exception::new(ErrorCode::InvalidData,
+            return Err(Exception::new(ErrorCode::InvalidFormat,
                                     "Not a valid RIFF/WAVE file"));
         }
 
@@ -80,7 +80,7 @@ impl WaveAudio {
         // Iterate chunks until we find "fmt " and "data"
         loop {
             let mut chunk_hdr = [0u8; 8];
-            let len = file.read(&mut chunk_hdr);
+            let len = file.read(&mut chunk_hdr)?;
             if len < 8 {
                 break;
             }
@@ -92,7 +92,7 @@ impl WaveAudio {
                     // Read fmt chunk (at least 16 bytes expected)
                     // See comment above for field offsets inside fmt chunk.
                     let mut fmt_buf = vec![0u8; size as usize];
-                    file.read(&mut fmt_buf);
+                    file.read(&mut fmt_buf)?;
                     if fmt_buf.len() >= 16 {
                         data_format = u16::from_le_bytes(fmt_buf[0..2].try_into().unwrap());
                         channels = u16::from_le_bytes(fmt_buf[2..4].try_into().unwrap());
@@ -105,27 +105,27 @@ impl WaveAudio {
                     // Data is raw PCM (or other codec) bytes.
                     data_size = size;
                     data = vec![0u8; data_size as usize];
-                    file.read(&mut data);
+                    file.read(&mut data)?;
                     break;
                 }
                 _ => {
                     // skip unknown chunk - Todo: replace with seek if supported
                     let mut skip_buf = vec![0u8; size as usize];
-                    file.read(&mut skip_buf);
+                    file.read(&mut skip_buf)?;
                 }
             }
         }
 
         if data_size == 0 {
-            return Err(Exception::new(ErrorCode::InvalidData,
+            return Err(Exception::new(ErrorCode::InvalidFormat,
                                         "No data chunk found"));
         }
         if bit_depth == 0 || channels == 0 || byte_rate == 0 {
-            return Err(Exception::new(ErrorCode::InvalidData,
+            return Err(Exception::new(ErrorCode::InvalidFormat,
                                         "Incomplete fmt chunk"));
         }
         if data_format != 1 {
-            return Err(Exception::new(ErrorCode::Unsupported,
+            return Err(Exception::new(ErrorCode::NotSupported,
                                         "Only PCM format is supported"));
         }
 

@@ -93,12 +93,12 @@ impl<'a> ZlibDecoder<'a> {
         }
         if max_len == 0 {
             // empty huffman table
-            return Err(Exception::new(ErrorCode::InvalidData, 
+            return Err(Exception::new(ErrorCode::InvalidFormat, 
                                     "Empty Huffman table"));
         }
         if max_len > 15 {
             // huffman max bit length > 15 is not allowed in DEFLATE
-            return Err(Exception::new(ErrorCode::InvalidData,
+            return Err(Exception::new(ErrorCode::InvalidFormat,
                                     "Huffman code length exceeds limit of 15"));
         }
         // bl_count[len] = number of codes of length len
@@ -148,7 +148,7 @@ impl<'a> ZlibDecoder<'a> {
         let sym = table_symbol[idx];
         if sym < 0 {
             // This shouldn't happen if table is well-formed
-            Err(Exception::new(ErrorCode::InvalidData, "Invalid Huffman code"))
+            Err(Exception::new(ErrorCode::InvalidFormat, "Invalid Huffman code"))
         } else {
             let len = table_len[idx];
             // drop len bits
@@ -168,12 +168,12 @@ impl<'a> ZlibDecoder<'a> {
         let flg = self.read_byte()?;
         // check compression method = 8 (deflate) and FCHECK
         if (cmf & 0x0F) != 8 {
-            return Err(Exception::new(ErrorCode::Unsupported, 
-                                        "Unsupported zlib compression method"));
+            return Err(Exception::new(ErrorCode::NotSupported, 
+                                    "zlib compression method not supported"));
         }
         let combined = ((cmf as u16) << 8) | (flg as u16);
         if combined % 31 != 0 {
-            return Err(Exception::new(ErrorCode::InvalidData,
+            return Err(Exception::new(ErrorCode::InvalidFormat,
                                             "Invalid zlib header checksum"));
         }
         // Now DEFLATE stream
@@ -193,7 +193,7 @@ impl<'a> ZlibDecoder<'a> {
                     let nlen = nhi << 8 | nlo;
                     if len != (!nlen) {
                         // invalid uncompressed LEN/NLEN
-                        return Err(Exception::new(ErrorCode::InvalidData, 
+                        return Err(Exception::new(ErrorCode::InvalidFormat, 
                                             "Invalid uncompressed LEN/NLEN"));
                     }
                     // copy len bytes
@@ -235,7 +235,8 @@ impl<'a> ZlibDecoder<'a> {
                         cl_lengths[cl_order[i]] = v;
                     }
                     // build code length huffman
-                    let (cl_table_sym, cl_table_len, cl_bits) = Self::build_huffman_table(&cl_lengths)?;
+                    let (cl_table_sym, cl_table_len, cl_bits) =
+                                        Self::build_huffman_table(&cl_lengths)?;
                     // read literal/length and distance code lengths
                     let mut lengths = Vec::with_capacity(hlit + hdist);
                     let mut i = 0usize;
@@ -249,7 +250,7 @@ impl<'a> ZlibDecoder<'a> {
                             if s < 0 {
                                 // invalid code length
                                 return Err(
-                                    Exception::new(ErrorCode::InvalidData,
+                                    Exception::new(ErrorCode::InvalidFormat,
                                                     "Invalid code length"));
                             }
                             let l = cl_table_len[idx];
@@ -266,7 +267,7 @@ impl<'a> ZlibDecoder<'a> {
                                 // copy previous 3-6 times, extra 2 bits
                                 if lengths.is_empty() {
                                     return Err(
-                                        Exception::new(ErrorCode::InvalidData,
+                                        Exception::new(ErrorCode::InvalidFormat,
                                             "No previous length to repeat"));
                                 }
                                 let extra = self.read_bits(2)? as usize;
@@ -298,14 +299,14 @@ impl<'a> ZlibDecoder<'a> {
                             _ => {
                                 // invalid code length symbol
                                 return Err(Exception::new(
-                                                ErrorCode::InvalidData,
+                                                ErrorCode::InvalidFormat,
                                                 "Invalid code length"));
                             }
                         }
                     }
                     if lengths.len() != hlit + hdist {
                         // bad lengths
-                        return Err(Exception::new(ErrorCode::InvalidData,
+                        return Err(Exception::new(ErrorCode::InvalidFormat,
                                             "Bad lengths"));
                     }
                     let litlen_lengths = &lengths[0..hlit];
@@ -316,7 +317,7 @@ impl<'a> ZlibDecoder<'a> {
                 }
                 _ => {
                     // reserved BTYPE
-                    return Err(Exception::new(ErrorCode::InvalidData,
+                    return Err(Exception::new(ErrorCode::InvalidFormat,
                                             "Invalid DEFLATE block type"));
                 }
             }
@@ -365,7 +366,7 @@ impl<'a> ZlibDecoder<'a> {
                 let idx = (lit_sym as usize) - 257;
                 if idx >= LEN_BASE.len() {
                     // invalid length symbol
-                    return Err(Exception::new(ErrorCode::InvalidData,
+                    return Err(Exception::new(ErrorCode::InvalidFormat,
                                                     "Invalid length symbol"));
                 }
                 let base = LEN_BASE[idx];
@@ -376,13 +377,13 @@ impl<'a> ZlibDecoder<'a> {
                 let dist_sym = self.decode_symbol(d_table_sym, d_table_len, d_bits)?;
                 if dist_sym < 0 {
                     // invalid distance symbol
-                    return Err(Exception::new(ErrorCode::InvalidData,
+                    return Err(Exception::new(ErrorCode::InvalidFormat,
                                             "Invalid distance symbol"));
                 }
                 let dist_idx = dist_sym as usize;
                 if dist_idx >= DIST_BASE.len() {
                     // invalid distance index
-                    return Err(Exception::new(ErrorCode::InvalidData,
+                    return Err(Exception::new(ErrorCode::InvalidFormat,
                                                     "Invalid distance index"));
                 }
                 let db = DIST_BASE[dist_idx];
@@ -391,7 +392,7 @@ impl<'a> ZlibDecoder<'a> {
                 let distance = db + extrad;
                 if distance == 0 || distance > out.len() {
                     // invalid distance 
-                    return Err(Exception::new(ErrorCode::InvalidData,
+                    return Err(Exception::new(ErrorCode::InvalidFormat,
                                                     "Invalid distance"));
                 }
                 // copy length bytes from distance back
@@ -402,7 +403,7 @@ impl<'a> ZlibDecoder<'a> {
                 }
             } else {
                 // invalid literal/length symbol
-                return Err(Exception::new(ErrorCode::InvalidData,
+                return Err(Exception::new(ErrorCode::InvalidFormat,
                                             "Invalid literal/length symbol"));
             }
         }

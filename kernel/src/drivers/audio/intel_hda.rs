@@ -38,10 +38,10 @@ use alloc::sync::Arc;
 use crate::arch::{MMUMapping};
 use crate::drivers::{MMIORegisterFile, pci::*};
 use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
-use crate::drivers::storage::IOCompletion;
 use crate::sched::Task;
 use crate::util::*;
 use crate::mem::phys::*;
+use crate::Error;
 
 #[cfg(feature="debug_ihda")]
 macro_rules! dbg {
@@ -930,19 +930,35 @@ impl IntelHDA {
     const DEV_HND_OUTPUT_VOL:       usize = 6;
     const DEV_HND_CODECS:           usize = 7;
     const DEV_HND_PCM_FILE_BASE:    usize = 1000;
-    fn fops_handler(op: FileOperation) -> IOCompletion {
+
+    fn fops_handler(op: FileOperation) -> Result<usize, Error> {
         match op {
-            FileOperation::Open { path } => {
-                let mpath = MountPoint::device_relative_path(path);
+            FileOperation::Open { full_path, mode: _, dent } => {
+                let mpath = MountPoint::device_relative_path(full_path);
                 if mpath.eq("/") {
-                    return IOCompletion::Successful(Self::DEV_HND_ROOT);
+                    dent.name = String::from("");
+                    dent.size = 0;
+                    dent.flags = DirectoryEntry::DEV_R_DIR_FLAGS;
+                    return Ok(Self::DEV_HND_ROOT);
                 } else if mpath.eq("/output") || mpath.eq("/output/") {
-                    return IOCompletion::Successful(Self::DEV_HND_OUTPUT);
+                    dent.name = String::from("output");
+                    dent.size = 0;
+                    dent.flags = DirectoryEntry::DEV_R_DIR_FLAGS;
+                    return Ok(Self::DEV_HND_OUTPUT);
                 } else if mpath.eq("/output/fmt") {
-                    return IOCompletion::Successful(Self::DEV_HND_OUTPUT_FMT);
+                    dent.name = String::from("fmt");
+                    dent.size = 64;
+                    dent.flags = DirectoryEntry::DEV_RW_FILE_FLAGS;
+                    return Ok(Self::DEV_HND_OUTPUT_FMT);
                 } else if mpath.eq("/output/mute") {
-                    return IOCompletion::Successful(Self::DEV_HND_OUTPUT_MUTE);
+                    dent.name = String::from("mute");
+                    dent.size = 1;
+                    dent.flags = DirectoryEntry::DEV_RW_FILE_FLAGS;
+                    return Ok(Self::DEV_HND_OUTPUT_MUTE);
                 } else if mpath.eq("/output/pcm") {
+                    dent.name = String::from("pcm");
+                    dent.size = 1024 * 1024; // 1MB max PCM file size for now
+                    dent.flags = DirectoryEntry::DEV_W_FILE_FLAGS;
                     let mut hda = HDA_DEVICE.lock();
                     let mut file_list = PCM_FILES.lock();
                     let hnd = hda.next_pcm_hnd;
@@ -953,19 +969,25 @@ impl IntelHDA {
                     };
                     file_list.insert(hnd, Arc::new(pcm_fobj));
                     hda.next_pcm_hnd += 1;
-                    return IOCompletion::Successful(hnd);
+                    return Ok(hnd);
                 } else if mpath.eq("/output/vol") {
-                    return IOCompletion::Successful(Self::DEV_HND_OUTPUT_VOL);
+                    dent.name = String::from("vol");
+                    dent.size = 16;
+                    dent.flags = DirectoryEntry::DEV_RW_FILE_FLAGS;
+                    return Ok(Self::DEV_HND_OUTPUT_VOL);
                 } else if mpath.eq("/codecs") {
-                    return IOCompletion::Successful(Self::DEV_HND_CODECS);
+                    dent.name = String::from("codecs");
+                    dent.size = 0;
+                    dent.flags = DirectoryEntry::DEV_R_FILE_FLAGS;
+                    return Ok(Self::DEV_HND_CODECS);
                 } else {
-                    return IOCompletion::InvalidPath;
+                    return Err(error!(ErrorCode::InvalidPath));
                 }
                 
             },
             FileOperation::Close { hnd } => {
                 if hnd <= Self::DEV_HND_CODECS {
-                    return IOCompletion::Successful(0);
+                    return Ok(0);
                 } else {
                     return Self::fclose(hnd);
                 }
@@ -980,66 +1002,65 @@ impl IntelHDA {
                 return Self::fenum(hnd, out);
             },
              _ => {
-                return IOCompletion::InvalidOp;
+                return Err(error!(ErrorCode::InvalidOp));
              }
         }
     }
 
-    fn fenum(hnd: usize, out: &mut Vec<DirectoryEntry>) -> IOCompletion {
-        const DIR_FLAGS :   usize = DirectoryEntry::FLG_DIRECTORY |
-                                    DirectoryEntry::FLG_SYSTEM |
-                                    DirectoryEntry::FLG_PERM_READ |
-                                    DirectoryEntry::FLG_DEVICE;
-        const ROFILE_FLAGS : usize = DirectoryEntry::FLG_SYSTEM |
-                                    DirectoryEntry::FLG_PERM_READ |
-                                    DirectoryEntry::FLG_DEVICE;
-        const WOFILE_FLAGS : usize = DirectoryEntry::FLG_SYSTEM |
-                                    DirectoryEntry::FLG_PERM_WRITE |
-                                    DirectoryEntry::FLG_DEVICE;
-        const RWFILE_FLAGS : usize = DirectoryEntry::FLG_SYSTEM |
-                                    DirectoryEntry::FLG_PERM_READ |
-                                    DirectoryEntry::FLG_PERM_WRITE |
-                                    DirectoryEntry::FLG_DEVICE;
-                                
+    fn fenum(hnd: usize, out: &mut Vec<DirectoryEntry>) -> Result<usize, Error>{                                
         if hnd == Self::DEV_HND_ROOT {
             out.push(DirectoryEntry {
-                name: String::from("codecs"), size: 0, flags: ROFILE_FLAGS
+                name: String::from("codecs"),
+                size: 0,
+                flags: DirectoryEntry::DEV_R_FILE_FLAGS
             });
             out.push(DirectoryEntry {
-                name: String::from("input"), size: 0, flags: DIR_FLAGS
+                name: String::from("input"),
+                size: 0,
+                flags: DirectoryEntry::DEV_R_DIR_FLAGS
             });
             out.push(DirectoryEntry {
-                name: String::from("output"), size: 0, flags: DIR_FLAGS
+                name: String::from("output"),
+                size: 0,
+                flags: DirectoryEntry::DEV_R_DIR_FLAGS
             });
         } else if hnd == Self::DEV_HND_OUTPUT {
             out.push(DirectoryEntry {
-                name: String::from("fmt"), size: 0, flags: RWFILE_FLAGS
+                name: String::from("fmt"),
+                size: 64,
+                flags: DirectoryEntry::DEV_RW_FILE_FLAGS
             });
             out.push(DirectoryEntry {
-                name: String::from("mute"), size: 0, flags: RWFILE_FLAGS
+                name: String::from("mute"),
+                size: 1,
+                flags: DirectoryEntry::DEV_RW_FILE_FLAGS
             });
             out.push(DirectoryEntry {
-                name: String::from("pcm"), size: 0, flags: WOFILE_FLAGS
+                name: String::from("pcm"),
+                size: 1024 * 1024, // 1MB max PCM file size for now
+                flags: DirectoryEntry::DEV_W_FILE_FLAGS
             });
             out.push(DirectoryEntry {
-                name: String::from("vol"), size: 0, flags: RWFILE_FLAGS
+                name: String::from("vol"),
+                size: 16,
+                flags: DirectoryEntry::DEV_RW_FILE_FLAGS
             });
         } else {
-            return IOCompletion::InvalidHandle;
+            return Err(error!(ErrorCode::InvalidHandle));
         }
-        return IOCompletion::Successful(out.len());
+        return Ok(out.len());
     }
 
-    fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> IOCompletion {
+    fn fread(hnd: usize, off: usize, buff: &mut [u8]) -> Result<usize, Error> {
         if hnd <= Self::DEV_HND_CODECS {
             // Read from a special file
             let hda = HDA_DEVICE.lock();
             return hda.fread_spec(hnd, off, buff);
         }
-        IOCompletion::InvalidHandle
+        Err(error!(ErrorCode::InvalidHandle))
     }
 
-    fn fwrite(hnd: usize, off: usize, buff: &[u8]) -> IOCompletion {
+    fn fwrite(hnd: usize, off: usize, buff: &[u8]) -> Result<usize, Error> {
         if hnd <= Self::DEV_HND_CODECS {
             // Write to a special file
             let mut hda = HDA_DEVICE.lock();
@@ -1051,23 +1072,23 @@ impl IntelHDA {
                 if fobj.output {
                     // For simplicity, we only support writing to output PCM files
                     let mut hda = HDA_DEVICE.lock();
-                    return IOCompletion::Successful(hda.queue_playback(buff));
+                    return Ok(hda.queue_playback(buff));
                 } else {
                     // Cannot write to input PCM files
-                    return IOCompletion::InvalidOp;
+                    return Err(error!(ErrorCode::InvalidOp));
                 }
             }
         }
-        IOCompletion::InvalidHandle
+        Err(error!(ErrorCode::InvalidHandle))
     }
 
-    fn fclose(_hnd: usize) -> IOCompletion {
-        IOCompletion::InvalidHandle
+    fn fclose(_hnd: usize) -> Result<usize, Error> {
+        Err(error!(ErrorCode::InvalidHandle))
     }
 
 
     fn fread_spec(&self, hnd: usize, off: usize, buff: &mut [u8])
-                                                            -> IOCompletion {
+                                                    -> Result<usize, Error> {
         if hnd == Self::DEV_HND_OUTPUT_FMT {
             let str;
             let bytes;
@@ -1082,7 +1103,7 @@ impl IntelHDA {
             }
             let len = (bytes.len() - off).min(buff.len());
             buff[..len].copy_from_slice(&bytes[off..off + len]);
-            return IOCompletion::Successful(len);
+            return Ok(len);
         } else if hnd == Self::DEV_HND_OUTPUT_MUTE {
             let bytes;
             if self.output_mute {
@@ -1092,24 +1113,26 @@ impl IntelHDA {
             }
             let len = (bytes.len() - off).min(buff.len());
             buff[..len].copy_from_slice(&bytes[off..off + len]);
-            return IOCompletion::Successful(len);
+            return Ok(len);
         } else if hnd == Self::DEV_HND_OUTPUT_VOL {
             let bytes;
-            let l  = (self.output_gain_l as u32 * 100) / Self::MAX_GAIN as u32;
-            let r = (self.output_gain_r as u32 * 100) / Self::MAX_GAIN as u32;
+            let l  = div_round_up!(self.output_gain_l as u32 * 100, 
+                                                    Self::MAX_GAIN as u32);
+            let r = div_round_up!(self.output_gain_r as u32 * 100,
+                                                    Self::MAX_GAIN as u32);
             let str = format!("L:{},R:{}", l, r);
             bytes = str.as_bytes();
             let len = (bytes.len() - off).min(buff.len());
             buff[..len].copy_from_slice(&bytes[off..off + len]);
-            return IOCompletion::Successful(len);
+            return Ok(len);
         }
-        IOCompletion::InvalidOp
+        Err(error!(ErrorCode::InvalidOp))
     }
 
     fn fwrite_spec(&mut self, hnd: usize, _off: usize, buff: &[u8])
-                                                            -> IOCompletion {
+                                                    -> Result<usize, Error> {
         if hnd == Self::DEV_HND_OUTPUT_FMT {
-            return IOCompletion::InvalidOp; // TODO
+            return Err(error!(ErrorCode::InvalidOp)); // TODO
         } else if hnd == Self::DEV_HND_OUTPUT_MUTE {
             let s = core::str::from_utf8(buff).unwrap_or("");
             if s.trim() == "1" {
@@ -1117,37 +1140,37 @@ impl IntelHDA {
             } else if s.trim() == "0" {
                 self.output_mute = false;
             } else {
-                return IOCompletion::InvalidOp;
+                return Err(error!(ErrorCode::InvalidFormat));
             }
             self.apply_output_gain();
         } else if hnd == Self::DEV_HND_OUTPUT_VOL {
             let s = core::str::from_utf8(buff).unwrap_or("");
             let parts: Vec<&str> = s.trim().split(',').collect();
             if parts.len() != 2 {
-                return IOCompletion::InvalidOp;
+                return Err(error!(ErrorCode::InvalidFormat));
             }
             let mut l = None;
             let mut r = None;
             for part in parts {
                 let kv: Vec<&str> = part.split(':').collect();
                 if kv.len() != 2 {
-                    return IOCompletion::InvalidOp;
+                    return Err(error!(ErrorCode::InvalidFormat));
                 }
                 let key = kv[0].trim();
                 let val = kv[1].trim().parse::<u8>();
                 if val.is_err() {
-                    return IOCompletion::InvalidOp;
+                    return Err(error!(ErrorCode::InvalidFormat));
                 }
                 let val = val.unwrap();
                 if val > 100 {
-                    return IOCompletion::InvalidOp;
+                    return Err(error!(ErrorCode::InvalidFormat));
                 }
                 if key == "L" {
                     l = Some((val as u32 * Self::MAX_GAIN as u32) / 100);
                 } else if key == "R" {
                     r = Some((val as u32 * Self::MAX_GAIN as u32) / 100);
                 } else {
-                    return IOCompletion::InvalidOp;
+                    return Err(error!(ErrorCode::InvalidFormat));
                 }
             }
             if let Some(l) = l {
@@ -1157,8 +1180,9 @@ impl IntelHDA {
                 self.output_gain_r = r as u8;
             }
             self.apply_output_gain();
+            return Ok(buff.len());
         }
-        IOCompletion::InvalidOp
+        Err(error!(ErrorCode::InvalidOp))
     }
 }
 

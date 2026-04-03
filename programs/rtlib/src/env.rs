@@ -38,6 +38,9 @@ pub fn set_current_dir(path: &str) -> Result<(), Exception> {
     let mut dir = CUR_DIR.lock();
     dir.clear();
     dir.push_str(path);
+    if !path.ends_with('/') {
+        dir.push('/');
+    }
     Ok(())
 }
 

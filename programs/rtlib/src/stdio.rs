@@ -61,30 +61,56 @@ pub fn read_line(buf: &mut [u8]) -> usize {
 }
 
 pub fn stdio_write(msg: &[u8]) {
+    let mut args = VfsReadWriteArgs {
+        fd: SyscallRsvdFDs::StandardIO as usize,
+        offset: 0,
+        buf_ptr: msg.as_ptr() as usize,
+        buf_len: msg.len(),
+        bytes: 0
+    };
+    let mut ret_val: usize = 0;
     syscall(Syscall::Write {
-            fd: SyscallRsvdFDs::StandardIO as usize,
-            buf_ptr: msg.as_ptr() as usize,
-            buf_len: msg.len(),
-            ret_ptr: 0
+            args_ptr: &mut args as *mut VfsReadWriteArgs as usize,
+            args_len: core::mem::size_of::<VfsReadWriteArgs>(),
+            arg3: 0,
+            ret_ptr: &mut ret_val as *mut usize as usize
     });
 }
 
 pub fn stdio_read_byte() -> u8 {
-    let outchar: u8 = 0;
+    let mut outchar: u8 = 0;
+    let mut args = VfsReadWriteArgs {
+        fd: SyscallRsvdFDs::StandardIO as usize,
+        offset: 0,
+        buf_ptr: &mut outchar as *mut u8 as usize,
+        buf_len: 1,
+        bytes: 0
+    };
+    let mut ret_val: usize = 0;
     syscall(Syscall::Read {
-            fd: SyscallRsvdFDs::StandardIO as usize,
-            buf_ptr: &outchar as *const u8 as usize,
-            buf_len: 1,
-            ret_ptr: 0
+            args_ptr: &mut args as *mut VfsReadWriteArgs as usize,
+            args_len: core::mem::size_of::<VfsReadWriteArgs>(),
+            arg3: 0,
+            ret_ptr: &mut ret_val as *mut usize as usize
     });
     outchar
 }
 
 pub fn stdio_clear_screen() {
-    syscall(Syscall::Exec {
+    let mut func_args: [usize; 1] = [0; 1];
+    let mut func_ret: usize = 0;
+    let mut args = VfsExecArgs {
         fd: SyscallRsvdFDs::StandardIO as usize,
-        cmd_buf_ptr: 1,
-        cmd_buf_len: 0,
-        ret_ptr: 0
+        func_code: 1, // Clear screen command
+        args_ptr: func_args.as_mut_ptr() as usize,
+        args_len: core::mem::size_of_val(&func_args),
+        ret_val: &mut func_ret as *mut usize as usize
+    };
+    let mut ret_val: usize = 0;
+    syscall(Syscall::Exec {
+        args_ptr: &mut args as *mut VfsExecArgs as usize,
+        args_len: core::mem::size_of::<VfsExecArgs>(),
+        arg3: 0,
+        ret_ptr: &mut ret_val as *mut usize as usize
     });
 }
