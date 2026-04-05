@@ -4,7 +4,9 @@
 use crate::{Exception};
 use crate::task::Task;
 use crate::fileio::*;
+use crate::time::TimeStampCounter;
 use core::time::Duration;
+use crate::*;
 
 pub struct AudioFormat {
     pub channels: u16,
@@ -39,8 +41,20 @@ impl Playback {
         &self.fmt
     }
 
+    pub fn samples_to_bytes(&self, samples: usize) -> usize {
+        samples * (self.fmt.bit_depth as usize / 8) * self.fmt.channels as usize
+    }
+
+    pub fn bytes_to_samples(&self, bytes: usize) -> usize {
+        bytes / ((self.fmt.bit_depth as usize / 8) * self.fmt.channels as usize)
+    }
+
     pub fn duration_to_samples(&self, duration_ms: u32) -> usize {
         (self.fmt.sample_rate as usize * duration_ms as usize) / 1000
+    }
+
+    pub fn samples_to_duration(&self, samples: usize) -> u32 {
+        ((samples * 1000) as u32) / self.fmt.sample_rate
     }
 
     pub fn duration_to_bytes(&self, duration_ms: u32) -> usize {
@@ -49,39 +63,65 @@ impl Playback {
                 self.fmt.channels as usize
     }
 
+    pub fn bytes_to_duration(&self, bytes: usize) -> u32 {
+        let samples = self.bytes_to_samples(bytes);
+        self.samples_to_duration(samples)
+    }
     /// Plays audio data through the default output device.
     /// If `sync` is true, this function will block until playback is complete.
     pub fn play(&mut self, data: &[u8], sync: bool) -> Result<(), Exception> {
+        const CHUNK_MS: u32 = 1000;
         if !self.snd.is_open() {
-            self.snd.open(&Path::from("audio:/output/pcm"), File::MODE_WRITE)?;
+            self.snd.open(&Path::from("audio:/output/pcm"),
+                            File::MODE_STREAM | File::MODE_WRITE)?;
         }
-        // Write 1s worth of audio data at a time to avoid overwhelming the
-        // output device. Back off for 20ms in between if the `sync` flag is set.
+        
+        let total_time = self.bytes_to_duration(data.len());
+        // println!("Playing audio data of length {} bytes ({}ms).",
+        //         data.len(), total_time);
         let mut total_written = 0;
-        let chunk_size = self.duration_to_bytes(1000);
+        // Write CHUNK_MS milliseconds worth of audio data at a time to avoid
+        // overwhelming the output device and allow stopping playback if needed
+        let chunk_size = self.duration_to_bytes(CHUNK_MS);
         // println!("Starting audio playback with chunk size {}", chunk_size);
         let mut tries = 0;
+        let mut tsc = TimeStampCounter::new();
+        let start_time = tsc.current_as_nanos() / 1_000_000;
         while total_written < data.len() {
             let end = usize::min(total_written + chunk_size, data.len());
-            let written = self.snd.write(&data[total_written..end]).unwrap_or(0);
-            if written == 0 {
+            let wrrt = self.snd.write(&data[total_written..end]);
+            let Ok(written) = wrrt else {
                 // If we fail to write any data, try a few more times before
                 // giving up
+                let err = wrrt.err().unwrap();
                 tries += 1;
                 if tries >= 50 {
                     break;
                 }
-                Task::sleep(Duration::from_millis(5));
+                println!("AudioWrite failed due to error: {:?}", err);
+                Task::sleep(Duration::from_millis(10));
+                continue;
+
+            };
+            if written == 0 {
+                // Buffer full. Back off and try again
+                let backoff_ms = CHUNK_MS as u64 / 2;
+                Task::sleep(Duration::from_millis(backoff_ms));
                 continue;
             } else {
                 tries = 0;
             }
-            // println!("Wrote {} bytes to audio output", written);
             total_written += written;
             if sync {
-                // Sleep for 5ms to allow the output device to catch up
-                Task::sleep(Duration::from_millis(5));
+                let backoff_ms = self.bytes_to_duration(written) / 100 * 80;
+                Task::sleep(Duration::from_millis(backoff_ms as u64));
             }
+        }
+        let end_time = tsc.current_as_nanos() / 1_000_000;
+        let duration = (end_time - start_time) as u32;
+        if sync && duration < total_time {
+            // Sleep for the remaining time to ensure sync playback
+            Task::sleep(Duration::from_millis(duration as u64));
         }
         Ok(())
     }

@@ -11,7 +11,8 @@ use crate::*;
 pub struct File {
     fd:         usize,
     open:       bool,
-    flags:      usize,
+    flags:      usize,  // File flags reported by the kernel
+    mode:       usize,  // Open mode
     size:       usize,
     rd_offset:  usize,
     wr_offset:  usize
@@ -28,21 +29,44 @@ impl File {
     const FLG_PERM_WRITE:   usize = 0x200;
     const FLG_PERM_EXEC:    usize = 0x400;
 
+    /// If MODE_CREATE is set, the file will be created if it does not exist.
+    /// If the file already exists, it will be truncated to zero length.
     pub const MODE_CREATE:  usize = 0x1;
+    /// If MODE_READ is set, the file will be opened for reading.
     pub const MODE_READ:    usize = 0x2;
+    /// If MODE_WRITE is set, the file will be opened for writing.
     pub const MODE_WRITE:   usize = 0x4;
+    /// If MODE_EXEC is set, the file will be opened for execution. This is used
+    /// for executable files and device files that support exec calls.
     pub const MODE_EXEC:    usize = 0x8;
+    /// If MODE_APPEND is set, the file will be opened in append mode, which
+    /// initializes the write cursor to the end of the file and prevents seeking
+    /// backwards.
     pub const MODE_APPEND:  usize = 0x10;
+    /// The modes defined above are recognized and handled by the syscall.
+    /// KMODE_MASK can be used to filter out the user-space defined modes below.
+    const KMODE_MASK:       usize = 0x1F;
+    // User-space handled file modes
+
+    /// Device files that support streaming (e.g. audio output) report their
+    /// stream buffer size in the file size. These files should be opened
+    /// with this flag to prevent the system from seeking monotinically.
+    /// Instead, the read/write offsets will be allowed to wrap around within
+    /// the file size.
+    pub const MODE_STREAM:  usize = 0x1000;
+
+    // Convenience mode combinations
     pub const MODE_RX:      usize = Self::MODE_READ | Self::MODE_EXEC;
     pub const MODE_RW:      usize = Self::MODE_READ | Self::MODE_WRITE;
     pub const MODE_RWX:     usize = Self::MODE_READ | Self::MODE_WRITE |
-                                                    Self::MODE_EXEC;
+                                                    Self::MODE_EXEC;    
 
     pub const fn new() -> Self {
         Self {
             fd:         0,
             open:       false,
             flags:      0,
+            mode:       0,
             size:       0,
             rd_offset:  0,
             wr_offset:  0
@@ -50,11 +74,12 @@ impl File {
     }
 
     pub fn from_path(path: &Path, mode: usize) -> Result<Self, Exception> {
-        let fobj = fopen(path.as_str(), mode)?;
+        let fobj = fopen(path.as_str(), mode & Self::KMODE_MASK)?;
         Ok(Self {
             fd:         fobj.fd,
             open:       true,
             flags:      fobj.attr,
+            mode:       mode,
             size:       fobj.size,
             rd_offset:  0,
             wr_offset:  0
@@ -62,10 +87,11 @@ impl File {
     }
 
     pub fn open(&mut self, path: &Path, mode: usize) -> Result<(), Exception> {
-        let fobj = fopen(path.as_str(), mode)?;
+        let fobj = fopen(path.as_str(), mode & Self::KMODE_MASK)?;
         self.fd         = fobj.fd;
         self.open       = true;
         self.flags      = fobj.attr;
+        self.mode       = mode;
         self.size       = fobj.size;
         self.rd_offset  = 0;
         self.wr_offset  = 0;
@@ -104,6 +130,10 @@ impl File {
         self.flags & Self::FLG_PERM_WRITE != 0
     }
 
+    pub fn is_stream(&self) -> bool {
+        self.mode & Self::MODE_STREAM != 0
+    }
+
     pub fn can_execute(&self) -> bool {
         self.flags & Self::FLG_PERM_EXEC != 0
     }
@@ -128,7 +158,9 @@ impl File {
                 break;
             }
             total += n;
-            self.rd_offset += n;
+            if !self.is_stream() {
+                self.rd_offset += n;
+            }
         }
         Ok(total)
     }
@@ -138,13 +170,24 @@ impl File {
             return Err(Exception::new(ErrorCode::NotAllowed, "File not open"));
         }
         let mut total: usize = 0;
-        while total < buffer.len() {
+        let to_write;
+        if self.is_stream() {
+            // Write as much as possible up to the end of the file
+            // Trying to write more than the end of the file will cause a 
+            // seek error, which will be propagated to the caller.
+            to_write = buffer.len().min(self.size() - self.wr_offset);
+        } else {
+            to_write = buffer.len();
+        }
+        while total < to_write {
             let n = fwrite(self.fd, self.wr_offset, &buffer[total..])?;
             if n == 0 {
                 break;
             }
             total += n;
-            self.wr_offset += n;
+            if !self.is_stream() {
+                self.wr_offset += n;
+            }
         }
         Ok(total)
     }

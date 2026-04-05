@@ -11,11 +11,11 @@ use rtlib::graphics::RGB;
 use rtlib::graphics::framebuffer::*;
 use rtlib::audio::Playback;
 use rtlib::audio::wav::WaveAudio;
+use rtlib::time::TimeStampCounter;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
-use core::arch::asm;
 
 const ARENA_WIDTH:  u32 = 15;
 const ARENA_HEIGHT: u32 = 30;
@@ -475,28 +475,9 @@ fn play_sfx(snd: &WaveAudio, sync: bool) {
     let _ = playback.play(&snd.data, sync);
 }
 
-fn read_timestamp() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let (upper, lower): (u64, u64);
-        unsafe {
-            asm!("rdtsc", out("rdx")upper, out("rax")lower);
-        }
-        (upper << 32) | lower
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let cntvct: u64;
-        unsafe {
-            asm!("mrs {}, cntvct_el0", out(reg) cntvct);
-        }
-        cntvct
-    }
-}
-
 fn rand() -> usize {
     // A simple pseudo-random number generator (e.g., linear congruential generator)
-    let mut seed: usize = read_timestamp() as usize;
+    let mut seed: usize = TimeStampCounter::new().current_tick() as usize;
     seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
     seed.wrapping_div(65536) % 32768
 }

@@ -97,6 +97,11 @@ impl SystemTimerTrait for SystemTimer {
     //
     // Timestamp Interface
     //
+
+    fn frequency_hz() -> u64 {
+        THIS_TSC.borrow().freq_hz()
+    }
+
     fn current_timestamp() -> u64 {
         cpu_read_timestamp()
     }

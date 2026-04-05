@@ -51,6 +51,8 @@ fn main() {
     println!("\n[Test 8] Audio Playback Test:");
     beeper_test(50, 4);
     wav_audio_test(&Path::from("res/sfx/click.wav"));
+    println!("\nLarger WAV file test:");
+    wav_audio_test(&Path::from("res/music/doomesk.wav"));
 
     // All tests done
     println!("\nAll tests completed.");

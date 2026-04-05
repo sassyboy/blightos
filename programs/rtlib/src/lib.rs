@@ -7,6 +7,7 @@
 extern crate alloc; 
 
 pub mod syscall;
+pub mod time;
 pub mod stdio;
 pub mod env;
 pub mod fileio;

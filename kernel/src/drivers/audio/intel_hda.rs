@@ -525,7 +525,9 @@ impl IntelHDA {
         let bytes_written = self.ostream[self.next_os as usize].push(pcm);
 
         // Start playback if not already playing and return
-        self.play_audio();
+        if !self.playing{
+            self.play_audio();
+        }
         bytes_written
     }
 
@@ -534,7 +536,7 @@ impl IntelHDA {
             // Should wait for the currently playing stream to either finish
             // or be stopped before switching to the next stream
             return;
-        } 
+        }
         let Some(widx) = self.speakers_widx else {
             klog!("No default output configured to set the format.\n");
             return;
@@ -1545,9 +1547,33 @@ impl HDAStream {
         }
         // Update the BDL entries to reflect the new valid length of audio data
         // in the PCM buffer. IoC will be disabled for all entries except the
-        // last one to avoid
+        // last one -1. If the copy above started from the middle of a partially
+        // filled BDL, first_bdle_index would be the index of that BDL, and
+        // its new length and IoC will be updated accordingly.
         let first_bdle_index = self.pcm_wp / PHY_FRAME_SIZE;
         let last_bdle_index = (self.pcm_wp + bytes_written - 1) / PHY_FRAME_SIZE;
+        // IoC is set for the last BDL entry - 1 (if possible) to allow some
+        // time for the interrupt handler to prepare the next batch of samples
+        // The link usually has ? bytes fetched ahead of the current position
+        // TODO - The Output Payload Capability (OUTPAY) register may provide
+        // more insight into how many bytes the hardware fetches ahead
+        let ioc_bdle_index;
+        if last_bdle_index > 0 {
+            ioc_bdle_index = last_bdle_index; //- 1; TODO figure out skipping
+        } else {
+            ioc_bdle_index = last_bdle_index;
+        }
+        // By the same token, we should clear the IoC bit for the previous entry
+        // if this is not the first time this stream is being written
+        // if first_bdle_index > 0 {
+        //     let prev_entry_addr = self.bdl_virt + (first_bdle_index - 1) * Self::BDL_ENTRY_SIZE;
+        //     let prev_entry = prev_entry_addr as *mut BufferDescListEntry;
+        //     unsafe {
+        //         let mut desc = prev_entry.read_volatile();
+        //         desc.flags &= !1; // Clear IoC bit
+        //         prev_entry.write_volatile(desc);
+        //     }
+        // }
         for i in first_bdle_index..=last_bdle_index {
             let entry_addr = self.bdl_virt + i * Self::BDL_ENTRY_SIZE;
             let entry = entry_addr as *mut BufferDescListEntry;
@@ -1563,11 +1589,11 @@ impl HDAStream {
                 let mut desc = entry.read_volatile();
                 desc.len = valid_bytes_in_entry as u32;
                 // Set IoC for the last entry being written to
-                if i == last_bdle_index {
+                if i == ioc_bdle_index {
                     desc.flags = 1; // Set IoC bit
-                    dbg!("Setting IoC for BDL entry {} (offset {} in PCM \
+                    dbg!("Setting IoC for S#{} BDL entry {} (offset {} in PCM \
                           buffer, valid bytes {})\n",
-                        i, offset_into_pcm, valid_bytes_in_entry);
+                        self.number, i, offset_into_pcm, valid_bytes_in_entry);
                 } else {
                     desc.flags = 0;
                 }

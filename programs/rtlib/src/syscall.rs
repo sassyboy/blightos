@@ -8,20 +8,21 @@ use core::arch::asm;
 pub enum SyscallOpCode {
     TaskCtl         = 0,
     ProcCtl         = 1,
-    Open            = 2,
-    Enum            = 3,
-    Read            = 4,
-    Write           = 5,
-    Exec            = 6,
-    Close           = 7,
-    Max             = 8
+    TimeCtl         = 2,
+    Open            = 3,
+    Enum            = 4,
+    Read            = 5,
+    Write           = 6,
+    Exec            = 7,
+    Close           = 8,
+    Max             = 9
 }
 
 pub enum Syscall {
     // Task/Process control
     TaskControl{opcode: usize, args: usize, ret_code: usize},
     ProcControl{opcode: usize, args: usize, ret_code: usize},
-
+    TimeControl{opcode: usize, args_ptr: usize, args_len: usize, ret_ptr: usize},
     // Virtual File System - Device/File control
     // Open returns a File object to the user-space which includes a file
     // descriptor (FD) and some basic information about the directory entry of
@@ -140,6 +141,21 @@ pub struct ProcCtlResizeHeapArgs {
 }
 
 //
+// Time Control structures
+//
+#[repr(usize)]
+#[derive(PartialEq, PartialOrd)]
+pub enum TimeCtlOpCode {
+    GetTscFreq     = 0, // Returns the current TSC frequency in Hz
+    GetRealTime    = 1, // Returns the current real time in UNIX timestamp
+    SetRealTime    = 2, // Sets the current real time with a UNIX timestamp
+}
+#[repr(C, packed)]
+pub struct TimeCtlTscFreqArgs {
+    pub tsc_freq_hz: u64, // Output: Current TSC frequency in Hz
+}
+
+//
 // VFS System call structures
 //
 #[repr(C, packed)]
@@ -189,7 +205,6 @@ pub struct VfsExecArgs {
 //
 // Low level system call interface
 //
-
 pub fn syscall(params: Syscall) {
     match params {
         Syscall::TaskControl {opcode, args, ret_code}                   => {
@@ -199,6 +214,10 @@ pub fn syscall(params: Syscall) {
         Syscall::ProcControl {opcode, args, ret_code}                   => {
             syscall_trigger_int(SyscallOpCode::ProcCtl as usize,
                                 opcode, args, ret_code, 0);
+        },
+        Syscall::TimeControl {opcode, args_ptr, args_len, ret_ptr}     => {
+            syscall_trigger_int(SyscallOpCode::TimeCtl as usize,
+                                opcode, args_ptr, args_len, ret_ptr);
         },
         Syscall::Open { args_ptr, args_len, arg3, ret_ptr }             => {
             syscall_trigger_int(SyscallOpCode::Open as usize,

@@ -159,6 +159,10 @@ impl SystemTimerTrait for SystemTimer {
     //
     // Timestamp Interface
     //
+    fn frequency_hz() -> u64 {
+        Self::freq_hz()
+    }
+
     fn current_timestamp() -> u64 {
         let tsc: u64;
         unsafe {

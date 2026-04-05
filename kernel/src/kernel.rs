@@ -154,6 +154,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
         // Install the system call handlers
         arch::syscall_register(SyscallOpCode::TaskCtl,  syscall_task_control);
         arch::syscall_register(SyscallOpCode::ProcCtl,  syscall_proc_control);
+        arch::syscall_register(SyscallOpCode::TimeCtl,  syscall_time_control);
         arch::syscall_register(SyscallOpCode::Open,     syscall_open);
         arch::syscall_register(SyscallOpCode::Enum,     syscall_enum);
         arch::syscall_register(SyscallOpCode::Read,     syscall_read);
@@ -288,13 +289,14 @@ fn kinit_task(_arg: usize) {
 pub enum SyscallOpCode {
     TaskCtl         = 0,
     ProcCtl         = 1,
-    Open            = 2,
-    Enum            = 3,
-    Read            = 4,
-    Write           = 5,
-    Exec            = 6,
-    Close           = 7,
-    Max             = 8
+    TimeCtl         = 2,
+    Open            = 3,
+    Enum            = 4,
+    Read            = 5,
+    Write           = 6,
+    Exec            = 7,
+    Close           = 8,
+    Max             = 9
 }
 
 #[repr(usize)]
@@ -670,6 +672,57 @@ fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
 }
 
 //
+// Time Control structures
+//
+#[repr(usize)]
+#[derive(PartialEq, PartialOrd)]
+pub enum TimeCtlOpCode {
+    GetTscFreq     = 0, // Returns the current TSC frequency in Hz
+    GetRealTime    = 1, // Returns the current real time in UNIX timestamp
+    SetRealTime    = 2, // Sets the current real time with a UNIX timestamp
+}
+#[repr(C, packed)]
+pub struct TimeCtlTscFreqArgs {
+    pub tsc_freq_hz: u64, // Output: Current TSC frequency in Hz
+}
+
+fn syscall_time_control(opcode: usize, args_ptr: usize, args_len: usize,
+                                                            ret_ptr: usize) {
+    if ret_ptr == 0 {
+        // Invalid return pointer
+        return;
+    } 
+    if opcode == TimeCtlOpCode::GetTscFreq as usize {
+        //
+        // GET TSC FREQUENCY
+        //
+        if args_ptr == 0 || args_len != size_of::<TimeCtlTscFreqArgs>() {
+            // Invalid arguments pointer/length
+            copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
+            return;
+        }
+        let args = TimeCtlTscFreqArgs {
+            tsc_freq_hz: SystemTimer::frequency_hz(),
+        };
+        copy_to_user(args_ptr, args);
+        copy_to_user(ret_ptr, ErrorCode::NoError);
+    } else if opcode == TimeCtlOpCode::GetRealTime as usize {
+        //
+        // GET REAL TIME
+        //
+        copy_to_user(ret_ptr, ErrorCode::NotSupported); // TODO
+    } else if opcode == TimeCtlOpCode::SetRealTime as usize {
+        //
+        // SET REAL TIME
+        //
+        copy_to_user(ret_ptr, ErrorCode::NotSupported); // TODO
+    } else {
+        copy_to_user(ret_ptr, ErrorCode::InvalidOp);
+    }
+}
+
+
+//
 // Virtual File System Control System Calls
 //
 #[repr(C, packed)]
@@ -962,9 +1015,11 @@ fn syscall_write(args_ptr: usize, args_len: usize, _: usize, ret_ptr: usize) {
     // Normal File Write
     let pid = Task::current_pid();
     let fd = args.fd;
+    let offset = args.offset;
+    let buf_len = args.buf_len;
     match AddressSpace::get_file(pid, fd) {
         Ok(mut file) => {
-            let seekr = file.seek(args.offset as isize, 
+            let seekr = file.seek(offset as isize, 
                             FileSeekOrigin::Start, FileSeekCursor::Write);
             if let Err(e) = seekr {
                 // Invalid offset
@@ -975,8 +1030,8 @@ fn syscall_write(args_ptr: usize, args_len: usize, _: usize, ret_ptr: usize) {
             };
             let wr;
             unsafe {
-                let buf = core::slice::from_raw_parts(
-                                    args.buf_ptr as *const u8, args.buf_len);
+                let buf = core::slice::from_raw_parts(args.buf_ptr as *const u8,
+                                                                    buf_len);
                 wr = file.write(buf);
             };
             match wr {

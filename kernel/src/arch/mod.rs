@@ -63,6 +63,8 @@ pub trait SystemTimerTrait {
     // depending on the mode set for the timer.
     fn arm(duration: Duration);
 
+    fn frequency_hz() -> u64;
+
     fn duration_to_timestamp_ticks(d: Duration) -> u64;
 
     fn timestamp_to_duration(t: u64) -> Duration;
