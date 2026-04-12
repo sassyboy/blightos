@@ -44,6 +44,18 @@ impl Malloc {
         let mut heap = FFH.lock();
         heap.release_unused_memory()   
     }
+
+    pub fn dump_free_list() {
+        let mut heap = FFH.lock();
+        let mut cur = heap.free_list_head;
+        while cur != FirstFitHeap::NULL {
+            let size = heap.get_block_size(cur);
+            print!("[@{}: {} bytes] ", cur, size);
+            cur = heap.next_free_block(cur);
+        }
+        println!("");
+    }
+
     pub fn heap_base() -> usize {
         let heap = FFH.lock();
         heap.heap_base
@@ -428,36 +440,49 @@ impl FirstFitHeap {
     }
 
     ///
-    /// Releases any unused memory over HEAP_GROW_SIZE back to the kernel.
+    /// Releases any unused memory at the end of the heap (if more than
+    /// HEAP_GROW_SIZE) back to the operating system.
     /// This can be called periodically by the application (via the Malloc
     /// interface) to return memory to the system.
-    /// Returns the amount of memory released back to the system.
-    /// 
+    /// Returns the amount of memory (in bytes) released back to the system.
     pub fn release_unused_memory(&mut self) -> usize {
-        // Strategy: find the largest contiguous free block at the end of the heap.
-        // If it's larger than HEAP_GROW_SIZE, release the excess back to the kernel
-        // by shrinking the heap via syscall. Update free list accordingly.
-        println!("Attempting to release unused heap memory back to kernel. \
-                    Current heap size: {} bytes", self.heap_size);
+        // Find the free block with the largest offset in the free list
         let mut last_free = None;
         let mut cur = self.free_list_head;
         while cur != Self::NULL {
-            last_free = Some(cur);
+            if last_free.is_none() {
+                last_free = Some(cur);
+            } else if last_free.unwrap() < cur {
+                last_free = Some(cur);
+            }
             cur = self.next_free_block(cur);
         }
-        if let Some(last) = last_free {
-            let last_size = self.get_block_size(last);
-            let last_end = last + last_size;
+        if let Some(last_off) = last_free {
+            let last_size = self.get_block_size(last_off);
+            let last_end = last_off + last_size;
+            // If this hole is at the end of the heap and is larger than
+            // the HEAP_GROW_SIZE factor, it can be released
             if last_end == self.heap_size && last_size > Self::HEAP_GROW_SIZE {
-                // can release memory back to kernel
                 let excess = last_size - Self::HEAP_GROW_SIZE;
+                let old_heap_size = self.heap_size;
                 if let Some(args) = self.resize_heap(-(excess as isize)) {
+                    // Update the heap size
                     self.heap_size = args.heap_size;
-                    // update free block header
-                    self.set_header(last, Self::HEAP_GROW_SIZE, false);
-                    println!("Released {} bytes of unused heap memory back to kernel. New heap size: {} bytes",
-                        excess, self.heap_size);
-                    return excess;
+                    let bytes_released = old_heap_size - self.heap_size;
+                    // The kernel may release less than requested to maintain
+                    // page alignment, so the size of the last block should be
+                    // adjusted by old_heap_size - args.heap_size (new size)
+                    self.write_usize(last_off, last_size - bytes_released);
+                    let last_size = self.get_block_size(last_off);
+                    if last_off + last_size != self.heap_size {
+                        println!("Last heap block: offset {}, size {}, \
+                                    expected end {}, actual end {}",
+                                 last_off, last_size,
+                                 self.heap_size,
+                                 last_off + last_size);
+                        panic!("Inconsistent heap state after release");
+                    }
+                    return bytes_released;
                 }
             }
         }

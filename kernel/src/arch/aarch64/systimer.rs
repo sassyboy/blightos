@@ -105,6 +105,16 @@ impl SystemTimerTrait for SystemTimer {
         }
     }
 
+    fn per_cpu_init() {
+        unsafe {
+            // Don't trap EL0 when accessing cntvct_el0
+            let mut cntkctl: u64;
+            asm!("mrs {0}, CNTKCTL_EL1", out(reg)cntkctl);
+            cntkctl |= 0x3; // Set EL0VCTEN and EL0PCTEN to 1
+            asm!("msr CNTKCTL_EL1, {0}", in(reg)cntkctl);
+        }   
+    }
+
     fn exec_handler() {
         SystemTimer::send_eoi();
         unsafe{

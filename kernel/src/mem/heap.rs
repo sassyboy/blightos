@@ -159,9 +159,14 @@ unsafe impl GlobalAlloc for Kalloc {
             // Request too large for our TLSF allocator -> Allocate from PMM
             let page_count =
                 round_up!(layout.size(), PHY_FRAME_SIZE) / PHY_FRAME_SIZE;
-            addr = match palloc_continuous(page_count) {
-                Some(pbase) => pbase as *mut u8,
-                None        => null_mut()
+            addr = match PhysMem::alloc_continuous(page_count) {
+                Ok(pbase) => pbase as *mut u8,
+                Err(e)    => {
+                    klog!("Kalloc: Failed to allocate {} bytes ({} pages) \
+                            for a large allocation request - {:?}.\n",
+                            layout.size(), page_count, e);
+                    null_mut()
+                }
             };
             heapdbg!("PALLOC {:p} Pages = {}\n", addr, page_count);
         }
@@ -175,7 +180,7 @@ unsafe impl GlobalAlloc for Kalloc {
                     round_up!(layout.size(), PHY_FRAME_SIZE) / PHY_FRAME_SIZE;
 
             heapdbg!("PFREE {:p} Pages = {}\n", ptr, page_count);
-            pfree_continuous(ptr as usize, page_count);
+             PhysMem::free_continuous(ptr as usize, page_count);
         }
     }
 }
@@ -247,13 +252,13 @@ struct KallocCDPage {
 impl KallocCDPage {
     const DESCRIPTOR_COUNT: usize = 255;
     fn alloc_and_init(prev: usize) -> usize {
-        match palloc() {
-            Some(addr)  => {
+        match PhysMem::alloc() {
+            Ok(addr)  => {
                 Self::init(addr, prev);
                 KALLOC_DESC_PAGES.fetch_add(1, Ordering::Relaxed);
                 addr
             },
-            None        => {
+            Err(_)        => {
                 panic!("Out of memory!");
             }
         }
@@ -270,7 +275,7 @@ impl KallocCDPage {
             Self::set_prev(next, prev);
         }
         // Free the page
-        pfree(base_addr);
+        PhysMem::free(base_addr);
         KALLOC_DESC_PAGES.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -587,14 +592,14 @@ impl Kalloc {
 
     // Cluster allocation and free functions
     fn cluster_alloc(au_index: usize) -> usize {
-        match palloc_continuous(au_index) {
-            Some(addr)      => {
-                heapdbg!("    CLUSTER ALLOC: base_addr: {:X}, au_index/pages: {}\n",
-                    addr, au_index);
+        match PhysMem::alloc_continuous(au_index) {
+            Ok(addr) => {
+                heapdbg!("    CLUSTER ALLOC: base_addr: {:X}, \
+                            au_index/pages: {}\n", addr, au_index);
                 KALLOC_CLUSTER_PAGES.fetch_add(au_index, Ordering::Relaxed);
                 addr
             },
-            None            => {panic!("Out of memory!")}
+            Err(_) => {panic!("Out of memory!")}
         }
     }
 
@@ -602,7 +607,7 @@ impl Kalloc {
         heapdbg!("    CLUSTER FREE:  base_addr: {:X}, au_index/pages: {}\n",
                     base_addr, au_index);
         KALLOC_CLUSTER_PAGES.fetch_sub(au_index, Ordering::Relaxed);
-        pfree_continuous(base_addr, au_index);
+        PhysMem::free_continuous(base_addr, au_index);
     }
 
     // Helper functions for statistics/debugging purposes

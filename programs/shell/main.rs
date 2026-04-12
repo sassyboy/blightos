@@ -279,10 +279,13 @@ fn run_executable(path: &str, args: &str) {
         println!("Launching {} args: '{}' ...", path, args);
     }
     
-    if let Some(proc) = Process::spawn(&cmd_line) {
-        proc.join();
-    } else {
-        println!("Failed to execute {}", path);
+    match Process::spawn(&cmd_line) {
+        Ok(proc) => {
+            proc.join();
+        }
+        Err(e) => {
+            println!("Failed to execute {} due to {:?}", path, e);
+        }
     }
 }
 

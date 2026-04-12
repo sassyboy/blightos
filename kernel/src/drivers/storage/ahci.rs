@@ -366,10 +366,10 @@ impl AHCIBus {
     //
     pub fn identify_device(&mut self, drv: &mut AHCIDrive) {
         // Allocate a buffer for receiving the IDENTIFY_DEVICE block (512 bytes)
-        let buffer_phy = palloc().expect("Out of memory");
-        let buffer_nocache = crate::arch::MMUMapping::dma_from_kernel_phys(buffer_phy);
+        let mut dma = DMABuffer::new();
+        dma.init(512, false);
         unsafe {
-            let buffer_ptr: *mut u8 = buffer_nocache as *mut u8;
+            let buffer_ptr: *mut u8 = dma.virt_addr as *mut u8;
             buffer_ptr.write_bytes(0xAA, 512);
         }
         // Clear pending interrupt
@@ -385,7 +385,7 @@ impl AHCIBus {
         // 2) Prepare the scatter/gather list
         drv.clear_cmd_table(0);
         let mut prd0    = HBAPhysicalRegionDescriptor::new();
-        prd0.base_addr  = buffer_phy as u64;
+        prd0.base_addr  = dma.phys_addr as u64;
         prd0.length     = 512;
         prd0.irq        = true;
         drv.write_cmd_prdt_entry(0, 0, &prd0);
@@ -415,7 +415,7 @@ impl AHCIBus {
             // 100–103	Total Sectors (48-bit)	For LBA48 supporting disks
             // 106	    Bit 12 set: sector size > 256 words & 117-118 are valid.
             // 117–118	Words per Logical Sector
-            let ptr: *mut u16 = buffer_nocache as *mut u16;
+            let ptr: *mut u16 = dma.virt_addr as *mut u16;
             unsafe {
                 let w49 = ptr.add(83).read_volatile();
                 let w83 = ptr.add(83).read_volatile();
@@ -450,7 +450,6 @@ impl AHCIBus {
             }
             
         }
-        pfree(buffer_phy);
     }
 
     //
@@ -794,7 +793,7 @@ impl AHCIDrive {
     }
 
     fn init_memory(&mut self) {
-        self.base_addr = palloc().expect("Out of memory");
+        self.base_addr = PhysMem::alloc().expect("Out of memory");
         let mem : *mut u8 = self.base_addr as *mut u8;
         // Zero out the port memory
         unsafe {
@@ -842,6 +841,13 @@ impl AHCIDrive {
     }
 }
 
+impl Drop for AHCIDrive {
+    fn drop(&mut self) {
+        if self.base_addr != 0 {
+            PhysMem::free(self.base_addr);
+        }
+    }
+}
 
 //
 // HBACommandHeader

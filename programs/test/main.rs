@@ -4,6 +4,7 @@
 
 #![no_std]
 extern crate alloc; 
+use rtlib::time::TimeStampCounter;
 use rtlib::*;
 use rtlib::stdio::*;
 use rtlib::fileio::*;
@@ -26,29 +27,37 @@ fn main() {
     println!("\n[Test 2] Spawning a new task:");
     task_spawn_test();
 
-    println!("\n[Test 3] Co-operative multitasking test:");
+    println!("\n[Test 3] Co-operative multitasking:");
     co_op_sched_test();
 
-    println!("\n[Test 4] Sleep test:");
+    println!("\n[Test 4] Sleep:");
     sleep_test();
 
-    println!("\n[Test 5] Heap test 1: 2MBs of small allocations");
+    println!("\n[Test 5] No-Execute (NX) Protection:");
+    stack_exec_test();
+
+    wait_for_enter_and_clear();
+
+    println!("\n[Test 6] Heap management:");
     heap_test();
 
-    wait_for_enter();
+    println!("\n[Test 7] Dynamic stack growth:");
+    stack_growth_test();
+
+    wait_for_enter_and_clear();
 
     // Test framebuffer access
-    println!("\n[Test 6] Framebuffer Access Test:");
+    println!("\n[Test 8] Framebuffer access:");
     framebuffer_test();
 
     // PNG Loading test
-    println!("\n[Test 7] PNG Loading Test:");
+    println!("\n[Test 9] PNG loading:");
     png_test();
 
-    wait_for_enter();
+    wait_for_enter_and_clear();
 
     // Audio Playback test
-    println!("\n[Test 8] Audio Playback Test:");
+    println!("\n[Test 10] Audio playback:");
     beeper_test(50, 4);
     wav_audio_test(&Path::from("res/sfx/click.wav"));
     println!("\nLarger WAV file test:");
@@ -104,6 +113,8 @@ fn task_spawn_test() {
 }
 
 fn sleep_test() {
+    let mut tsc = TimeStampCounter::new();
+    let t0 = tsc.current_as_nanos();
     let task_c = Task::spawn(|_arg: usize| {
         println!("<Task C> Sleeping for five 500ms intervals...");
         for i in 0..5 {
@@ -117,40 +128,138 @@ fn sleep_test() {
         Task::sleep(core::time::Duration::from_millis(100));
     }
     Task::join(task_c.unwrap().tid);
+    let t1 = tsc.current_as_nanos();
+    println!("\nTotal elapsed time according to TSC: {} ms",
+                (t1 - t0) as f64 / 1_000_000.0);
 }
 
 fn heap_test() {
     rtlib::heap::Malloc::init();
     let alloc_size = 64;
-    let total_alloc_size = 2 * 1024 * 1024; // 2 MB
+    let total_alloc_size = 20 * 1024 * 1024; // 20 MB
     let alloc_count = total_alloc_size / alloc_size;
-    println!("Allocating {} blocks of {} bytes each (total: {} bytes). \
-                Physical memory before allocations:", 
-                alloc_count, alloc_size, total_alloc_size);
-    println!("Heap base: {:#x}, Heap size: {} bytes", Malloc::heap_base(),
-                                                        Malloc::heap_size());
+    println!("20 MBs of small allocations");
+    println!("Heap base: {:#x}, Heap size: {} bytes, Free list:",
+                Malloc::heap_base(), Malloc::heap_size());
+    rtlib::heap::Malloc::dump_free_list();
+    println!("Physical memory before allocations:");
     txt_dump(&Path::from("machine:/ram"));
-    println!("");
+    // Allocate multiple blocks of memory
+    println!("\n1) Allocating {} blocks of {} bytes each (total: {} bytes).", 
+                alloc_count, alloc_size, total_alloc_size);
     {
-        let mut ptrs: Vec<Box<[u8; 64]>> = Vec::with_capacity(alloc_count);
+        let mut ptrs: Vec<Box<[u8; 64]>> = Vec::new();
         for _i in 0..alloc_count {
-            let ptr = Box::new([0u8; 64]);
+            let mut ptr = Box::new([0u8; 64]);
+            for j in 0..64 {
+                ptr[j] = j as u8;
+            }
             if ptr.is_empty() {
                 println!("Failed to allocate {} bytes", alloc_size);
                 break;
             }   
             ptrs.push(ptr);
         }
+
+        // Verify the allocated memory
+        println!("\n2) Verifying the allocated memory...");
+        for (i, ptr) in ptrs.iter().enumerate() {
+            for j in 0..64 {
+                if ptr[j] != j as u8 {
+                    println!("Memory corruption detected at block {}, byte {}!", 
+                            i, j);
+                    return;
+                }
+            }
+        }
     }
     
-
-    let released = rtlib::heap::Malloc::release_unused_memory();
-    println!("Deallocated all blocks. Released {} bytes of unused heap memory \
-                back to kernel.", released);
-    println!("Heap base: {:#x}, Heap size: {} bytes", Malloc::heap_base(),
-                                                        Malloc::heap_size());
-    println!("Physical memory after deallocations:");
+    // All blocks should be deallocated when `ptrs` goes out of scope
+    println!("\n3) Deallocated all blocks. Free list:");
+    rtlib::heap::Malloc::dump_free_list();
+    println!("Physical memory after deallocation:");
     txt_dump(&Path::from("machine:/ram"));
+
+    // Release unused memory back to the OS
+    println!("\n4) Releasing unused memory... Current heap size: {} bytes",
+                Malloc::heap_size());
+    let released = rtlib::heap::Malloc::release_unused_memory();
+    println!("Released {} bytes back to the OS.", released);
+    
+    println!("\nHeap base: {:#x}, Heap size: {} bytes. Free list:",
+                Malloc::heap_base(), Malloc::heap_size());
+    rtlib::heap::Malloc::dump_free_list();
+    println!("Physical memory after heap release:");
+    txt_dump(&Path::from("machine:/ram"));
+}
+
+fn stack_exec_test() {
+    println!("Attempting to execute code on the stack...");
+    let sgt_task = Task::spawn(|_arg: usize| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let code: [u8; 2] = [0xC3, 0x00]; // x86_64 'ret' instruction
+            let code_ptr = code.as_ptr() as usize;
+            let func: extern "C" fn() = unsafe {
+                core::mem::transmute(code_ptr)
+            };
+            // This should cause a page fault due to NX bit protection
+            func();
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let code: [u8; 4] = [0xC0, 0x03, 0x5F, 0xD6]; // aarch64 'ret' inst.
+            let code_ptr = code.as_ptr() as usize;
+            let func: extern "C" fn() = unsafe {
+                core::mem::transmute(code_ptr)
+            };
+            // This should cause a page fault due to NX bit protection
+            func();
+        }
+    }, 0, "StackExecTest");
+    Task::join(sgt_task.unwrap().tid);
+}
+
+fn stack_growth_test() {
+    println!("Initial stack size is 16KB - Max per-task stack size is 16MB");
+    txt_dump(&Path::from("machine:/ram"));
+    let sgt_task = Task::spawn(|_arg: usize| {
+        print!("  Allocating 8KB on the stack...");
+        stack_growth_test_recursive(2);
+        print!("  Allocating 20KB on the stack...");
+        stack_growth_test_recursive(5);
+        print!("  Allocating 400KB on the stack...");
+        stack_growth_test_recursive(100);
+        print!("  Allocating 10MB on the stack...");
+        stack_growth_test_recursive(2500);
+        print!("  Allocating 15.6MB on the stack...");
+        stack_growth_test_recursive(4000);
+        // The next allocation should fail and result in a page fault
+        print!("  Allocating 16MB on the stack...");
+        stack_growth_test_recursive(4096);
+    }, 0, "StackGrowthTest");
+    Task::join(sgt_task.unwrap().tid);
+    txt_dump(&Path::from("machine:/ram"));
+}
+
+fn stack_growth_test_recursive(depth: usize) {
+    if depth == 0 {
+        println!("Passed");
+        return;
+    }
+    // 4KB buffer to consume stack space
+    let mut buffer = [0u8; 4096]; 
+    for i in 0..buffer.len() {
+        buffer[i] = depth as u8;
+    }
+    stack_growth_test_recursive(depth - 1);
+    // Validate the buffer
+    for i in 0..buffer.len() {
+        if buffer[i] != depth as u8 {
+            println!("Stack corruption detected at depth {}!", depth);
+            return;
+        }
+    }
 }
 
 fn framebuffer_test() {
@@ -335,7 +444,7 @@ fn wav_audio_test(path: &Path) {
     }
 }
 
-fn wait_for_enter() {
+fn wait_for_enter_and_clear() {
     println!("Press Enter to continue...");
     while stdio_read_byte() != b'\n' {}
     stdio_clear_screen();

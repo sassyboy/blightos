@@ -38,14 +38,12 @@ macro_rules! dbg{
 static ARCH_BSP_LOADED: AtomicBool = AtomicBool::new(false);
 static CPU_COUNT:       AtomicUsize= AtomicUsize::new(1);
 static mut DEV_TREE:    FdtMachineResources = FdtMachineResources::new();
-static IOINT_CTRL:      Spinlock<BCM2836IntCtl> = Spinlock::new(BCM2836IntCtl::new());
-pub static L1INT_CTRL:  Spinlock<BCM2836L1IntCtl> = Spinlock::new(BCM2836L1IntCtl::new());
-
-pub static VIDEO_CORE:  Spinlock<BCM2835VideoCore> = Spinlock::new(BCM2835VideoCore::new());
-
-percpu_global!{
-    pub MMU_ON: AtomicBool = AtomicBool::new(false);
-}
+static IOINT_CTRL:      Spinlock<BCM2836IntCtl> = 
+                                        Spinlock::new(BCM2836IntCtl::new());
+pub static L1INT_CTRL:  Spinlock<BCM2836L1IntCtl> =
+                                        Spinlock::new(BCM2836L1IntCtl::new());
+pub static VIDEO_CORE:  Spinlock<BCM2835VideoCore> = 
+                                        Spinlock::new(BCM2835VideoCore::new());
 
 #[unsafe(no_mangle)]
 extern "C"
@@ -55,6 +53,11 @@ fn rust_aarch64_entry_bsp(dtbp: usize, cpuid: usize,
         rust_aarch64_entry_ap(cpuid, stack_base);
         return;
     }
+
+    // Initialize the MMU for the whole system
+    MMUMapping::global_init();
+    // Initialize the MMU on this CPU
+    MMUMapping::per_cpu_init();
 
     // Initialize the PerCPU sections of every processor (default memory values)
     percpu_init_sections();
@@ -80,7 +83,6 @@ fn rust_aarch64_entry_bsp(dtbp: usize, cpuid: usize,
         }
         dev_tree = &DEV_TREE;
     }
-    
 
     // Start the secondary CPUs - Assuming spin-table for the method
     for i in 0..dev_tree.cpu_count as usize {
@@ -113,16 +115,9 @@ fn rust_aarch64_entry_bsp(dtbp: usize, cpuid: usize,
     if !found_int_ctl_dev {
         panic!("Didn't find a compatible interrupt controller device");
     }
-
-    // Initialize the MMU for the whole system
-    MMUMapping::global_init();
-
     // End of BSP' initialization - Unleash the secondary processors
     ARCH_BSP_LOADED.store(true, Ordering::Relaxed);
 
-    // Initialize the MMU on this CPU
-    MMUMapping::percpu_init();
-    MMU_ON.borrow_mut().store(true, Ordering::Relaxed);
     // Start the kernel without a Ramdisk
     crate::kstart(0,  Some(&dev_tree.mmap[0..dev_tree.mmap_count as usize]));
     panic!("SHOULDN'T HAVE REACHED HERE!");
@@ -137,7 +132,7 @@ fn rust_aarch64_entry_ap(cpuid: usize, _stack_base: usize) {
     percpu_init_cpu(cpuid);
 
     // Initialize the MMU on this CPU
-    MMUMapping::percpu_init();
+    MMUMapping::per_cpu_init();
 
     dbg!("rust_aarch64_entry_ap: CPU{}, stack_base={:X}, CurrentEL={:X}\n",
         cpuid, _stack_base, aarch64_cur_exc_lvl());
@@ -358,15 +353,26 @@ impl BCM2835VideoCore {
             fb.pitch=msg[33];         //get number of bytes per line
             fb.bpp = msg[20] as u8;   // depth
             // TODO - proper bus2mem address translation from the device tree
-            fb.base_address = (msg[28] & 0x3FFFFFFF) as usize; 
+            let fb_addr = msg[28] as usize & 0x3FFFFFFF;
             // dbg!("FB initialized @ {:X} {}x{} ({} bpp)\n",
             //     self.fb.base_address, self.fb.width, self.fb.height,
             //     self.fb.bpp
             // );
             fb.background_rgb = (200, 200, 200);
             fb.foreground_rgb = (0, 0, 220);
-            FrameBuffer::register(&fb);
+            FrameBuffer::register(&fb, fb_addr);
             FrameBuffer::clean_screen();
+            // let mut dma = crate::drivers::DMABuffer::new();
+            // dma.init_preallocated(fb_addr, (fb.pitch * fb.height) as usize, true);
+            // klog!("Framebuffer initialized @ {:X} {}x{} ({} bpp) - \
+            //         dma_virt: {:X}, dma_phys: {:X}\n",
+            //     fb_addr, fb.width, fb.height, fb.bpp, dma.virt_addr, dma.phys_addr);
+            // crate::arch::MMUMapping::kmap_log_mapping(dma.virt_addr);
+            // unsafe {
+            //     for i in 0..100 {
+            //         (dma.virt_addr as *mut u32).add(i).write_volatile(0xFF0000FF);
+            //     }
+            // }
         } else {
             dbg!("Unable to set screen resolution to 1024x768x32\n");
         }
@@ -538,31 +544,33 @@ pub mod bcm_peripherals {
     }
 
     fn read_register(reg: BCMRegister) -> u32 {
-        if crate::arch::MMU_ON.borrow().load(Ordering::Relaxed) {
-            unsafe {
-                (MMUMapping::dma_from_kernel_phys(reg as usize) as *const u32).
-                        read_volatile()
-            }
-        } else {
+        // if crate::arch::MMU_ON.borrow().load(Ordering::Relaxed) {
+        //     unsafe {
+        //         (MMUMapping::dma_from_kernel_phys(reg as usize) as *const u32).
+        //                 read_volatile()
+        //     }
+        // } else {
             unsafe {
                 (reg as usize as *const u32).read_volatile()
             }
-            
-        }
+        // TODO - treat this like a proper driver and implement as a device with
+        // registers and mappings
+
+        // }
         
     }
 
     fn write_register(reg: BCMRegister, val: u32) {
-        if crate::arch::MMU_ON.borrow().load(Ordering::Relaxed) {
-            unsafe {
-                (MMUMapping::dma_from_kernel_phys(reg as usize) as *mut u32).
-                        write_volatile(val);
-            }
-        } else {
+        // if crate::arch::MMU_ON.borrow().load(Ordering::Relaxed) {
+        //     unsafe {
+        //         (MMUMapping::dma_from_kernel_phys(reg as usize) as *mut u32).
+        //                 write_volatile(val);
+        //     }
+        // } else {
             unsafe {
                 (reg as usize as *mut u32).write_volatile(val);
             }
-        }
+        // }
     }
     ////////////////////////////////////////////
 
@@ -956,23 +964,53 @@ pub fn aarch64_spsr_el1_unmask_ints() {
    aarch64_write_spsr_el1(aarch64_spsr_el1() & !0x3c0);
 }
 
+const EXC_CLS_UNKNOWN:          usize = 0x00;
+const EXC_CLS_SVC:              usize = 0x15;
+const EXC_CLS_SYSINST_BY_EL0:   usize = 0x18; 
+const EXC_CLS_INST_ABORT_EL0:   usize = 0x20;
+const EXC_CLS_INST_ABORT_ELX:   usize = 0x21;
+const EXC_CLS_DATA_ABORT_EL0:   usize = 0x24;
+const EXC_CLS_DATA_ABORT_ELX:   usize = 0x25;
+
 #[unsafe(no_mangle)]
 extern "C"
 fn aarch64_elx_exception(syndrome: usize, fault_addr: usize) {
     let exception_class = (syndrome & 0xFC000000) >> 26;
     let iss = syndrome & 0x1FFFFFF;
     match exception_class {
-        0x15        => { // SVC Instruction
+        EXC_CLS_SVC => {
+            // SVC Instruction
             if iss == 1000 {
                 klog!("<SVC>");
             } else if iss == 1001 { // cpu_trigger_systimer_irq was called
                 SystemTimer::exec_handler();
             }
         },
-        0x25        => {
+        EXC_CLS_INST_ABORT_ELX => {
+            let el0_sp: u64;
+            let el1_sp = aarch64_stack_pointer();
+            let el1_elr:u64;
+            let el1_spsr:u64;
+            unsafe {
+                asm!(
+                    "mrs    {0}, sp_el0",
+                    "mrs    {1}, elr_el1",
+                    "mrs    {2}, spsr_el1",
+                    out(reg)el0_sp,
+                    out(reg)el1_elr,
+                    out(reg)el1_spsr
+                );
+            }
+            klog!("<Inst. Abort by ELx> Synd:{:X}, FA:{:X}\n\
+                    TID:{} EL0: sp={:X}, EL1: sp={:X},elr={:X},spsr={:X}\n", 
+                    syndrome, fault_addr,
+                    Task::current_tid(), el0_sp, el1_sp, el1_elr, el1_spsr);
+            panic!("");
+        },
+        EXC_CLS_DATA_ABORT_ELX => {
             klog!("<Data Abort, ELx> FA:{:X}\n", fault_addr);
             panic!("");
-        }
+        },
         _           => {
             let el0_sp: u64;
             let el1_sp = aarch64_stack_pointer();
@@ -995,7 +1033,7 @@ fn aarch64_elx_exception(syndrome: usize, fault_addr: usize) {
             // klog!("EL0: sp={:X}    EL1: sp={:X}\n",
             //      el0_sp, el1_sp);
             panic!("aarch64_elx_exception");
-        }
+        },
     }
 }
 
@@ -1050,7 +1088,8 @@ fn aarch64_ivt_excep_lower_el(x0: usize, x1: usize, x2: usize, x3: usize,
     let iss = excep_syndrome & 0x1FFFFFF;
     
     match exception_class {
-        0x15        => { // SVC Instruction
+        EXC_CLS_SVC => {
+            // SVC Instruction
             if iss == 1000 {
                 // System call
                 ksyscall_handler(x0, x1, x2, x3, x4);
@@ -1061,18 +1100,41 @@ fn aarch64_ivt_excep_lower_el(x0: usize, x1: usize, x2: usize, x3: usize,
                 klog!("<ELE{:X}>", exception_class);
             }
         },
-        0x24        => {
-            klog!("<Data Abort, lower> FA:{:X}\n", fault_addr);
-            panic!("");
+        EXC_CLS_SYSINST_BY_EL0 => {
+            // System instruction (e.g., HVC, SMC, etc.) from the user-space
+            klog!("<System Inst. by EL0> ELR_EL1:{:X}, Inst:{:X}\n",
+                    inst_addr, iss & 0x1FFFFFF);
+            Task::exit();
         },
-        0x0     => { // Unknown reason
+        EXC_CLS_INST_ABORT_EL0 => {
+            // Instruction Abort from the user-space
+            if !AddressSpace::handle_page_fault(fault_addr, true, false) {
+                klog!("<Instruction by EL0 Aborted> FA:{:X}\n", fault_addr);
+                // Terminate the faulty task
+                Task::exit();
+            } else {
+                klog!("<Instruction Abort by EL0 Handled> FA:{:X}\n", fault_addr);
+            }
+        },
+        EXC_CLS_DATA_ABORT_EL0 => {
+            // Data Abort from the user-space
+            let is_write = (iss & 0x40) > 0;
+            if !AddressSpace::handle_page_fault(fault_addr, false, is_write) {
+                klog!("<Data Access by EL0 Aborted> FA:{:X}, is_write:{}\n",
+                        fault_addr, is_write);
+                // Terminate the faulty task
+                Task::exit();
+            }
+        },
+        EXC_CLS_UNKNOWN => { // Unknown reason
             // Check illegal instruction address for the user-space
-            if inst_addr < MMUMapping::MIN_VIRTUAL as usize || 
+            if inst_addr < MMUMapping::MIN_VIRTUAL_USER as usize || 
                 inst_addr >= MMUMapping::MAX_VIRTUAL as usize {
-                if AddressSpace::handle_page_fault(inst_addr) {
+                if AddressSpace::handle_page_fault(inst_addr, true, false) {
                     return;
                 }
-                klog!("<Illegal Execution by EL0> ELR_EL1:{:X}\n", inst_addr);
+                klog!("<Illegal Execution by EL0> ELR_EL1: \
+                        inst_addr:{:X}, fault_addr:{:X}\n", inst_addr, fault_addr);
                 panic!("");
             } else {
                 klog!("<Unknown Exception, lower> FA:{:X}, ELR_EL1:{:X}\n",

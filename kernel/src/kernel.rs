@@ -38,6 +38,7 @@ use util::*;
 use crate::arch::*;
 use crate::drivers::storage::num_disks;
 use crate::fs::*;
+use crate::mem::phys::*;
 use crate::mem::virt::AddressSpace;
 use crate::sched::{SCHEDULER, Scheduler, Task};
 use crate::drivers::input::Keyboard;
@@ -117,7 +118,7 @@ pub struct RamdiskInfo {
 // order, albeit only after all onlined CPUs have reported to the arch-specific
 // stub code so that the generic code has the correct CPU count (e.g., for 
 // resource allocation purposes).
-pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
+pub fn kstart(cpuid: usize, mmap_opt: Option<&[PMMapElement]>)
 {
     if cpuid == 0 {
         // BSP-only initialization
@@ -134,7 +135,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
                 }
                 // Initialize the physical memory manager. Also marks the kernel
                 // and the initramdisk (if any) as used - No ramdisk anymore
-                mem::phys::pmm_init(mmap, kernel_start, kernel_end, None);
+                PhysMem::init(mmap, kernel_start, kernel_end, None);
             },
             _ => {panic!("No memory map was sent to the BSP!")}
         }
@@ -149,6 +150,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
 
         // Time keeping...
         SystemTimer::global_init(systimer_irq_handler);
+        SystemTimer::per_cpu_init();
         // Todo: Need an event timer to implement sleep, etc.
 
         // Install the system call handlers
@@ -180,6 +182,7 @@ pub fn kstart(cpuid: usize, mmap_opt: Option<&[mem::phys::PMMapElement]>)
         while BSP_INITIALIZED.load(Ordering::Relaxed) == false {
             core::hint::spin_loop();
         }
+        SystemTimer::per_cpu_init();
         // Jump to the first task!
         Scheduler::config_round_robin(Duration::from_micros(200));
         SCHEDULER.borrow_mut().start_scheduling();
@@ -223,7 +226,7 @@ fn kinit_task(_arg: usize) {
     // Perform the post-enumeration phase of the drivers
     dbg!("[{}({})] started on CPU {} (Free frames: {})\n", 
             Task::name(), Task::current_tid(),Task::current_cpu(),
-            crate::mem::phys::pmm_num_free_frames());
+            PhysMem::free_frame_count());
     let drvs = drivers::get_builtin_drivers();
     for d in drvs.iter() {
         (d.post_enum)();
@@ -238,42 +241,39 @@ fn kinit_task(_arg: usize) {
     // Kernel Self-Test - Moved to an fexec call on the machine: file
     // klog!("calling test::kself_test\n");
     // test::kself_test();
-    let mut pidopt: Option<usize> = None;
+
     // Find the initial binary (disk%d.0:/blightos/shell.box) to load
     for d in 0..ndisks {
         let path = format!("disk{}.0:/blightos/shell.box", d);
-        // Open the file (if exists)
-        match ELFBinary::from_path(path.as_str()) {
-            Ok(mut elf) => {
-                dbg!("  Found INIT program at {} on disk {} - Free frames: {}\n", 
-                    path.as_str(), d, crate::mem::phys::pmm_num_free_frames());
-                // elf.log_header();
-                // klog!("Segments:\n");
-                // for i in 0..elf.segments.len() {
-                //     klog!("  {:X?}\n", elf.segments[i]);
-                // }
-                let pname = "shell.box".to_string();
-                let pidr = AddressSpace::spawn_from_elf(
-                                                &mut elf, pname, path.clone());
-                if pidr.is_err() {
-                    klog!("  Failed to launch the INIT process from {} due to \
-                        {:?}\n", path.as_str(), pidr.err());
-                    continue;
-                }
-                pidopt = Some(pidr.unwrap());
-                break;
-            },
-            Err(_e) => {
-                continue;
-            }
-        }
-    }
-    if let Some(pid) = pidopt {
+        // Open & parse the ELF file if exists
+        let Ok(elf) = ELFBinary::from_path(path.as_str()) else {
+            continue;
+        };
+        dbg!("  Found INIT program at {} on disk {} - Free frames: {}\n", 
+                path.as_str(), d, PhysMem::free_frame_count());
+        // elf.log_header();
+        // klog!("Segments:\n");
+        // for i in 0..elf.segments.len() {
+        //     klog!("  {:X?}\n", elf.segments[i]);
+        // }
+
+        // Spawn a new process address space
+        let pname = "shell.box".to_string();
+        let pspwn = AddressSpace::spawn(pname, path.clone());
+        let Ok(pid) = pspwn else {
+            let e = pspwn.err().unwrap();
+            klog!("  Failed to launch the INIT process from {} due to {:?}\n",
+                    path.as_str(), e);
+            continue;
+        };
         dbg!("  {}({}) is launching the INIT process ({}) - Free frames: {}\n",
                         Task::name(), Task::current_tid(), pid,
-                        crate::mem::phys::pmm_num_free_frames());
-                Keyboard::clear_buffer();
-                AddressSpace::launch_as_main(pid);
+                        PhysMem::free_frame_count());
+        Keyboard::clear_buffer();
+        let _ = AddressSpace::launch_elf(pid, elf).unwrap_or_else(|e| {
+            klog!("  Failed to launch the INIT process due to {:?}\n", e);
+        });
+        panic!("Unreachable end of kinit_task!");
     }
     panic!("/blightos/shell.box not found on any supported disk partition!");
     
@@ -376,7 +376,10 @@ fn kuser_task_launcher(args: usize) {
     dbg!("kuser_task_launcher: PID={}, func={:p}, arg={}\n",
             info.target_pid, info.func_ptr, info.func_arg);
     // Box will be dropped here
-    AddressSpace::launch(pid, func, farg);
+    if let Err(e) = AddressSpace::move_to_process(pid, func, farg) {
+        klog!("move_to_process(PID={}) failed  due to {:?}\n", pid, e);
+        return;
+    }
     klog!("BUG: TID{} returned to kuser_task_launcher!\n", Task::current_tid());
     Task::exit();
 }
@@ -533,10 +536,10 @@ pub struct ProcCtlGetInfoArgs {
 }
 
 pub struct ProcCtlSpawnArgs {
-    pub cmd_ptr: usize,// Input: Pointer to the cmd-line string in user-space
-    pub cmd_len: usize,// Input: Length of the cmd-line string
-    pub pid:    usize,  // Output
-    pub m_tid:  usize,  // Output TID of the main task
+    pub cmd_ptr: usize, // Input: Pointer to the cmd-line string in user-space
+    pub cmd_len: usize, // Input: Length of the cmd-line string
+    pub pid:     usize, // Output: PID of the spawned process
+    pub m_tid:   usize, // Output: TID of the main task
 }
 
 pub struct ProcCtlResizeHeapArgs {
@@ -545,10 +548,24 @@ pub struct ProcCtlResizeHeapArgs {
     pub heap_size:  usize   // Output: New heap size
 }
 
-fn kuser_proc_launcher(pid: usize) {
-    dbg!("kuser_proc_launcher: PID={}, TID={}\n", pid, Task::current_tid());
-    // Box will be dropped here
-    AddressSpace::launch_as_main(pid);
+struct KUserProcLaunchArgs {
+    pid: usize,
+    elf: ELFBinary,
+}
+
+fn kuser_proc_launcher(args: usize) {
+    let info = unsafe { Box::from_raw(args as *mut KUserProcLaunchArgs) };
+    dbg!("kuser_proc_launcher: PID={} by {}(TID={})\n", info.pid,
+            Task::name(), Task::current_tid());
+    // Spawn a new process address space
+    let pid = info.pid;
+    let elf = info.elf.clone();
+    drop(info);
+    if let Err(e) = AddressSpace::launch_elf(pid, elf) {
+        klog!("Failed to launch the user-space process for PID {}: {:?}\n",
+                pid, e);
+        return;
+    }
     klog!("BUG: TID{} returned to kuser_proc_launcher!\n", Task::current_tid());
     Task::exit();
 }
@@ -594,6 +611,9 @@ fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
     } else if opcode == ProcCtlOpCode::Spawn as usize {
         //
         // SPAWN
+        // Creates a new process and a new task (main) for the process, and
+        // offloads the actual load & launch to the task to avoiding spending
+        // too long in the syscall handler.
         //
         let Some(mut info) = copy_from_user::<ProcCtlSpawnArgs>(args) else {
             // Invalid arguments pointer
@@ -614,7 +634,7 @@ fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
         cmd_line = str::from_utf8(cmd_bytes).unwrap_or("");
         if cmd_line.len() == 0 {
             // Invalid command line
-            copy_to_user(ret_ptr, 0);
+            copy_to_user(ret_ptr, ErrorCode::InvalidArgument);
             return;
         }
         path = match cmd_line.find(' ') {
@@ -626,28 +646,40 @@ fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
             None => path
         };
         // Open/parse the ELF file
-        let Ok(mut elf) = ELFBinary::from_path(path) else {
+        let elf_result = ELFBinary::from_path(path);
+        let Ok(elf) = elf_result else {
+            let e = elf_result.err().unwrap();
             // Invalid ELF file
-            copy_to_user(ret_ptr, 0);
+            klog!("Failed to load the ELF file to spawn a process: {:?}\n", e);
+            copy_to_user(ret_ptr, e.code);
             return;
         };
-        // Spawn a new process address space
-        let Ok(pid) = AddressSpace::spawn_from_elf(&mut elf,
-                                pname.to_string(), cmd_line.to_string()) else {
-            // Failed to spawn the process from the ELF file
-            copy_to_user(ret_ptr, 0);
+
+        // Create a new process
+        let pname_str = pname.to_string();
+        let pcmd_str = cmd_line.to_string();
+        let pspwn_ret = AddressSpace::spawn(pname_str, pcmd_str);
+        let Ok(pid) = pspwn_ret else {
+            // Failed to create a new process
+            let e = pspwn_ret.err().unwrap();
+            klog!("Failed to spawn a new process for {}: {:?}\n", path, e);
+            copy_to_user(ret_ptr, e.code);
             return;
         };
-        dbg!("  Launching user-space process.. {}({}) - Free frames: {}\n",
-                Task::name(), Task::current_tid(),
-                crate::mem::phys::pmm_num_free_frames());
-        // Spawn the main task of the new process
+        
+        // Create and launch the main task
+        let launch_args = Box::into_raw(
+            Box::new(KUserProcLaunchArgs {
+                pid: pid,
+                elf: elf
+            })
+        ) as usize;
         let tname = format!("P[{}].main", pid).to_string();
-        info.m_tid = Task::spawn_named(kuser_proc_launcher, pid, tname);
+        info.m_tid = Task::spawn_named(kuser_proc_launcher, launch_args, tname);
         info.pid = pid;
         // Return the PID back to the caller
         copy_to_user(args, info);
-        copy_to_user(ret_ptr, size_of::<ProcCtlSpawnArgs>());
+        copy_to_user(ret_ptr, ErrorCode::NoError);
         return; // Success
     } else if opcode == ProcCtlOpCode::ResizeHeap as usize {
         //
@@ -658,7 +690,7 @@ fn syscall_proc_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
             dbg!("\nProcess {} requested heap resize with delta {}\n", 
                 Task::current_pid(), info.delta);
             let delta = info.delta;
-            if let Some((new_base, new_size)) = AddressSpace::resize_heap(delta) {
+            if let Ok((new_base, new_size)) = AddressSpace::resize_heap(delta) {
                 info.heap_base = new_base;
                 info.heap_size = new_size;
                 copy_to_user(args, info);

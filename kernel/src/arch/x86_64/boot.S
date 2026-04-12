@@ -107,41 +107,32 @@ setup_initial_4lp:
   xorl  %ecx, %ecx
 	jmp	.cleanup_loop_cond
 .cleanup_loop_body:
-/* Zero-out all the entries in page_dir_pointer_table, pml4 */
-	movl	$0, init_page_dir_pointer_table(,%ecx,4)
-	movl	$0, init_pml4_table(,%ecx,4)
+/* Zero-out all the entries in pdpt[0], pml4 */
+	movl	$0, kpdpt0_tbl(,%ecx,4)
+	movl	$0, kpml4_tbl(,%ecx,4)
 	incl  %ecx
 .cleanup_loop_cond:
 	cmpl	$1024, %ecx
 	jle	.cleanup_loop_body
 
 /* Level 4) Set pml4e[0] point to page directory pointer table (first 512 GB) */
-  movl	$init_page_dir_pointer_table, %eax
-  orl   $0xB, %eax                    /* Present|Writable|Cache-Write-Through */
-  movl	%eax, init_pml4_table
+  movl	$kpdpt0_tbl, %eax
+  orl   $0x3, %eax                              /* Present|Writable|WriteBack */
+  movl	%eax, kpml4_tbl
 
-/* Level 3) PDPT[0..7] maps the first 8GBs of virtual address space for kernel*/
-/* Map Virt[0GB..4GB] -> Phys[0..4GB] as 0x83 P/W/S  Kernel's Code/Data       */
+/* Level 3) PDPT[0] maps the first 4GBs of virtual address space for kernel   */
+                                      /* 0x83 = Present|Writable|PS|WriteBack */
   movl  $0x00000083, %eax
-  movl  %eax, init_page_dir_pointer_table+0*8
+  movl  %eax, kpdpt0_tbl+0*8
   movl  $0x40000083, %eax
-  movl  %eax, init_page_dir_pointer_table+1*8
+  movl  %eax, kpdpt0_tbl+1*8
   movl  $0x80000083, %eax
-  movl  %eax, init_page_dir_pointer_table+2*8
+  movl  %eax, kpdpt0_tbl+2*8
   movl  $0xC0000083, %eax
-  movl  %eax, init_page_dir_pointer_table+3*8
-/* Map Virt[4GB..8GB] -> Phys[0..4GB] as 0x9B P/W/S/NC Kernel's DMA           */
-  movl  $0x0000009B, %eax
-  movl  %eax, init_page_dir_pointer_table+4*8
-  movl  $0x4000009B, %eax
-  movl  %eax, init_page_dir_pointer_table+5*8
-  movl  $0x8000009B, %eax
-  movl  %eax, init_page_dir_pointer_table+6*8
-  movl  $0xC000009B, %eax
-  movl  %eax, init_page_dir_pointer_table+7*8
+  movl  %eax, kpdpt0_tbl+3*8
 
 /* Load base address of PML4 table into cr3 */
-	mov $init_pml4_table, %eax
+	mov $kpml4_tbl, %eax
 	mov %eax, %cr3
 
 /* Clean-up and return */
@@ -215,6 +206,39 @@ setup_idt:
   popq    %rax
 .endm
 
+/* Saves the registers used in the kernel routines, and places %rdi at the start
+ * of the exception frame:
+ * Saved R15   --|
+ * ...           |
+ * Saved  RCX    |-- Pushed by SAVE_GP_REGS
+ * Saved  RBX    |
+ * Saved  RAX  --|
+ * Error Code <----- rdi
+ * Retrun RIP  --|
+ * Return CS     |
+ * Return RFLAGS |-- Pushed by the CPU before entering Ring-0
+ * Return RSP    |
+ * Return SS   --|
+ */
+.macro ENTER_EXCEP
+  SAVE_GP_REGS
+  movq %rsp, %rdi
+  addq $(15*8), %rdi /* SAVE_GP_REGS pushed 15 registers on the stack */
+.endm
+
+/* Returns from an exception (no error code) handler */
+.macro EXIT_EXCEP
+  RSTR_GP_REGS
+  iretq
+.endm
+
+/* Returns from an exception (with error code) handler */
+.macro EXIT_EXCEP_WITH_ERR
+  RSTR_GP_REGS
+  addq    $8, %rsp /* skip over the error code */
+  iretq
+.endm
+
 .macro CALL_KIRQ_HANDLER irq_num
   SAVE_GP_REGS
   movq    $\irq_num, %rdi
@@ -229,82 +253,64 @@ int_default:
   iretq
 
 excep_div_by_zero:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_div_by_zero
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP
 
 excep_nmi:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_nmi
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP
 
 excep_overflow:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_overflow
-  RSTR_GP_REGS
-	iretq
+  EXIT_EXCEP
 
 excep_invalid_opcode:
-  SAVE_GP_REGS
-  movq %rsp, %rdi
-  addq $(15*8), %rdi /* SAVE_GP_REGS pushed 15 registers on the stack */
+  ENTER_EXCEP
   call kexcep_invalid_opcode
-  RSTR_GP_REGS
-	iretq
+  EXIT_EXCEP
 
 excep_invalid_tss:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_invalid_tss
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP_WITH_ERR
 
 excep_seg_not_present:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_seg_not_present
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP_WITH_ERR
 
 excep_stack_fault:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_stack_fault
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP_WITH_ERR
 
 excep_gp_fault:
-  SAVE_GP_REGS
-  movq %rsp, %rdi
-  addq $(15*8), %rdi /* SAVE_GP_REGS pushed 15 registers on the stack */
+  ENTER_EXCEP
   call kexcep_gp_fault
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP_WITH_ERR
 
 excep_page_fault:
-  SAVE_GP_REGS
-  movq %rsp, %rdi
-  addq $(15*8), %rdi /* SAVE_GP_REGS pushed 15 registers on the stack */
+  ENTER_EXCEP
   call kexcep_page_fault
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP_WITH_ERR
 
 excep_x87fpu:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_x87fpu
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP
 
 excep_alignment_chk:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_alignment_chk
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP_WITH_ERR
 
 excep_machine_chk:
-  SAVE_GP_REGS
+  ENTER_EXCEP
   call kexcep_machine_chk
-  RSTR_GP_REGS
-  iretq
+  EXIT_EXCEP_WITH_ERR
 
 excep_simd_fp:
   /* Pass the value of MXCSR value as the argument to the handler */
@@ -679,27 +685,32 @@ switch_context:
 .comm     _KINIT_STACK_START, PER_CPU_KERNEL_STACK_SIZE * MAX_CPU_COUNT
 
 /*
- * Initial 4-level paging structures direct-mapping the first 4GBs used for
+ * Kernel's Address space:
+ * [0..4GB) Identity-mapped using 1GB pages (PDPT0[0..3]) as kernel's fixed map:
  * - Switching the CPUs to long-mode (64-bit)
  * - Loading any ramdisk image or kernel modules
  * - Enumeration of ACPI tables and configuring early drivers (APICs, etc.)
+ * [4..8GB) Kernel's dynamic mapping area (PDPT0[4..7]) as 4KB pages for
+ * - DMA mappings for drivers
+ * - Temporary mappings to access physical memory
+ * - etc.
  *
- * Use 1 Page Directory Pointer Table with the first 4 entries directly
- * mapping to corresponding 1GB (huge page) of virt. to phys. address space.
- * Otherwise, there needs to be 2048 Page Tables (2048x4KB + 24KB).
- *
- * These structures (init_* below) can be reclaimed once the kernel starts
- * handling process address spaces.
+ * These tables are reserved here as the MMU (and some early drivers such as FB)
+ * may need to start mapping into the dynamic pool before the physical memory
+ * manager is initialized.
  */
-/* L1) Allocate 2048 Page Tables. Each PT can map 2MB (512x4K)
-/* SKIPPED! */
-/* L2) Allocate 4 Page Directories. Each PD can map 1GB */
-/* SKIPPED! */
+/* L1) Allocate 4*512 Page Tables. Each PT can map 2MB */
+.globl    kpg_tbls
+.comm     kpg_tbls, 0x1000 * 512 * 4
+/* L2) Allocate 4 Page Directories. Each PD can map 1GB in the kmap pool */
+.globl    kpd_tlbs
+.comm     kpd_tlbs, 0x1000 * 4
 /* L3) Allocate 1 Page Directory Pointer Table. Each PDPT can map 512 GB*/
-.comm	    init_page_dir_pointer_table, 0x1000 /* Only first 4 PDPTEs are used */
-/* L4) Allocate 1 PML4 Table. Each PML4 can map 256 TB */
-.globl    init_pml4_table
-.comm	    init_pml4_table, 0x1000 /* Only the first PML4E is used */
+.globl    kpdpt0_tbl
+.comm	    kpdpt0_tbl, 0x1000 /* Only first 4 PDPTEs are used */
+/* L4) Allocate 1 PML4 Table. Each PML4 can map 512 TB */
+.globl    kpml4_tbl
+.comm	    kpml4_tbl, 0x1000 /* Only the first PML4E is used */
 
 
 /******************************************************************************
@@ -779,7 +790,7 @@ ap_startup_32bit:
   pushl   $0x5a55a400       /* Save a magic # for verification */
   pushl   %edi              /* Save the CPU LAPIC ID */
   /* Switch the AP to Long Mode using the same IDT, GDT and PML4 as BSP */
-  mov $init_pml4_table, %eax
+  mov $kpml4_tbl, %eax
 	mov %eax, %cr3
   mov %cr4, %edx
   or  $0x20,%edx

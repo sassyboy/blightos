@@ -7,7 +7,7 @@
 use core::{ptr::slice_from_raw_parts, ptr::slice_from_raw_parts_mut};
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
-use crate::{mem::phys::{palloc, pfree}, util::Spinlock};
+use crate::mem::phys::PhysMem;
 use crate::util::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -184,7 +184,7 @@ impl BufferedDiskIO {
     fn fetch_from(&mut self, addr: DiskAddress) {
         if self.buffer == 0 {
             // allocate the buffer on the first IO call
-            self.buffer = palloc().expect("Out of memory");
+            self.buffer =  PhysMem::alloc().expect("Out of memory");
         }
 
         match addr {
@@ -259,7 +259,7 @@ impl BufferedDiskIO {
 impl Drop for BufferedDiskIO {
     fn drop(&mut self) {
         if self.buffer != 0 {
-            pfree(self.buffer);
+            PhysMem::free(self.buffer);
         }
     }
 }

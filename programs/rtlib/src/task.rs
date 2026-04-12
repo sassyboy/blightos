@@ -3,7 +3,9 @@
 //
 extern crate alloc; 
 use alloc::string::*;
+use crate::Exception;
 use crate::syscall::*;
+use crate::ErrorCode;
 
 pub struct Task {
     pub tid:        usize,
@@ -228,7 +230,10 @@ impl Process {
         true
     }
 
-    pub fn spawn(cmd_line: &str) -> Option<Self> {
+    /// Spawns a new process with the given command line.
+    /// If `launch_wait` is true, the parent process will wait for the child to
+    /// finish launching before returning.
+    pub fn spawn(cmd_line: &str) -> Result<Self, Exception> {
         let mut syscall_args = ProcCtlSpawnArgs {
             cmd_ptr: 0,
             cmd_len: cmd_line.len(),
@@ -245,10 +250,11 @@ impl Process {
             ret_code: &mut retval as *mut usize as usize
         });
 
-        if retval != size_of::<ProcCtlSpawnArgs>() {
-            return None; // Failed to spawn process
+        if retval != ErrorCode::NoError as usize {
+            return Err(Exception::new(ErrorCode::from(retval), 
+            "Process::spawn"));
         }
-        Some(Self {
+        Ok(Self {
                 pid:            syscall_args.pid,
                 main_tid:       syscall_args.m_tid,
                 name:           String::new(),

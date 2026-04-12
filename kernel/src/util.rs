@@ -341,7 +341,7 @@ use alloc::slice;
 use alloc::vec::Vec;
 use crate::fs::{File, FileSeekOrigin, FileSeekCursor};
 
-#[derive(Debug)]
+#[derive(Clone,Debug)]
 pub struct ELFSegment {
     pub p_type:     u32,
     pub p_flags:    u32,
@@ -360,12 +360,13 @@ impl ELFSegment {
     pub const P_FLAGS_WRITE:    u32 = 2;
     pub const P_FLAGS_READ:     u32 = 4;
 }
+#[derive(Clone)]
 pub struct ELFBinary {
     file:               File,
     // From ELF Header
     elf_type:           u16,
     elf_machine:        u16,
-    pub elf_entry:          usize, // Virt.Addr. to jump to
+    pub elf_entry:      usize, // Virt.Addr. to jump to
     elf_hdr_sz:         u16,   // Size of the ELF header
 
     // We only care about program headers that have to be loaded

@@ -462,12 +462,13 @@ impl Drop for Task {
             SCHEDULER.borrow_mut().unblock_task(*wtid);
         }
         // Notify the process about this task being dropped
+        // This should release the user-space resources (e.g., stack)
         AddressSpace::task_dropped(self.pid, self.tid);
         // Free the kernel stack
-        pfree_continuous(self.kstack_base, self.kstack_pages);
+        PhysMem::free_continuous(self.kstack_base, self.kstack_pages);
         self.state = TaskState::Dropped;
         dbg!("Dropped task {} - Free frames: {}\n",
-                self.tid, pmm_num_free_frames());
+                self.tid, PhysMem::free_frame_count());
     }
 }
 
@@ -665,15 +666,21 @@ impl Scheduler {
     }
 
     fn stack_alloc(&self, stack_pages: usize) -> Option<&mut [usize]> {
-        if let Some(base_addr) = palloc_continuous(stack_pages) {
-            let stack: &mut [usize];
-            unsafe {
-                stack = from_raw_parts_mut(base_addr as *mut usize, 
+        match PhysMem::alloc_continuous(stack_pages) {
+            Ok(base_addr) => {
+                let stack: &mut [usize];
+                unsafe {
+                    stack = from_raw_parts_mut(base_addr as *mut usize, 
                             stack_pages * PHY_FRAME_SIZE / size_of::<usize>());
+                }
+                return Some(stack);
             }
-            return Some(stack);
+            Err(_) => {
+                klog!("Failed to allocate {} pages for the kernel stack of \
+                       a new task.\n", stack_pages);
+                None
+            }
         }
-        None
     }
 
     pub fn block_task(&mut self, tid: usize) {
@@ -835,7 +842,7 @@ impl Scheduler {
                     // Log in the iteration when the last task gets dropped
                     if cpuid == 0 {
                         klog!("<{} - Free Frames: {}>", Task::name(),
-                                pmm_num_free_frames());
+                                PhysMem::free_frame_count());
                     } else {
                         dbg!("<{} IDLE>\n", Task::name());
                     }

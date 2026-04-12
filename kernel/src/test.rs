@@ -15,7 +15,7 @@ use crate::mem::heap::Kalloc;
 use crate::util::*;
 use crate::arch::*;
 use crate::drivers::storage::*;
-use crate::mem::phys::{pfree, pmm_num_free_frames};
+use crate::mem::phys::PhysMem;
 use crate::sched::{Task, WaitChannel};
 use crate::fs::{MountPoint, File};
 use crate::drivers::input::{Keyboard, KeyboardEvent};
@@ -153,7 +153,7 @@ fn task3_exec(_arg: usize) {
     // TEST - PARALLEL HEAP ALLOCATION -----------------------------------------
     klog!("[Test] Parallel heap allocations - Free frames: {}\n\
            Pages used by the heap: Meta-data {}, User-data: {}\n",
-            pmm_num_free_frames(),
+            PhysMem::free_frame_count(),
             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
 
     let t4 = Task::spawn(|_arg: usize| {
@@ -187,7 +187,7 @@ fn task3_exec(_arg: usize) {
         }
         klog!("  [MIDPOINT] Free frames: {}, \
                  Pages used by the heap: Meta-data {}, User-data: {}\n",
-            pmm_num_free_frames(),
+            PhysMem::free_frame_count(),
             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
         klog!("  _myvars: {}, {}, {}, {}\n",
                     *_myvar1, *_myvar2, *_myvar3, *_myvar4);
@@ -201,7 +201,7 @@ fn task3_exec(_arg: usize) {
     Task::join(t4);
     klog!("  Free frames: {}, \
              Pages used by the heap: Meta-data {}, User-data: {}\n",
-            pmm_num_free_frames(),
+            PhysMem::free_frame_count(),
             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
 
     // TEST - CO-OP SCHEDULING -------------------------------------------------
@@ -284,7 +284,16 @@ fn task3_exec(_arg: usize) {
         for i in 0..ndisks {
             let dsk = get_disk(i).expect("Couldn't find the disk!");
             klog!("  {:X?}\n", dsk);
-            let buf = crate::mem::phys::palloc().unwrap();
+            let buf;
+            match PhysMem::alloc() {
+                Ok(frame_addr) => {
+                    buf = frame_addr;
+                },
+                Err(e) => {
+                    klog!("Disk I/O buffer allocation failed - {:?}!\n", e);
+                    return;
+                }
+            }
             let bufp: *mut u8 = buf as *mut u8;
             unsafe {
                 bufp.write_bytes(0xAA, 4096);
@@ -333,7 +342,7 @@ fn task3_exec(_arg: usize) {
                 }
             }
             dump_memory_columns(buf, 20 , 5);       
-            pfree(buf);
+            PhysMem::free(buf);
         }
     }
     // List available mount points
@@ -361,7 +370,7 @@ fn task3_exec(_arg: usize) {
     }
     // FINISHED TESTING --------------------------------------------------------
     klog!("\n[KERNEL SELF-TEST] Finished - Free frames: {}\n",
-        pmm_num_free_frames());
+        PhysMem::free_frame_count());
 }
 
 //
@@ -389,7 +398,7 @@ fn task3_exec(_arg: usize) {
 
 //     klog!("  [Before Alloc] Free frames: {}, \
 //              Pages used by the heap: Meta-data {}, User-data: {}\n",
-//             pmm_num_free_frames(),
+//             PhysMem::free_frame_count(),
 //             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
 
 //     // Allocating more than 255 clusters worth of AUs to test the chaining of
@@ -419,7 +428,7 @@ fn task3_exec(_arg: usize) {
 
 //     klog!("  [After Alloc] Free frames: {}, \
 //              Pages used by the heap: Meta-data {}, User-data: {}\n",
-//             pmm_num_free_frames(),
+//             PhysMem::free_frame_count(),
 //             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
 
 //     // Verify the integrity of the allocated data.
@@ -462,7 +471,7 @@ fn task3_exec(_arg: usize) {
 
 //     klog!("  [After Free] Free frames: {}, \
 //              Pages used by the heap: Meta-data {}, User-data: {}\n",
-//             pmm_num_free_frames(),
+//             PhysMem::free_frame_count(),
 //             Kalloc::metadata_pages_used(), Kalloc::userdata_pages_used());
 
 //     // Compute stats

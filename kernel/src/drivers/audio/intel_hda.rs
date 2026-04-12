@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use core::time::Duration;
 ///
 /// BlightOS kernel
 ///
@@ -35,11 +36,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use crate::arch::{MMUMapping};
-use crate::drivers::{MMIORegisterFile, pci::*};
+use crate::arch::{MMUMapping, MMUTrait, cpu_busywait};
+use crate::drivers::{DMABuffer, RegisterFile, pci::*};
 use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
 use crate::sched::Task;
 use crate::util::*;
+use crate::mem::MemoryType;
 use crate::mem::phys::*;
 use crate::Error;
 
@@ -63,7 +65,7 @@ static PCM_FILES:  Spinlock<BTreeMap<usize, Arc<PcmFileObject>>> =
 
 pub struct IntelHDA {
     // PCI device information
-    regs:           MMIORegisterFile,
+    regs:           RegisterFile,
     irq:            u8,
     // Codec information
     widgets:        Vec<AudioWidget>, // Discovered audio widgets
@@ -89,12 +91,12 @@ pub struct IntelHDA {
 impl IntelHDA {
     const fn new() -> Self {
         Self {
-            regs:           MMIORegisterFile::new(0, 0),
+            regs:           RegisterFile::new(),
             irq:            0,
             widgets:        Vec::new(),
             speakers_widx:  None,
-            ostream:        [HDAStream::new(); 2],
-            istream:        [HDAStream::new(); 2],
+            ostream:        [HDAStream::new(), HDAStream::new()],
+            istream:        [HDAStream::new(), HDAStream::new()],
             ostream_cnt:    0,
             istream_cnt:    0,
             next_os:        0,
@@ -150,8 +152,7 @@ impl IntelHDA {
                 crate::arch::isr_register(vec as u16, Self::irq_handler);
                 // Set up the HDA instance
                 let mut hda = HDA_DEVICE.lock();
-                hda.regs.base_virt = MMUMapping::dma_from_kernel_phys(mmio_base);
-                hda.regs.length    = mmio_len;
+                hda.regs.init_physical(mmio_base, mmio_len);
                 hda.irq         = irq;
                 // Initialize the controller
                 hda.init();
@@ -235,10 +236,10 @@ impl IntelHDA {
         // Put the controller in reset and wait until it transitions to reset
         gctl &= !Self::GCTL_CRST;
         self.regs.write(Self::REG_GCTL, gctl);
-        let mut tries = 10000;
+        let mut tries = 100;
         while self.regs.read::<u32>(Self::REG_GCTL) & Self::GCTL_CRST != 0
                                                                 && tries > 0 {
-            hint::spin_loop();
+            cpu_busywait(Duration::from_millis(1));
             tries -= 1;
         }
         // Set CRST to 1 to bring controller out of reset and wait for it to
@@ -246,18 +247,18 @@ impl IntelHDA {
         gctl |= Self::GCTL_CRST;
         self.regs.write(Self::REG_GCTL, gctl);
         // wait for GCTL_CRST to set
-        tries = 10000;
+        tries = 100;
         while self.regs.read::<u32>(Self::REG_GCTL) & Self::GCTL_CRST != 1
                                                                 && tries > 0 {
-            hint::spin_loop();
+            cpu_busywait(Duration::from_millis(1));
             tries -= 1;
         }
         // Wait for codecs to report state
         // Available codecs are reported by the hardware by setting bits in the
         // REG_STATESTS
-        tries = 10000;
+        tries = 100;
         while self.regs.read::<u16>(Self::REG_STATESTS) == 0 && tries > 0 {
-            hint::spin_loop();
+            cpu_busywait(Duration::from_millis(1));
             tries -= 1;
         }
         if self.regs.read::<u32>(Self::REG_GCTL) & Self::GCTL_CRST == 0 {
@@ -1323,20 +1324,18 @@ struct BufferDescListEntry {
 /// initialization of the stream. The IntelHDA driver is responsible for
 /// populating the that buffer by copying/mixing various audio sources into it.
 /// 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct HDAStream {
-    regs:       MMIORegisterFile,
+    regs:       RegisterFile,
     number:     u8,     // Stream number used by DAC/ADC widgets (1-based)
     enabled:    bool,   // true if this stream has been initialized and reset
     // Buffer Descriptor List (BDL) information for this stream
-    bdl_virt:           usize,  // Base address (virtual no-cache)
-    bdl_phys:           usize,  // Base address (physical)
-    bdl_entries:        usize,  // Number of entries in the BDL
-    pcm_phys:           usize,  // Physical address of the PCM buffer
-    pcm_virt:           usize,  // Virtual address of the PCM buffer
-    pcm_capacity:       usize,  // Maximum size of the PCM buffer in bytes
-    pcm_wp:             usize,  // Index into the PCM buffer where the next
-                                // audio samples should be written by the driver
+    bdl:        DMABuffer,
+    bdl_entries:usize,  // Number of entries in the BDL
+    // Pulse Code Modulation (PCM) buffer
+    pcm:        DMABuffer,  // Physical address of the PCM buffer
+    pcm_wp:     usize,  // Index into the PCM buffer where the next
+                        // audio samples should be written by the driver
     // Default format: 48KHz, 16-bit, Stereo
     sample_rate:        u32,
     bits_per_sample:    u8,
@@ -1364,15 +1363,12 @@ impl HDAStream {
 
     const fn new() -> Self {
         Self {
-            regs:               MMIORegisterFile::new(0, 0x20),
+            regs:               RegisterFile::new(),
             number:             0,
             enabled:            false,
-            bdl_virt:           0,
-            bdl_phys:           0,
+            bdl:                DMABuffer::new(),
             bdl_entries:        0,
-            pcm_phys:           0,
-            pcm_virt:           0,
-            pcm_capacity:       0,
+            pcm:                DMABuffer::new(),
             pcm_wp:             0,
             sample_rate:        48000,
             bits_per_sample:    16,
@@ -1387,17 +1383,16 @@ impl HDAStream {
     /// - Resetting the stream via the stream's control register
     fn init(&mut self, stream_number: u8, mmio_base: usize) -> bool {
         // Allocate a 4KB page for the BDL on the first stream initialization
-        if self.bdl_phys == 0 {
+        if self.bdl.phys_addr == 0 {
             self.number     = stream_number;
-            self.regs.base_virt = mmio_base;
-            self.bdl_phys   = palloc().expect("out of memory");
-            self.bdl_virt   = MMUMapping::dma_from_kernel_phys(self.bdl_phys);
+            self.regs.init_logical(mmio_base, 0x20);
+            self.bdl.init(4096, true);
             // Zero out the BDL page
             unsafe {
-                ptr::write_bytes(self.bdl_virt as *mut u8, 0, PHY_FRAME_SIZE);
+                ptr::write_bytes(self.bdl.virt_addr as *mut u8, 0, 4096);
             }
             // Program the BDL base address into the stream's registers
-            self.write_bdl_addr(self.bdl_phys); // physical address
+            self.write_bdl_addr(self.bdl.phys_addr); // physical address
             // Set the Last Valid Index (LVI) to 0 for now, will be updated when
             // preparing DMA for audio playback/capture
             self.write_lvi_reg(0);
@@ -1407,14 +1402,12 @@ impl HDAStream {
                 mmio_read16(self.mmio_base, Self::REG_FIFOS));
         // Allocate 1MB of sample buffer and hook it up to the BDL entries
         // 1MB fits 262144 dual-channel samples, i.e., about 5.46 seconds
-        // stereo audio at 48KHz
-        self.pcm_phys = palloc_continuous(256).expect("out of memory");
-        self.pcm_virt = MMUMapping::dma_from_kernel_phys(self.pcm_phys);
-        self.pcm_capacity = 256 * PHY_FRAME_SIZE; // 256 entries of 4KB each
-        let mut pcm_page_addr = self.pcm_phys;
+        // stereo audio at 48KHz with 16 bits per sample
+        self.pcm.init(256 * PHY_FRAME_SIZE, true); // 256 entries of 4KB each
+        let mut pcm_page_addr = self.pcm.phys_addr;
         // Initialize the BDL entries
         for i in 0..Self::BDL_MAX_ENTRIES {
-            let entry_addr = self.bdl_virt + i * Self::BDL_ENTRY_SIZE;
+            let entry_addr = self.bdl.virt_addr + i * Self::BDL_ENTRY_SIZE;
             let entry = entry_addr as *mut BufferDescListEntry;
             let desc = BufferDescListEntry {
                 addr: pcm_page_addr as u64,
@@ -1534,14 +1527,14 @@ impl HDAStream {
         // Avoid writing partial samples to the PCM buffer by rounding down the
         // data length to the nearest sample boundary
         let bytes_to_write = (data.len() / sample_size) * sample_size;
-        let bytes_written = bytes_to_write.min(self.pcm_capacity - self.pcm_wp);
+        let bytes_written = bytes_to_write.min(self.pcm.length - self.pcm_wp);
         if bytes_written == 0 {
             dbg!("Warning: PCM buffer for stream #{} is full, \
                     cannot push more samples\n", self.number);
             return 0;
         }
         let src = data.as_ptr();
-        let dst = (self.pcm_virt + self.pcm_wp) as *mut u8;
+        let dst = (self.pcm.virt_addr + self.pcm_wp) as *mut u8;
         unsafe {
             dst.copy_from_nonoverlapping(src, bytes_written);
         }
@@ -1575,7 +1568,7 @@ impl HDAStream {
         //     }
         // }
         for i in first_bdle_index..=last_bdle_index {
-            let entry_addr = self.bdl_virt + i * Self::BDL_ENTRY_SIZE;
+            let entry_addr = self.bdl.virt_addr + i * Self::BDL_ENTRY_SIZE;
             let entry = entry_addr as *mut BufferDescListEntry;
             let offset_into_pcm = i * PHY_FRAME_SIZE;
             let valid_bytes_in_entry;
@@ -1749,9 +1742,9 @@ pub fn self_test(freq: u32, seconds: f32) {
     let buffer_size: usize = num_samples * CHANNELS * BYTES_PER_SAMPLE;
 
     let num_pages = div_round_up!(buffer_size, PHY_FRAME_SIZE);
-    let pcm_phys = palloc_continuous(num_pages).expect("out of memory");
-    let pcm_virt = MMUMapping::dma_from_kernel_phys(pcm_phys);
-
+    let pcm_phys = PhysMem::alloc_continuous(num_pages).expect("out of memory");
+    let pcm_virt = MMUMapping::kmap(pcm_phys, num_pages, MemoryType::OutputDMA)
+                                .expect("HDAStream: failed to map PCM page");
     // Generate square wave samples with amplitude of 5000 and frequency
     // determined by the input parameter
     let period_samples = (SAMPLE_RATE / freq) as usize;
@@ -1783,7 +1776,8 @@ pub fn self_test(freq: u32, seconds: f32) {
     }
         
     // free the buffer
-    pfree_continuous(pcm_phys, num_pages);
+    PhysMem::free_continuous(pcm_phys, num_pages);
+    MMUMapping::kunmap(pcm_virt, num_pages);
 }
 
 

@@ -11,15 +11,16 @@ use core::mem::size_of;
 use core::cmp::min;
 use alloc::{format, slice};
 use alloc::string::String;
+use crate::drivers::DMABuffer;
 use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
 use crate::util::*;
 use crate::Error;
 
 pub type RGB = (u8, u8, u8);
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct FrameBuffer {
-	pub base_address:   	usize,
+	dma:					DMABuffer,
     pub pitch:          	u32,    // total # of bytes in one horizontal line
     pub width:          	u32,    // in pixels
     pub height:         	u32,    // in pixels
@@ -43,7 +44,7 @@ impl FrameBuffer {
 	//
     pub const fn new() -> Self {
         Self {
-        	base_address:   		0,
+			dma:					DMABuffer::new(),
         	pitch:          		0,
         	width:          		0,
         	height:         		0,
@@ -63,6 +64,14 @@ impl FrameBuffer {
 	pub fn enabled() -> bool {
 		let fb = DEFAULT_FB.lock();
 		fb.enabled
+	}
+
+	pub fn base_address() -> usize {
+		let fb = DEFAULT_FB.lock();
+		if fb.enabled {
+			return fb.dma.virt_addr;
+		}
+		0
 	}
 
 	pub fn screen_size() -> (u32, u32) {
@@ -152,7 +161,7 @@ impl FrameBuffer {
             return; // Out of bounds
         	}
 
-        	let pixel_offset = self.base_address as usize + 
+        	let pixel_offset = self.dma.virt_addr as usize + 
                         	self.pitch as usize * row as usize +
                         	(self.bpp as usize/8) * col as usize;
         	let mut bufp : *mut u8 = pixel_offset as *mut u8;
@@ -167,10 +176,12 @@ impl FrameBuffer {
 	// 
 	// VGA/VideoCore Interface
 	//
-	pub fn register(info: &FrameBuffer) {
+	pub fn register(info: &FrameBuffer, phys_addr: usize) {
 		let mut fb = DEFAULT_FB.lock();
 		*fb = info.clone();
 		fb.enabled = true;
+		let length = (fb.pitch * fb.height) as usize;
+		fb.dma.init_preallocated(phys_addr, length, true);
 	}
 
 	//
@@ -329,7 +340,7 @@ impl FrameBuffer {
 		}
 
 		unsafe {
-			let src = fb.base_address as *const u8;
+			let src = fb.dma.virt_addr as *const u8;
 			let dst = buff.as_mut_ptr() as *mut u8;
 			core::ptr::copy_nonoverlapping(src, dst, frame_size);
 		}
@@ -352,7 +363,7 @@ impl FrameBuffer {
 
 		unsafe {
 			let src = buff.as_ptr() as *const u8;
-			let dst = fb.base_address as *mut u8;
+			let dst = fb.dma.virt_addr as *mut u8;
 			core::ptr::copy_nonoverlapping(src, dst, frame_size);
 		}
 		Ok(frame_size)

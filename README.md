@@ -27,7 +27,11 @@ any combination of components. Available debug options are:
     - Symmetric Multiprocessing (SMP) up to 8 CPUs
     - Local Round-Robin scheduling w\ automatic load balancing, task migration, etc.
     - Bitmap physical memory allocator
-    - PML-4 virtual memory manager
+    - Virtual memory manager
+        - x64: PML-4, Aarch64: 3-Level mapping (up to 64GB physical)
+        - No-Execute protection for stack, heap, etc.
+        - User-space stack autoscaling (Init: 4KB, Max: 16MB per task)
+        - User-space heap resize
     - Simplified TLSF heap allocator
     - Unix-line Virtual File System
         - `disk#.#:/` for normal file system access using a `disk.partition:` pattern

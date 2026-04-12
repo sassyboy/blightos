@@ -8,6 +8,7 @@ use core::arch::asm;
 use core::time::Duration;
 use crate::arch::*;
 use crate::util::*;
+use crate::drivers::RegisterFile;
 
 #[cfg(feature="debug_systimer")]
 macro_rules! dbg {
@@ -59,6 +60,10 @@ impl SystemTimerTrait for SystemTimer {
         unsafe {
             X86_LAPIC_TIMER_HANDLER = isr_callback;
         }
+    }
+
+    fn per_cpu_init() {
+        // Nothing to do for now
     }
 
     fn exec_handler() {
@@ -206,7 +211,7 @@ impl X86TimeStampCounter {
                     // Approximate it
                     // Not the most precise method, but yields < 0.1% error
                     // Good enough!
-                    let tm = THIS_MACHINE.lock();
+                    let mut tm = THIS_MACHINE.lock();
                     if tm.hpet.valid {
                         tm.hpet.disable_counting();
                         tm.hpet.reset_current_count();
@@ -337,3 +342,123 @@ mod x86_pit {
         }
     }
 }
+
+#[derive(Debug)]
+pub struct X86HPET {
+    valid:          bool,
+    comp_count:     u8,
+    comp_size:      u8,
+    hpet_num:       u8,
+    min_prd_tick:   u16,
+    irq:            u8,
+    regs:           RegisterFile,
+    period_ns:      u32,
+}
+
+impl X86HPET {
+    pub const fn new() -> Self {
+        Self {
+            valid:          false,
+            comp_count:     0,
+            comp_size:      0,
+            hpet_num:       0,
+            min_prd_tick:   0,
+            irq:            0,
+            regs:           RegisterFile::new(),
+            period_ns:      0
+        }
+    }
+
+    const REG_GEN_CAP:          usize = 0x000;
+    const REG_GEN_CONFIG:       usize = 0x010;
+    const REG_MAIN_COUNTER_VAL: usize = 0x0F0;
+
+
+    const REG_TIM0_CONFIG:      usize = 0x100;
+    const REG_TIM0_COMP_VAL:    usize = 0x108;
+    const REG_TIM0_FSB_INT_ROUT:usize = 0x110;
+
+    pub fn init(&mut self, acpi_hpet_base: usize) {
+        // Relevant HPET fields
+        // Offset (size)
+        // 36     (4)    :Event Timer Block ID
+        //                [31:16] PCI Vendor ID of 1st Timer Block
+        //                [15]    Legacy Replacement IRQ routing Capable
+        //                [13]    COUNT_SIZE_CAP (0: 32-bit, 1: 64-bit)
+        //                [12:8]  # of comparators in 1st Timer Block
+        //                [7:0]   Hardware Rev ID
+        //
+        // 40     (12)    MMIO Base Address in the form of ACPIGenericAddress,
+        //                1KB region, regardless of the # of comparators
+        // 52     (1)     HPET sequence number: 0 = 1st, 1 = 2nd, etc.
+        // 53     (2)     Main Counter Minimum Clock Tick in periodic mode
+
+        // Fetch mmio_base
+        let gen_addr = AcpiGenericAddress::from_acpi_entry(acpi_hpet_base + 40);
+        match gen_addr {
+            AcpiGenericAddress::Memory { addr }     => {
+                self.regs.init_physical(addr as usize, MMUMapping::PAGE_SIZE);
+            },
+            _ => {
+                self.valid = false;
+                return;
+            }
+        }
+
+        // Fetch comp_count and comp_size
+        let blk_id: u32;
+        let u32ptr = (acpi_hpet_base + 36) as *const u32;
+        unsafe {
+            blk_id = u32ptr.read_volatile();
+        }
+        self.comp_count = ((blk_id >> 8) & 0x1F) as u8 + 1;
+        if blk_id & 0x2000 > 0 {
+            self.comp_size = 64;
+        } else {
+            self.comp_size = 32;
+        }
+        // TODO look at bld_id & 0x8000 if IRQ support is needed
+
+        // Fetch min_prd_tick
+        let u16ptr = (acpi_hpet_base + 53) as *const u16;
+        unsafe {
+            self.min_prd_tick = u16ptr.read_volatile();
+        }
+        // Fetch hpet_num
+        let u8ptr = (acpi_hpet_base + 52) as *const u8;
+        unsafe {
+            self.hpet_num = u8ptr.read_volatile();
+        }
+
+        // TODO - Make sure none of the timers generate interrupts
+        self.disable_counting();
+        self.reset_current_count();
+        self.valid = true;
+        let gen_cap: u64 = self.regs.read(Self::REG_GEN_CAP);
+        self.period_ns = round_up!((gen_cap >> 32) as u32, 1_000_000)
+                                                                    / 1_000_000;
+    }
+
+    fn current_count(&self) -> u64 {
+        self.regs.read(Self::REG_MAIN_COUNTER_VAL)
+    }
+
+    fn reset_current_count(&mut self) {
+        self.regs.write(Self::REG_MAIN_COUNTER_VAL, 0);
+    }
+
+    fn enable_counting(&mut self) {
+        let gen_config_val: u64 = self.regs.read(Self::REG_GEN_CONFIG);
+        self.regs.write(Self::REG_GEN_CONFIG, gen_config_val | 1);
+    }
+
+    fn disable_counting(&mut self) {
+        let gen_config_val : u64 = self.regs.read(Self::REG_GEN_CONFIG);
+        self.regs.write(Self::REG_GEN_CONFIG, gen_config_val & !(1 as u64));
+    }
+
+    fn duration_to_ticks(&self, d: Duration) -> u64 {
+        (d.as_nanos() / self.period_ns as u128) as u64
+    }
+}
+

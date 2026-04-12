@@ -333,7 +333,9 @@ early_pcpu_stack_low:
 .global early_pcpu_stack_high
 early_pcpu_stack_high:
 
-// Kernel's initial page tables - 8 1GB blocks
+/* Kernel's initial page tables
+ * 4 1GB blocks - identity-mapped as normal memory for EL1
+ */
 .balign 1024
 .global _KLVL1_PGTBL
 _KLVL1_PGTBL:
@@ -343,11 +345,16 @@ _KLVL1_PGTBL:
   .quad 0x40000000 | 0x701
   .quad 0x80000000 | 0x701
   .quad 0xC0000000 | 0x701
-  /* V[$..8GB] -> P[0..4GB] BLOCK|MT_NGNRNE|EL1-RW|INNER_SHARE|ACCESS_FLG */
-  .quad 0x0        | 0x709
-  .quad 0x40000000 | 0x709
-  .quad 0x80000000 | 0x709
-  .quad 0xC0000000 | 0x709
+  /* V[4GB..8GB] -> Reserved for Kernel's Dynamic Mapping Pool (KMAP)         */
+  /* Need 4        LVL2 tables for each 1GB region                            */
+.balign 4096
+.global _KLVL2_PGTBL
+_KLVL2_PGTBL:
+.fill 0x1000, 4, 0 
+  /* Need 4 x 512 LVL3 tables for each 2MB region                             */
+.global _KLVL3_PGTBL
+_KLVL3_PGTBL:
+.fill 0x1000, 4 * 512, 0
 
 /*******************************************************************************
  * Scheduling primitives

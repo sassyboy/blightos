@@ -197,6 +197,10 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     // Setup the Task Segment Selector and the corresponding TSS for this CPU
     x64_init_tss(0);
 
+    // Initialize the MMU for the kernel's address space.
+    MMUMapping::global_init();
+    MMUMapping::per_cpu_init();
+
     // Physical Memory Map Buffer
     let mut mem_map: [PMMapElement; 32] = [
         PMMapElement {base: 0, len: 0, avail: false}; 32];
@@ -314,8 +318,8 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
     THIS_TSC.borrow_mut().init();
 
     // Fix the syscall interrupt entry (0x20) in IDT to accept calls from Ring3
-    extern "C" {
-        static idt_base : usize;
+    unsafe extern "C" {
+        unsafe static idt_base : usize;
     }
     unsafe {
         let idte: *mut u64 = &idt_base as *const usize as *mut u64;
@@ -331,6 +335,8 @@ extern "C" fn rust_x864_entry_bsp(mb2info_base: usize, max_cpus: usize) {
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_x864_entry_ap(_arg: usize) {
+    // Initialize the MMU for this CPU
+    MMUMapping::per_cpu_init();
     // Per-CPU section initialization
     let cpuid = cpu_lapic_id();
     percpu_init_cpu(cpuid);
@@ -361,7 +367,7 @@ extern "C" fn rust_x864_entry_ap(_arg: usize) {
 
 pub fn init_framebuffer_from_mb2(inp: &Multiboot2FrameBuffer) {
 	let mut fb = FrameBuffer::new();
-    fb.base_address         = inp.addr as usize;
+    // FrameBuffer register takes care of DMA mapping, etc.
     fb.pitch                = inp.pitch;
     fb.width                = inp.width;
     fb.height               = inp.height;
@@ -374,9 +380,7 @@ pub fn init_framebuffer_from_mb2(inp: &Multiboot2FrameBuffer) {
     fb.blue_mask_size       = inp.color_info[5];
     fb.background_rgb       = (240, 240, 240);
     fb.foreground_rgb       = (0, 0, 255);
-    // Map the buffer memory
-    // Register the framebuffer
-    FrameBuffer::register(&fb);
+    FrameBuffer::register(&fb, inp.addr as usize);
 }
 
 //
@@ -460,11 +464,14 @@ extern "C" fn kexcep_gp_fault(exframe: usize) {
 extern "C" fn kexcep_page_fault(exframe: usize) {
     let info = x86_decode_exception_frame(exframe, true);
     // Try to handle the page fault
-    if AddressSpace::handle_page_fault(info.cr2) == false {
-        klog!("#PF Current PID={}, TID={}\n",
+    let instr = (info.err & (1 << 4)) != 0;
+    let write = (info.err & (1 << 1)) != 0;
+    if AddressSpace::handle_page_fault(info.cr2, instr, write) == false {
+        klog!("\n#PF Current PID={}, TID={}\n",
             Task::current_pid(), Task::current_tid());
-        dump_cpu_state(&info, true);
-        panic!("");
+        dump_cpu_state(&info, false);
+        // Terminate the faulty task
+        Task::exit();
     }
 
 }
@@ -609,7 +616,8 @@ X86ExceptionInfo {
 // The rest of the kernel code should not use these interfaces as they are not
 // thread- or type-safe
 //
-const IA32_GS_BASE: u32 = 0xC0000101;
+const IA32_GS_BASE:      u32 = 0xC0000101;
+const IA32_GS_BASE_KERN: u32 = 0xC0000102;
 fn percpu_init_sections() {
     // Copy the first percpu section into the subsequent N-1 sections
     // (see link.ld)
@@ -627,8 +635,8 @@ fn percpu_init_sections() {
             return;
         }
         let nsects  = (pcpu_e - pcpu_s) / sect_size;
-        dbg!("PERCPU: VMA {:X} bytes starting @ 0, LMA[{:X} - {:X}], #Copies: {}\n",
-            sect_size, pcpu_s, pcpu_e, nsects);
+        dbg!("PERCPU: VMA {:X} bytes starting @ 0, LMA[{:X} - {:X}], \
+            #Copies: {}\n", sect_size, pcpu_s, pcpu_e, nsects);
         for s in 1..nsects {
             let base = pcpu_s + s * sect_size;
             (base as *mut u8).copy_from_nonoverlapping(
@@ -650,6 +658,11 @@ fn percpu_init_cpu(cpuid: usize) {
         let pcpu_s:    usize = &_KERNEL_PERCPU_START as *const usize as usize;
         let sect_size: usize = &_KERNEL_PERCPU_SIZE as *const usize as usize;
         let base_addr = pcpu_s + cpuid * sect_size;
+        // The user-space may change GS base (e.g., for thread local data)
+        // SAWPGS instruction is executed upon entering Ring-0 (irqs, excep.)
+        // to recover kernel's GS base from what's saved in IA32_GS_BASE_KERN
+        // TODO - Fix boot.s to save/restore gs and use swapgs
+        x86_msr_write(IA32_GS_BASE_KERN, base_addr as u64);
         x86_msr_write(IA32_GS_BASE, base_addr as u64);
         asm!(
             "mov gs:{base}, rax",
@@ -751,141 +764,6 @@ mod x86_pic {
         }
     }
 }
-
-
-
-#[derive(Debug)]
-struct X86HPET {
-    valid:          bool,
-    comp_count:     u8,
-    comp_size:      u8,
-    hpet_num:       u8,
-    min_prd_tick:   u16,
-    irq:            u8,
-    mmio_base:      usize,
-    period_ns:        u32,
-}
-
-impl X86HPET {
-    pub const fn new() -> Self {
-        Self {
-            valid:          false,
-            comp_count:     0,
-            comp_size:      0,
-            hpet_num:       0,
-            min_prd_tick:   0,
-            irq:            0,
-            mmio_base:      0,
-            period_ns:      0
-        }
-    }
-
-    const REG_GEN_CAP:          usize = 0x000;
-    const REG_GEN_CONFIG:       usize = 0x010;
-    const REG_MAIN_COUNTER_VAL: usize = 0x0F0;
-
-
-    const REG_TIM0_CONFIG:      usize = 0x100;
-    const REG_TIM0_COMP_VAL:    usize = 0x108;
-    const REG_TIM0_FSB_INT_ROUT:usize = 0x110;
-
-    pub fn init(&mut self, acpi_hpet_base: usize) {
-        // Relevant HPET fields
-        // Offset (size)
-        // 36     (4)    :Event Timer Block ID
-        //                [31:16] PCI Vendor ID of 1st Timer Block
-        //                [15]    Legacy Replacement IRQ routing Capable
-        //                [13]    COUNT_SIZE_CAP (0: 32-bit, 1: 64-bit)
-        //                [12:8]  # of comparators in 1st Timer Block
-        //                [7:0]   Hardware Rev ID
-        //
-        // 40     (12)    MMIO Base Address in the form of ACPIGenericAddress,
-        //                1KB region, regardless of the # of comparators
-        // 52     (1)     HPET sequence number: 0 = 1st, 1 = 2nd, etc.
-        // 53     (2)     Main Counter Minimum Clock Tick in periodic mode
-
-        // Fetch mmio_base
-        let gen_addr = AcpiGenericAddress::from_acpi_entry(acpi_hpet_base + 40);
-        match gen_addr {
-            AcpiGenericAddress::Memory { addr }     => {
-                self.mmio_base = MMUMapping::dma_from_kernel_phys(addr) ;
-            },
-            _ => {
-                self.valid = false;
-                return;
-            }
-        }
-
-        // Fetch comp_count and comp_size
-        let blk_id: u32;
-        let u32ptr = (acpi_hpet_base + 36) as *const u32;
-        unsafe {
-            blk_id = u32ptr.read_volatile();
-        }
-        self.comp_count = ((blk_id >> 8) & 0x1F) as u8 + 1;
-        if blk_id & 0x2000 > 0 {
-            self.comp_size = 64;
-        } else {
-            self.comp_size = 32;
-        }
-        // TODO look at bld_id & 0x8000 if IRQ support is needed
-
-        // Fetch min_prd_tick
-        let u16ptr = (acpi_hpet_base + 53) as *const u16;
-        unsafe {
-            self.min_prd_tick = u16ptr.read_volatile();
-        }
-        // Fetch hpet_num
-        let u8ptr = (acpi_hpet_base + 52) as *const u8;
-        unsafe {
-            self.hpet_num = u8ptr.read_volatile();
-        }
-
-        // TODO - Make sure none of the timers generate interrupts
-        self.disable_counting();
-        self.reset_current_count();
-        self.valid = true;
-        self.period_ns = round_up!(
-                        (self.read_reg(Self::REG_GEN_CAP) >> 32) as u32,
-                        1_000_000) / 1_000_000;
-    }
-
-    fn read_reg(&self, reg_no: usize) -> u64 {
-        unsafe {
-            return((self.mmio_base + reg_no) as *const u64).read_volatile()
-        }
-    }
-    fn write_reg(&self, reg_no: usize, val: u64) {
-        unsafe {
-            ((self.mmio_base + reg_no) as *mut u64).write_volatile(val);
-        }
-    }
-
-    fn current_count(&self) -> u64 {
-        self.read_reg(Self::REG_MAIN_COUNTER_VAL)
-    }
-
-    fn reset_current_count(&self) {
-        self.write_reg(Self::REG_MAIN_COUNTER_VAL, 0);
-    }
-
-    fn enable_counting(&self) {
-        let gen_config_val = self.read_reg(Self::REG_GEN_CONFIG);
-        self.write_reg(Self::REG_GEN_CONFIG, gen_config_val | 1);
-    }
-
-    fn disable_counting(&self) {
-        let gen_config_val = self.read_reg(Self::REG_GEN_CONFIG);
-        self.write_reg(Self::REG_GEN_CONFIG, gen_config_val & !(1 as u64));
-    }
-
-    fn duration_to_ticks(&self, d: Duration) -> u64 {
-        (d.as_nanos() / self.period_ns as u128) as u64
-    }
-    
-
-}
-
 
 pub struct X86IoApic{
     acpi_id:        u8,
@@ -1716,7 +1594,7 @@ pub const MAX_CPU_COUNT: usize = 8;
 pub const MAX_IRQ_COUNT: usize = 16;
 
 #[derive(Clone, Copy)]
-enum AcpiGenericAddress{
+pub enum AcpiGenericAddress{
     Memory{addr: usize},
     IOPort{port_num: u16},
     Unsupported,
@@ -1856,7 +1734,7 @@ impl AcpiNmiMapping {
     }
 }
 
-fn x86_acpi_parse(rsdp:Option<usize>) -> Option<AcpiInfo>{
+fn x86_acpi_parse(rsdp:Option<usize>) -> Option<AcpiInfo> {
     // 1) Find "RSD PTR " in low memory - on a 
     let mut valid_rsdp = false;
     let mut ptr: *mut u64;
@@ -2087,7 +1965,7 @@ impl TaskContext {
 
     pub fn init(&mut self, id: usize, func: fn(usize), arg: usize, stack: &mut [usize]) {
         let stacklen = stack.len();
-        let kern_cr3 = unsafe { &init_pml4_table as *const usize as usize };
+        let kern_cr3 = unsafe { &kpml4_tbl as *const usize as usize };
         // Initial stack - compatible with the context switch logic in boot.S
         // ----- stack_base -------------------------------
         // ....
@@ -2162,7 +2040,7 @@ fn empty_task(_arg: usize) {
 }
 
 unsafe extern "C" {
-    unsafe static init_pml4_table: usize;
+    unsafe static kpml4_tbl: usize;
     unsafe fn start_first_thread(task_p: usize);
     unsafe fn switch_context(old_p: usize,  new_p: usize);
 }

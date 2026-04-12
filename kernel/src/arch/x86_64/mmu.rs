@@ -3,11 +3,11 @@
 // 
 // Support module for the X64 Memory Management Unit
 //     
-// TODO: unmapping, tlb invalidation
-
+// TODO: Set appropriate RWX flags for the varous kernel/user mappings
+//
 use core::arch::asm;
-use crate::arch::MmuCachingPolicy;
-use crate::mem::phys::*;
+use crate::arch::{MMUTrait, x86_msr_read, x86_msr_write};
+use crate::mem::{MemoryType, phys::*};
 use crate::util::*;
 
 #[cfg(feature="debug_mmu")]
@@ -23,20 +23,21 @@ macro_rules! dbg{
     ($($arg:tt)*) => { };
 }
 
-//
-// Address-Space Configuration
-//
-// KERN: Virt 0   to 4GB ----> Phys 0 to 4GB as WriteBack cachable memory
-//       Virt 4GB to 8GB ----> Phys 0 to 4GB as Non-cachable memory for DMA
-//
-// USER: Virt 8GB to 256GB---> palloc'ed frames at 4KB granularity
-//
-// 4-Level Mapping - Virtual Address bits
-//     9 bits       9 bits       9 bits         9 bits         12 bits
-// [47 pml4e 39][38 pdpte 30][29   pde   21][20   pte   12][11   off   0]
-//
-
-
+/// Provides the architecture-dependent implementation of the MMU functionality
+/// for x64 to manage the virtual memory mappings for the kernel and user-space
+/// processes.
+/// 
+/// Address-Space Configuration
+///
+/// KERN: Virt 0   to 4GB ----> Phys 0 to 4GB as WriteBack cachable memory
+///       Virt 4GB to 8GB ----> Kernel's dynamic mapping area (kmap) for drivers
+///
+/// USER: Virt 8GB to 256GB---> palloc'ed frames at 4KB granularity
+///
+/// 4-Level Mapping - Virtual Address bits
+///     9 bits       9 bits       9 bits         9 bits         12 bits
+/// [47 pml4e 39][38 pdpte 30][29   pde   21][20   pte   12][11   off   0]
+///
 pub struct MMUMapping {
     // Virt=Phys address of PML4 Table <-> CR3
     pml4_base   : usize,
@@ -44,9 +45,14 @@ pub struct MMUMapping {
     pdpt0_base  : usize,
     // Number of pages mapped via map_pages (for testing/logging purposes)
     mapped_pages_count : usize,
-    // Number of pages allocated for paging structures (for testing/logging purposes)
+    // Number of pages allocated for paging structures (for logging purposes)
     tlb_page_count : usize,
 }
+
+/// Gaurds any changes to the kernel's dynamic mapping area
+/// (4GB to 8GB virtual address range)
+static KMAP_LOCK: Spinlock<()> = Spinlock::new(());
+
 impl MMUMapping {
     // See boot.S for our GDT Entries
     const GDTE_USER_CODE: u16 = 0x18;
@@ -62,12 +68,26 @@ impl MMUMapping {
     const PGENT_PCD:            u64 = 0x10; // Page-level Cache Disable
     const PGENT_PS:             u64 = 0x80; // Set for large pages
     const PGENT_G:              u64 = 0x100; // Global
+    const PGENT_XD:             u64 = 1 << 63; // No-Execute
     const PGENT_BASE_MASK:      u64 = 0xFFFFFFF000;
 
-    
-    // Virtual memory address range that can be mapped via calls to map_pages
-    pub const MIN_VIRTUAL:      u64 = 0x200000000;     // 8 GBs
-    pub const MAX_VIRTUAL:      u64 = (1 << 39) - 1;   // 256 GBs - only pml4[0]
+    const EFER_MSR_ADDR: u32 = 0xC0000080;
+    const EFER_NXE_BIT: u64 = 1 << 11;
+
+    /// Minimum virtual address that can be used for dynamic kernel mappings
+    pub const MIN_KPOOL_VIRTUAL: u64 = 0x100000000;
+    /// Maximum virtual address that can be used for dynamic kernel mappings.
+    pub const MAX_KPOOL_VIRTUAL: u64 = 0x200000000;
+    pub const KPOOL_PAGES: usize = ((Self::MAX_KPOOL_VIRTUAL -
+                                    Self::MIN_KPOOL_VIRTUAL) as usize) /
+                                    Self::PAGE_SIZE;
+
+    /// Minimum virtual address that can be used for non-priviledged
+    /// (user-space) mappings. The kernel address space will be mapped
+    /// from 0x0 to MIN_VIRTUAL_USER
+    pub const MIN_VIRTUAL_USER: u64 = 0x200000000;  // 8 GBs
+    /// Last virtual address that can be mapped.
+    pub const MAX_VIRTUAL:      u64 = (1 << 39) - 1;// 512 GBs - only pml4[0]
     pub const PAGE_SIZE:        usize = 0x1000; // Only 4KB pages in this range
     
     pub const fn new() -> Self {
@@ -79,17 +99,239 @@ impl MMUMapping {
         }
     }
 
-    // Creates the initial paging structures for the process that includes
-    // the kernel mappings.
-    // VIRTUAL MEM           --> PHYSICAL MEM
-    // 0   - 4GB             --> 0 - 4GB R/W KERNEL MODE
-    // 4GB - 8GB             --> 0 - 4GB but as DMA memory
-    // 8GB - 8GB+IMAGE_SIZE  --> IMAGE_START + IMAGE_END
-    pub fn init(&mut self) {
+    /// Prints the present kernel mappings in the following form for debugging:
+    /// virt. address --> phys. address (flags)
+    pub fn log_kmap() {
+        unsafe extern "C" {
+            // 512x4 PTs for 4 PD covering kpool
+            unsafe static kpg_tbls: usize; 
+        }
+        let pg_tbls_base = unsafe { &kpg_tbls as *const usize as usize };
+        let mut pte_addr: *mut u64  = pg_tbls_base as *mut u64;
+        let mut vaddr: usize = Self::MIN_KPOOL_VIRTUAL as usize;
+        for _v in 0..Self::KPOOL_PAGES {
+            let pte = unsafe { pte_addr.read_volatile() };
+            if pte & Self::PGENT_PRESENT != 0 {
+                let paddr = pte & Self::PGENT_BASE_MASK;
+                klog!("KMAP: {:X} --> {:X} (flags={:X})\n", vaddr, paddr, pte);
+            }
+            vaddr += Self::PAGE_SIZE;
+            pte_addr = unsafe { pte_addr.add(1) }; // Move to the next PTE 
+        }
+    }
+    
+    fn entry_flags(kern: bool, w: bool, x: bool, cache: &MemoryType) -> u64 {
+        let mut flags = Self::PGENT_PRESENT;
+        if w {
+            flags |= Self::PGENT_WRITABLE;
+        }
+        if kern {
+            flags |= Self::PGENT_G;
+        } else {
+            flags |= Self::PGENT_USERMODE;
+        }
+        match cache {
+            MemoryType::Normal => { /* default is WriteBack */ },
+            MemoryType::Device => { 
+                flags |= Self::PGENT_PCD; 
+            },
+            MemoryType::OutputDMA => {
+                // TODO: Add PAT entry for WriteCombining and use that instead
+                // of WriteBack with PCD
+                flags |= Self::PGENT_PWT; 
+            },
+        }
+        if !x {
+            flags |= Self::PGENT_XD;
+        }
+        flags
+    }
+
+    fn write_table_entry(table_virt_base: usize, index: usize, value: u64) {
+        unsafe {
+            let destp : *mut u64 = table_virt_base as *mut u64;
+            *(destp.wrapping_add(index)) = value;
+        }
+    }
+
+    fn read_table_entry(table_virt_base: usize, index: usize) -> u64 {
+        unsafe {
+            let destp : *mut u64 = table_virt_base as *mut u64;
+            destp.wrapping_add(index).read_volatile()
+        }
+    }
+    
+    //
+    // Misc.
+    //
+    pub fn mapped_pages_count(&self) -> usize {
+        self.mapped_pages_count
+    }
+
+    pub fn tlb_page_count(&self) -> usize {
+        self.tlb_page_count
+    }
+
+    pub fn log_mapping(&self, vaddr: usize) {
+        let pdpt0e_i    = (vaddr >> 30) & 0x1FF; // Index in PDPT[0]
+        let pde_i       = (vaddr >> 21) & 0x1FF; // Index in PD
+        let pte_i       = (vaddr >> 12) & 0x1FF; // Index in PT
+
+        
+        klog!("pml4[0] @ {:X} => {:X}\n", self.pml4_base, 
+            Self::read_table_entry(self.pml4_base, 0));
+
+        let pdpte = Self::read_table_entry(self.pdpt0_base, pdpt0e_i);
+        klog!("  pdpt0 @ {:X} elem[{}]=> {:X}\n", self.pdpt0_base, pdpt0e_i,
+            pdpte as usize);
+
+        let pd_base = pdpte & Self::PGENT_BASE_MASK;
+        let pde = Self::read_table_entry(pd_base as usize, pde_i);
+        klog!("    pd @ {:X} elem[{}]=> {:X}\n", pd_base, pde_i, pde);
+        
+        let pt_base = pde & Self::PGENT_BASE_MASK;
+        let pte = Self::read_table_entry(pt_base as usize, pte_i);
+        klog!("      pt @ {:X} elem[{}]=> {:X}\n", pt_base, pte_i, pte);
+        klog!("VADDR {:X} --> PADDR {:X}\n", vaddr, 
+                pte & Self::PGENT_BASE_MASK);
+    }
+}
+
+impl MMUTrait for MMUMapping {
+
+    //
+    // MMU Initialization Methods
+    //
+
+    /// PDPT[0..3] are already identity-mapped to the first 4GB of physical
+    /// memory for the kernel's code and data.
+    /// This function is called by rust_x864_entry_bsp() to set up the kernel's
+    /// dynamic mapping area so that device drivers (and other parts of the
+    /// kernel) can use that area to map/unmap physical memory for DMA
+    /// operations, physical memory access, etc.
+    /// The dynamic mapping area covers [4GB, 8GB) virtual address range, which
+    /// will be divided to 4KB pages and left unmapped (not present) until 
+    /// a client requests it.
+    fn global_init() {
+        let pdpt0_base   = unsafe { &kpdpt0_tbl as *const usize as usize };
+        let pd_tlbs_base = unsafe { &kpd_tlbs as *const usize as usize };
+        let pg_tbls_base = unsafe { &kpg_tbls as *const usize as usize };
+        // Populate pdpt0[3..7]
+        for pdpt0e_i in 4..8 {
+            // Set up the Page Directory for this 1GB region
+            let pd_base = pd_tlbs_base + (pdpt0e_i as usize - 4)
+                                                            * Self::PAGE_SIZE;
+            for pde_i in 0..512 {
+                // Set up the Page Table for this 2MB region
+                let pt_base = pg_tbls_base + ((pdpt0e_i as usize - 4) * 512
+                                            + pde_i as usize) * Self::PAGE_SIZE;
+                // Zero out the page table as there are no mappings yet
+                unsafe { (pt_base as *mut u8).write_bytes(0, 0x1000); }
+                // Set the PDE to point to the page table
+                Self::write_table_entry(pd_base, pde_i as usize,
+                                        (pt_base as u64) | 
+                                        Self::PGENT_PRESENT |
+                                        Self::PGENT_WRITABLE | Self::PGENT_G);
+            }
+            // Set the PDPT entry to point to the page directory
+            Self::write_table_entry(pdpt0_base, pdpt0e_i as usize,
+                                    (pd_base as u64) | 
+                                    Self::PGENT_PRESENT |
+                                    Self::PGENT_WRITABLE | Self::PGENT_G);
+        }
+    }
+
+    fn per_cpu_init() {
+        // Nothing to do for x64 as the kernel's address space is shared
+        // among all CPUs, and the paging structures are already set up in
+        // global_init. Just need to enable NXE bit in EFER MSR to support
+        // No-Execute flag in page table entries.
+        let efer = x86_msr_read(Self::EFER_MSR_ADDR);
+        x86_msr_write(Self::EFER_MSR_ADDR, efer | Self::EFER_NXE_BIT);
+    }
+
+    //
+    // Kernel Dynamic Mapping Methods
+    //
+
+    /// Given a physical address and a frame count, finds a virtual address
+    /// range in the kernel's dynamic mapping area and maps the physical frames
+    /// to that virtual address range with the appropriate flags for the given
+    /// cache type, and returns the base virtual address of the mapped range.
+    /// The resulting mapping is continuous both in virtual and physical memory.
+    /// The caller is expected to call kunmap_frames to unmap the virtual
+    /// address range and free the physical frames back to the physical memory
+    /// manager.
+    /// 
+    /// Note that the mapping is not tied to any address-space and is shared
+    /// among all address spaces since it belongs to the kernel.
+    fn kmap(phys_base: usize, frame_cnt: usize, cache: MemoryType)
+                                                            -> Option<usize> {
+        let pg_tbls_base = unsafe { &kpg_tbls as *const usize as usize };
+        // Can't use map_pages since that methods works for user-space processes
+        let mut vaddr: usize        = Self::MIN_KPOOL_VIRTUAL as usize;
+        let mut pte_addr: *mut u64  = pg_tbls_base as *mut u64;
+        KMAP_LOCK.lock();
+        for _v in 0..Self::KPOOL_PAGES {
+            let mut found = true;
+            for w in 0..frame_cnt {
+                let pte = unsafe { pte_addr.add(w).read_volatile() };
+                if pte & Self::PGENT_PRESENT != 0 {
+                    // This page is already mapped, try the next one
+                    found = false;
+                    break;
+                }
+            }
+            if found {
+                // Found a contiguous range of free pages
+                for w in 0..frame_cnt {
+                    let pte_flags = Self::entry_flags(true, true, false, &cache);
+                    let paddr = (phys_base + w * Self::PAGE_SIZE) as u64;
+                    unsafe {
+                        pte_addr.add(w).write_volatile(paddr | pte_flags);
+                    }
+                    Self::flush_tlb_for_page(vaddr + w * Self::PAGE_SIZE);
+                }
+                return Some(vaddr);
+            }
+            vaddr += Self::PAGE_SIZE;
+            pte_addr = unsafe { pte_addr.add(1) }; // Move to the next PTE 
+        }
+        None
+    }
+
+    fn kunmap(virt_base: usize, frame_cnt: usize) {
+        if virt_base < Self::MIN_KPOOL_VIRTUAL as usize ||
+                virt_base >= Self::MAX_KPOOL_VIRTUAL as usize {
+            return;
+        }
+        let pg_tbls_base = unsafe { &kpg_tbls as *const usize as usize };
+        let pte_addr: *mut u64  = pg_tbls_base as *mut u64;
+        let start_page_index = (virt_base - Self::MIN_KPOOL_VIRTUAL as usize)
+                                / Self::PAGE_SIZE;
+        KMAP_LOCK.lock();
+        for pe_i in start_page_index..start_page_index + frame_cnt {
+            unsafe {
+                pte_addr.add(pe_i).write_volatile(0);
+            }
+        }
+    }
+
+    //
+    // User-Space Mapping Methods
+    //
+
+    /// Creates the initial paging structures for the process.
+    /// The first 8GBs are formed from kernel's mappings.
+    /// [0GB to 4GB] is mapped as 1GB pages for the kernel's code/data
+    /// [4GB to 8GB] point to the same page directories kernel maintains for its
+    ///              dynamic mapping pool. Any mapping done by the kernel in
+    ///              that pool will be visible in the
+    fn init(&mut self) {
         // Allocate and zero out:
         //   1 page for the PML4 table and 1 page for the first PDPT table
-        self.pml4_base  = palloc().expect("Out of memory");
-        self.pdpt0_base = palloc().expect("Out of memory");
+        self.pml4_base  = PhysMem::alloc().expect("Out of memory");
+        self.pdpt0_base = PhysMem::alloc().expect("Out of memory");
         unsafe {
             (self.pml4_base  as *mut u8).write_bytes(0, 0x1000);
             (self.pdpt0_base as *mut u8).write_bytes(0, 0x1000);
@@ -109,75 +351,67 @@ impl MMUMapping {
             Self::write_table_entry(self.pdpt0_base, i as usize, 
                                     pdpt0e | phys_addr);
         }
-        // Kernel's DMA access
-        // Set PDPT0[4..=7] --> PHYS[0GB to 4GB] as writable+non-cachable
-        let pdpt0e = Self::PGENT_PRESENT | Self::PGENT_WRITABLE |
-                        Self::PGENT_PCD | Self::PGENT_PS | Self::PGENT_G; // 1GB
+        // Kernel's dynamic mapping area (kmap)
+        // Set PDPT0[4..=7] --> kpd_tlbs[0..3]
+        let pd_tlbs_base = unsafe { &kpd_tlbs as *const usize as usize };
         for i in 4..8 {
-            let phys_addr : u64 = (i - 4) << 30;
-            Self::write_table_entry(self.pdpt0_base, i as usize, 
-                                    pdpt0e | phys_addr);
+            let pd_base = pd_tlbs_base + (i as usize - 4) * Self::PAGE_SIZE;
+            Self::write_table_entry(self.pdpt0_base, i as usize,
+                                    (pd_base as u64) | 
+                                    Self::PGENT_PRESENT |
+                                    Self::PGENT_WRITABLE |
+                                    Self::PGENT_G);
         }
 
         // Log everything for testing
-        dbg!("PML4 Base: {:X}, PML4E0: {:X}\n",
-            self.pml4_base,
-            Self::read_table_entry(self.pml4_base, 0)
-        );
-        dbg!("PDPT0 Base: {:X}\n", self.pdpt0_base);
-        for _i in 0..8 {
-            dbg!("    PDPT0[{}] : {:X}\n", _i,
-                    Self::read_table_entry(self.pdpt0_base, _i));
-        }
+        // klog!("PML4 Base: {:X}, PML4E0: {:X}\n",
+        //     self.pml4_base,
+        //     Self::read_table_entry(self.pml4_base, 0)
+        // );
+        // klog!("PDPT0 Base: {:X}\n", self.pdpt0_base);
+        // for _i in 0..8 {
+        //     klog!("    PDPT0[{}] : {:X}\n", _i,
+        //             Self::read_table_entry(self.pdpt0_base, _i));
+        // }
         self.tlb_page_count = 2; // PML4 + PDPT0
     }
 
-    //
-    // Paging structure management methods 
-    //
-    // Virtual Address ----> Physical Address translation
-    // 4GB - 0         ----> 4GB - 0 as four 1GB pages as supervisor access
-    // Above 4GB       ----> Non-contiguous 4KB physical pages as user access
-    //
-    //
-
-    pub fn addr_to_page_index(addr: usize) -> usize {
-        addr >> 12
-    }
-
-    // Maps a page (virtual address > 4GB) to a frame (physical address)
-    // The assumption is that the caller has already reserved page_cnt frames
-    // starting from phys_address from the physical memory manager.
-    pub fn map_pages(&mut self, virt_addr: usize, phys_addr: usize, page_cnt: usize,
-                     privileged: bool, writeable: bool, _executable: bool,
-                    _caching: MmuCachingPolicy) -> bool {
-        // Page-align the given addresses
+    /// Maps a number of pages (virtual address) to frames (physical address)
+    /// for a user-space process.
+    /// The assumption is that the caller has already reserved page_cnt frames
+    /// starting from phys_address from the physical memory manager.
+    /// If the virtual address is already mapped, this function will return
+    /// false without modifying the existing mapping.
+    fn map_pages(&mut self, virt_addr: usize, phys_addrs: &[usize],
+                     writeable: bool, exec: bool, cache: MemoryType) -> bool {
+        // Page-align the given starting virtual address
         let mut vaddr : u64 = virt_addr as u64 & Self::PGENT_BASE_MASK;
-        let mut paddr : u64 = phys_addr as u64 & Self::PGENT_BASE_MASK;
-        dbg!("map_pages(v:{:X}, p:{:X}, cnt:{}\n", vaddr, paddr, page_cnt);
-        if vaddr < Self::MIN_VIRTUAL || vaddr > Self::MAX_VIRTUAL  {
+        if (vaddr < Self::MIN_VIRTUAL_USER) || vaddr > Self::MAX_VIRTUAL  {
             return false;
         }
 
-        for _i in 0..page_cnt {
+        let flgs_top = Self::entry_flags(false, true, true, &MemoryType::Normal);
+        let flgs_pge = Self::entry_flags(false, writeable, exec, &cache);
+
+        for i in 0..phys_addrs.len() {
             let pdpt0e_i    = (vaddr >> 30) & 0x1FF; // Index in PDPT[0]
             let pde_i       = (vaddr >> 21) & 0x1FF; // Index in PD
             let pte_i       = (vaddr >> 12) & 0x1FF; // Index in PT
             let pd_base : usize;
             let pt_base : usize;
+            let paddr : u64 = phys_addrs[i] as u64 & Self::PGENT_BASE_MASK;
 
             // 1GB Region
             let mut pdpt0e = Self::read_table_entry(self.pdpt0_base,
                                                 pdpt0e_i as usize);
             if pdpt0e == 0 {
                 // Allocate a page directory for this PDPT0[pdpt0e_i]
-                pd_base = palloc().expect("Out of memory");
+                pd_base = PhysMem::alloc().expect("Out of memory");
                 self.tlb_page_count += 1;
                 unsafe {
                     (pd_base as *mut u8).write_bytes(0, 0x1000);
                 }
-                pdpt0e = pd_base as u64 | Self::PGENT_PRESENT |
-                           Self::PGENT_USERMODE | Self::PGENT_WRITABLE;
+                pdpt0e = pd_base as u64 | flgs_top;
                 Self::write_table_entry(self.pdpt0_base,
                                         pdpt0e_i as usize, pdpt0e);
             } else {
@@ -190,13 +424,12 @@ impl MMUMapping {
                                             pde_i as usize);
             if pde == 0 {
                 // Allocate a page table for this PD[pde_i]
-                pt_base = palloc().expect("Out of memory");
+                pt_base = PhysMem::alloc().expect("Out of memory");
                 self.tlb_page_count += 1;
                 unsafe {
                     (pt_base as *mut u8).write_bytes(0, 0x1000);
                 }
-                pde = pt_base as u64 | Self::PGENT_PRESENT |
-                           Self::PGENT_USERMODE | Self::PGENT_WRITABLE;
+                pde = pt_base as u64 | flgs_top;
                 Self::write_table_entry(pd_base, pde_i as usize, pde);
             } else {
                 // Retrieve the page table's base from ths PD[pde_i]
@@ -206,23 +439,16 @@ impl MMUMapping {
             // 4KB Region
             let mut pte = Self::read_table_entry(pt_base, pte_i as usize);
             if pte & Self::PGENT_PRESENT != 0 {
-                klog!("map_pages - Virtual address {:X} is already mapped!\n",
+                panic!("map_pages - Virtual address {:X} is already mapped!\n",
                     virt_addr);
-                return false;
             }
-            pte = (paddr & Self::PGENT_BASE_MASK) | Self::PGENT_PRESENT;
-            if writeable == true {
-                pte |= Self::PGENT_WRITABLE;
-            }
-            if privileged == false {
-                pte |= Self::PGENT_USERMODE;
-            }
+            pte = (paddr & Self::PGENT_BASE_MASK) | flgs_pge;
             Self::write_table_entry(pt_base, pte_i as usize, pte);
 
+            Self::flush_tlb_for_page(vaddr as usize);
             vaddr += Self::PAGE_SIZE as u64;
-            paddr += Self::PAGE_SIZE as u64;
         }
-        self.mapped_pages_count += page_cnt;
+        self.mapped_pages_count += phys_addrs.len();
         true
     }
 
@@ -231,7 +457,7 @@ impl MMUMapping {
     /// page that was unmapped. The caller is expected to free the physical page
     /// after unmapping.
     /// 
-    pub fn unmap_page(&mut self, virt_addr: usize) -> Option<usize> {
+    fn unmap_page(&mut self, virt_addr: usize) -> Option<usize> {
         let pdpt0e_i    = (virt_addr >> 30) & 0x1FF; // Index in PDPT[0]
         let pde_i       = (virt_addr >> 21) & 0x1FF; // Index in PD
         let pte_i       = (virt_addr >> 12) & 0x1FF; // Index in PT
@@ -253,7 +479,9 @@ impl MMUMapping {
 
         // Unmap the page by clearing the Present bit in the PTE and return the
         // physical address of the page that was unmapped.
-        Self::write_table_entry(pt_base as usize, pte_i, pte & !Self::PGENT_PRESENT);
+        Self::write_table_entry(pt_base as usize, pte_i, 
+                                                    pte & !Self::PGENT_PRESENT);
+        Self::flush_tlb_for_page(virt_addr);
         self.mapped_pages_count -= 1;
         Some((pte & Self::PGENT_BASE_MASK) as usize)
     }
@@ -261,7 +489,7 @@ impl MMUMapping {
     /// Unmaps the given virtual address range and returns the number of pages
     /// that were unmapped. The caller is expected to free the physical pages
     /// after unmapping.
-    pub fn unmap_pages(&mut self, virt_addr: usize, num_pages: usize) -> usize {
+    fn unmap_pages(&mut self, virt_addr: usize, num_pages: usize) -> usize {
         let mut unmapped = 0;
         for i in 0..num_pages {
             if self.unmap_page(virt_addr + (i * Self::PAGE_SIZE)) != None {
@@ -271,23 +499,17 @@ impl MMUMapping {
         unmapped
     }
 
-    fn write_table_entry(table_virt_base: usize, index: usize, value: u64) {
+    //
+    // Address-space Switching Methods
+    //
+
+    /// Switches to the address space represented by this MMUMapping
+    fn enter(&self) {
         unsafe {
-            let destp : *mut u64 = table_virt_base as *mut u64;
-            *(destp.wrapping_add(index)) = value;
+            asm!("mov cr3, {}", in(reg) self.pml4_base);
         }
     }
-
-    fn read_table_entry(table_virt_base: usize, index: usize) -> u64 {
-        unsafe {
-            let destp : *mut u64 = table_virt_base as *mut u64;
-            destp.wrapping_add(index).read_volatile()
-        }
-    }
-
-    /*
-     * Execution/Segmentation Management methods
-     */
+    
     ///
     /// Converts the currently running kernel task into a user-space task as a
     /// part of this process address space. The calling (kernel) task will not
@@ -295,8 +517,8 @@ impl MMUMapping {
     /// The user-space execution must end with an Exit system call, at which
     /// point the task terminates.
     /// 
-    pub fn move_to_userspace(priv_data: usize, entry_point: usize, arg: usize,
-                            user_stack: usize, exit_handler: fn()) {
+    fn move_to_userspace(priv_data: usize, entry_point: usize, arg: usize,
+                            user_stack: usize, exit_handler: fn()) -> ! {
         // Prepare CS, DS, SS for ring 3 transition and then jump to the
         // entry point address given. x64 doesn't support ljmp, so Iretq it is!
         // The context switch logic takes care of RSP0
@@ -337,54 +559,61 @@ impl MMUMapping {
         panic!("Must have been unreachable!\n");
     }
 
-    pub fn copy_priv_data(&self) -> usize {
+    fn copy_priv_data(&self) -> usize {
         self.pml4_base
     }
 
-    /*
-     * DMA
-     */
-    /// Converts a physical address in the kernel's address space to a virtual
-    /// address in the kernel's address space that can be used for DMA
-    /// operations by the software.
-    pub fn dma_from_kernel_phys(phys_addr: usize) -> usize{
-        phys_addr | ((1 as usize) << 32)
-    }
-
     //
-    // Misc.
+    // Misc Methods
     //
-    pub fn mapped_pages_count(&self) -> usize {
-        self.mapped_pages_count
+
+    /// Invalidate the TLB entries for the entire address space by reloading
+    /// CR3 with the same value. This is a simple but expensive way to flush
+    /// the TLB.
+    fn flush_tlbs() {
+        unsafe {
+            let cr3: usize;
+            asm!("mov {}, cr3", out(reg) cr3);
+            asm!("mov cr3, {}", in(reg) cr3);
+        }
     }
 
-    pub fn tlb_page_count(&self) -> usize {
-        self.tlb_page_count
+    /// Invalidate the TLB entry for the given virtual address using the INVLPG
+    /// instruction. This is more efficient than flushing the entire TLB when
+    /// only a few pages are unmapped/changed.
+    fn flush_tlb_for_page(virt_addr: usize) {
+        unsafe {
+            asm!("invlpg [{}]", in(reg) virt_addr,
+            options(nostack, preserves_flags));
+        }
     }
 
-    pub fn log_mapping(&self, vaddr: usize) {
-        let pdpt0e_i    = (vaddr >> 30) & 0x1FF; // Index in PDPT[0]
-        let pde_i       = (vaddr >> 21) & 0x1FF; // Index in PD
-        let pte_i       = (vaddr >> 12) & 0x1FF; // Index in PT
-
-        
-        klog!("pml4[0] @ {:X} => {:X}\n", self.pml4_base, 
-            Self::read_table_entry(self.pml4_base, 0));
+    /// Finds the physical address that is mapped to the given virtual address
+    /// by walking the paging structures of the given address space.
+    /// Returns None if the virtual address is not mapped.
+    fn virt_to_phys(&self, virt_addr: usize) -> Option<usize> {
+        let pdpt0e_i    = (virt_addr >> 30) & 0x1FF; // Index in PDPT[0]
+        let pde_i       = (virt_addr >> 21) & 0x1FF; // Index in PD
+        let pte_i       = (virt_addr >> 12) & 0x1FF; // Index in PT
 
         let pdpte = Self::read_table_entry(self.pdpt0_base, pdpt0e_i);
-        klog!("  pdpt0 @ {:X} elem[{}]=> {:X}\n", self.pdpt0_base, pdpt0e_i,
-            pdpte as usize);
-
+        if pdpte & Self::PGENT_PRESENT == 0 {
+            return None;
+        }
         let pd_base = pdpte & Self::PGENT_BASE_MASK;
         let pde = Self::read_table_entry(pd_base as usize, pde_i);
-        klog!("    pd @ {:X} elem[{}]=> {:X}\n", pd_base, pde_i, pde);
-        
+        if pde & Self::PGENT_PRESENT == 0 {
+            return None;
+        }
         let pt_base = pde & Self::PGENT_BASE_MASK;
         let pte = Self::read_table_entry(pt_base as usize, pte_i);
-        klog!("      pt @ {:X} elem[{}]=> {:X}\n", pt_base, pte_i, pte);
-        klog!("VADDR {:X} --> PADDR {:X}\n", vaddr, 
-                pte & Self::PGENT_BASE_MASK);
+        if pte & Self::PGENT_PRESENT == 0 {
+            return None;
+        }
+
+        Some((pte & Self::PGENT_BASE_MASK) as usize)
     }
+
 }
 
 impl Drop for MMUMapping {
@@ -408,25 +637,36 @@ impl Drop for MMUMapping {
                             if pte & Self::PGENT_PRESENT > 0 {
                                 // Release the physical frame itself too
                                 _pg_count += 1;
-                                pfree((pte & Self::PGENT_BASE_MASK) as usize);
+                                let addr = pte & Self::PGENT_BASE_MASK;
+                                PhysMem::free(addr as usize);
                             }
                         }
                         // Release the Page Table
                         _pg_st_count += 1;
-                        pfree((pde & Self::PGENT_BASE_MASK) as usize);
+                        PhysMem::free((pde & Self::PGENT_BASE_MASK) as usize);
                     }
                 }
                 // Release the Page Directory
                 _pg_st_count += 1;
-                pfree(pde_base as usize);
+                PhysMem::free(pde_base as usize);
             }
         }
         _pg_st_count += 2;
-        pfree(self.pdpt0_base);
-        pfree(self.pml4_base);
+        PhysMem::free(self.pdpt0_base);
+        PhysMem::free(self.pml4_base);
         dbg!("Released {} user frames and {} paging structure frames - \
               Free frames: {}\n", _pg_count, _pg_st_count,
-              pmm_num_free_frames());
+              PhysMem::free_frame_count());
 
     }
 }
+
+unsafe extern "C" {
+    // Kernel's PDPT0 table for the first 512GB virtual address space
+    unsafe static kpdpt0_tbl: usize;
+    // 4   PDs for the dynamic pool
+    unsafe static kpd_tlbs: usize;
+    // 512 PTs for each PD above linearly covering the entire dynamic pool
+    unsafe static kpg_tbls: usize; 
+}
+

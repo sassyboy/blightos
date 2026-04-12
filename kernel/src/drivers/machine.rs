@@ -14,7 +14,7 @@ use alloc::{format, slice};
 use alloc::string::String;
 use crate::arch::cpu_count;
 use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
-use crate::mem::phys::{PHY_FRAME_SIZE, pmm_num_free_frames, pmm_num_total_frames};
+use crate::mem::phys::*;
 use crate::sched::Task;
 use crate::{test, util::*};
 use crate::Error;
@@ -162,10 +162,10 @@ impl Machine {
             let out = format!(
                 "Total: {} Frames, {:.3} MB\n\
                  Free : {} Frames, {:.3} MB",
-                pmm_num_total_frames(),
-                (pmm_num_total_frames() * PHY_FRAME_SIZE) as f64 / 0x100000 as f64,
-                pmm_num_free_frames(),
-                (pmm_num_free_frames() * PHY_FRAME_SIZE) as f64 / 0x100000 as f64
+                PhysMem::total_frame_count(),
+                PhysMem::total_memory() as f64 / 0x100000 as f64,
+                PhysMem::free_frame_count(),
+                PhysMem::free_memory() as f64 / 0x100000 as f64
             );
             let len = min(out[off..].len(), buff.len());
             let ptr = out[off..].as_ptr();
