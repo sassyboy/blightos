@@ -18,16 +18,16 @@ pub struct File {
     wr_offset:  usize
 }
 impl File {
-    const FLG_DIRECTORY:    usize = 0x1;
-    //pub const FLG_SOFT_LINK:    usize = 0x2;
-    //pub const FLG_HARD_LINK:    usize = 0x4;
-    const FLG_DEVICE:       usize = 0x8;
-    const FLG_HIDDEN:       usize = 0x10;
-    const FLG_ARCHIVE:      usize = 0x20;
-    const FLG_SYSTEM:       usize = 0x40;
-    const FLG_PERM_READ:    usize = 0x100;
-    const FLG_PERM_WRITE:   usize = 0x200;
-    const FLG_PERM_EXEC:    usize = 0x400;
+    pub const FLG_DIRECTORY:    usize = 0x1;
+    pub const FLG_SOFT_LINK:    usize = 0x2;
+    pub const FLG_HARD_LINK:    usize = 0x4;
+    pub const FLG_DEVICE:       usize = 0x8;
+    pub const FLG_HIDDEN:       usize = 0x10;
+    pub const FLG_ARCHIVE:      usize = 0x20;
+    pub const FLG_SYSTEM:       usize = 0x40;
+    pub const FLG_PERM_READ:    usize = 0x100;
+    pub const FLG_PERM_WRITE:   usize = 0x200;
+    pub const FLG_PERM_EXEC:    usize = 0x400;
 
     /// If MODE_CREATE is set, the file will be created if it does not exist.
     /// If the file already exists, it will be truncated to zero length.
@@ -281,12 +281,17 @@ impl File {
         }
         fenum(self.fd, buffer)
     }
+
+    pub fn close(&mut self){
+        if self.open {
+            fclose(self.fd);
+            self.open = false;
+        }
+    }
 }
 impl Drop for File {
     fn drop(&mut self) {
-        if self.open {
-            fclose(self.fd);
-        }
+        self.close();
     }
 }
 

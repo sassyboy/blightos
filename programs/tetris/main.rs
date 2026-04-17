@@ -82,10 +82,13 @@ const COLORS: [RGB; TEROMINO_TYPES + 1] = [
 
 static INPUT: AtomicU8 = AtomicU8::new(0);
 static VIDEO_LOOP: AtomicBool = AtomicBool::new(false);
+static GAME_OVER: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
 fn main() {
     let fb0 = Framebuffer::new();
+    println!("Controls: A/D to move left/right, W/E to rotate");
+    println!("          S/Space/Enter to soft drop, Q to quit.");
     if let Some(mut fb) = fb0 {
         // Save the framebuffer content before drawing
         fb.save_frame();
@@ -94,7 +97,7 @@ fn main() {
         VIDEO_LOOP.store(true, Ordering::Relaxed);
         let rtask = Task::spawn(render_loop, 0, "RenderLoop");
         // Main loop to update the framebuffer with the latest game state
-        loop {
+        while !GAME_OVER.load(Ordering::Relaxed) {
             // Handle user input (e.g., keyboard events) to control the game
             let key =  stdio_read_byte();
             if key == 'q' as u8 {
@@ -365,6 +368,7 @@ fn render_loop(_args: usize){
             StepResult::GameOver => {
                 play_sfx(&snd_gover, true);
                 println!("Game Over!");
+                GAME_OVER.store(true, Ordering::Relaxed);
                 break;
             },
             StepResult::RowCleared => {

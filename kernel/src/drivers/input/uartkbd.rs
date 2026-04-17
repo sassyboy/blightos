@@ -6,12 +6,15 @@
 
 use alloc::string::String;
 use core::time::Duration;
+use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::AtomicUsize;
 use crate::drivers::input::Keyboard;
 use crate::sched::Task;
 
 pub struct UARTKeyboard {
     
 }
+static KBD_HND: AtomicUsize = AtomicUsize::new(0);
 
 impl UARTKeyboard {
     pub const fn new() -> Self {
@@ -19,7 +22,9 @@ impl UARTKeyboard {
     }
 
     pub fn enumerate() -> usize {
-        // Todo detect the platform and the uart in use
+        // Register with the Keyboard interface
+        let hnd = Keyboard::register_keyboard("UARTKBD");
+        KBD_HND.store(hnd, Relaxed);
         1
     }
 
@@ -35,7 +40,7 @@ impl UARTKeyboard {
     fn worker(_arg: usize) {
         loop {
             if let Some(ch) = crate::arch::bcm_peripherals::pl011uart_getc() {
-                Keyboard::push_ascii(ch);
+                Keyboard::push_ascii(KBD_HND.load(Relaxed), ch);
             }
             Task::sleep(Duration::from_millis(10));
         }

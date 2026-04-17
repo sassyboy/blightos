@@ -42,5 +42,6 @@ pub struct Image {
     pub interlaced: bool,
 }
 
+pub mod font;
 pub mod framebuffer;
 pub mod png;

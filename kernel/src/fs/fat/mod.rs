@@ -878,12 +878,14 @@ fn fenum(hnd: usize, out: &mut Vec<DirectoryEntry>) -> Result<usize, Error> {
             item.flags |= DirectoryEntry::FLG_SYSTEM;
         }
         if child.attr & DirEntry::ATTR_READ_ONLY > 0 {
-            item.flags |= DirectoryEntry::FLG_PERM_READ |
-                            DirectoryEntry::FLG_PERM_EXEC;
+            item.flags |= DirectoryEntry::FLG_PERM_READ;
         } else {
             item.flags |= DirectoryEntry::FLG_PERM_READ |
-                            DirectoryEntry::FLG_PERM_WRITE |
-                            DirectoryEntry::FLG_PERM_EXEC;
+                            DirectoryEntry::FLG_PERM_WRITE;
+        }
+        if child.attr & DirEntry::ATTR_DIRECTORY == 0 &&
+            child.name().ends_with("BOX") {
+            item.flags |= DirectoryEntry::FLG_PERM_EXEC;
         }
         out.push(item);
     }

@@ -16,6 +16,8 @@ pub mod heap;
 pub mod zlib;
 pub mod graphics;
 pub mod audio;
+pub mod gui;
+pub mod hid;
 
 use crate::stdio::*;
 use crate::syscall::*;

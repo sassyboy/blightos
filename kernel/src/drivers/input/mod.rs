@@ -7,12 +7,31 @@
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::AtomicBool;
+use alloc::string::String;
+use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
+use alloc::vec::Vec;
 use crate::sched::WaitChannel;
+use crate::util::*;
 
 #[cfg(target_arch = "x86_64")]
 pub mod i8046;
 #[cfg(target_arch = "aarch64")]
 pub mod uartkbd;
+
+//
+// Keyboard Interface
+//
+// Provides a unified interface for all keyboard-like input devices
+// (including uart kbd).
+//
+// Every enumerated keyboard device must register itself with this interface
+// via a call to Keyboard::register() to be accessible by the kernel and
+// user-space tasks.
+//
+// The kernel can use the struct methods to access any of the available
+// keyboard devices without needing to know the specifics of each device.
+// Similarly, user-space tasks use the VFS interface (i.e., read from kbd:/).
+//
 
 pub enum KeyboardEvent {
     KeyPressed,
@@ -20,20 +39,63 @@ pub enum KeyboardEvent {
     KeyPressedOrReleased
 }
 
-#[repr(u8)] 
-pub enum KeyCode {
-    LeftShift               = 0x2A,
-    RightShift              = 0x36,
-    Backspace               = 0x0E,
-    Tab                     = 0x0F,
+pub struct KeyboardListener {
+    pub lhnd: usize,        // Handle to identify the listener task
+    pub dhnd: usize,        // Handle to identify the keyboard device the 
+                            // listener is subscribed to.
+    pub events: Vec<u8>,
 }
-
 pub struct Keyboard {
+    initialized:bool,
+    devices:    Vec<String>, // Registered keyboards
+    listeners:  Vec<KeyboardListener>,
+    next_hnd:   usize,  // Listener's handle starts from KBD_LISTENER_INIT_HND.
+                        // 0..0x100 is reserved for other possible nodes under
+                        // kbd:/
+    next_dev:   usize,  // Handler for the next registered keyboard device.
 }
-
+static KEYBOARD: Spinlock<Keyboard> = Spinlock::new(Keyboard::new());
 impl Keyboard {
+    pub const KEY_RELEASED: u8 = 0x80;
+
+    pub const fn new() -> Self {
+        Self {
+            initialized: false,
+            devices: Vec::new(),
+            listeners: Vec::new(),
+            next_hnd: Self::KBD_LISTENER_INIT_HND,
+            next_dev: Self::KBD_ALL_HND + 1,
+        }
+    }
+
+    /// Registers an enumerated keyboard device with the interface.
+    ///
+    /// Returns a handle to the registered device that can be used to 
+    /// distinguish events from different devices.
+    pub fn register_keyboard(name: &str) -> usize {
+        let mut kbd = KEYBOARD.lock();
+        if !kbd.initialized {
+            // Register the mount-point
+            let mnt_obj = MountPoint {
+                name:       String::from("kbd"),
+                fops:       Self::fops_handler
+            };
+            if !MountPoint::mount(mnt_obj) {
+                klog!("Failed to mount kbd:/");
+                return 0;
+            }
+            kbd.devices.push(String::from("all"));
+            kbd.initialized = true;
+        }
+        
+        kbd.devices.push(String::from(name));
+        let dev_hnd = kbd.next_dev;
+        kbd.next_dev += 1;
+        return dev_hnd;
+    }
+
     //
-    // Public interface
+    // Public interface for the kernel
     //
     pub fn clear_buffer() {
         KBD_LAST_KEYCODE.store(0, Relaxed);
@@ -103,37 +165,44 @@ impl Keyboard {
     //
     // Public interface to be exclusively used by specific keyboard drivers
     //
-    pub fn push(event: KeyboardEvent, code: u8) {
-        match event {
-            KeyboardEvent::KeyPressed             => {
-                if code & 0x7F == KeyCode::LeftShift as u8 {
-                    KBD_LSHIFT.store(true, Relaxed);
-                } else if code & 0x7F == KeyCode::RightShift as u8 {
-                    KBD_RSHIFT.store(true, Relaxed);
+    pub fn push(kbd_hnd: usize, code: u8) {
+
+        // Add the keycode to the event queue of all listeners
+        {
+            // Todo: offload if kbd can't be locked immediately
+            let mut kbd = KEYBOARD.lock();
+            for lst in kbd.listeners.iter_mut() {
+                if lst.dhnd == Self::KBD_ALL_HND || lst.dhnd == kbd_hnd {
+                    lst.events.push(code);
                 }
-                KBD_LAST_KEYCODE.store(code, Relaxed);
-                KBD_WC_PRESS.signal_all();
-            },
-            KeyboardEvent::KeyReleased            => {
-                if code & 0x7F == KeyCode::LeftShift as u8 {
-                    KBD_LSHIFT.store(false, Relaxed);
-                } else if code & 0x7F == KeyCode::RightShift as u8 {
-                    KBD_RSHIFT.store(false, Relaxed);
-                }
-                // Don't record the key upon release
-                KBD_WC_RELE.signal_all();
-            }
-            KeyboardEvent::KeyPressedOrReleased   => {
-                // Some drivers (uart) can't distinguish between press/release
-                KBD_LAST_KEYCODE.store(code, Relaxed);
-                KBD_WC_ANY.signal_all();
-                KBD_WC_RELE.signal_all();
-                KBD_WC_PRESS.signal_all();
             }
         }
+        // TODO - remove this once stdin is figured out
+        if code & 0x7F == KeyCode::LeftShift as u8 {
+            if code & Self::KEY_RELEASED > 0 {
+                KBD_LSHIFT.store(false, Relaxed);
+            } else {
+                KBD_LSHIFT.store(true, Relaxed);
+            }
+        } else if code & 0x7F == KeyCode::RightShift as u8 {
+            if code & Self::KEY_RELEASED > 0 {
+                KBD_RSHIFT.store(false, Relaxed);
+            } else {
+                KBD_RSHIFT.store(true, Relaxed);
+            }
+        } else {
+            KBD_LAST_KEYCODE.store(code, Relaxed);
+        }
+        // Wake up the tasks waiting a keyboard event
+        if code & Self::KEY_RELEASED > 0 {
+            KBD_WC_RELE.signal_all();
+        } else {
+            KBD_WC_PRESS.signal_all();
+        }
+        KBD_WC_ANY.signal_all();
     }
 
-    pub fn push_ascii(ascii: u8) {
+    pub fn push_ascii(kbd_hnd: usize, ascii: u8) {
         let (code, shift) = if ascii < 128 {
             ASCII_TO_KEYCODE[ascii as usize]
         } else {
@@ -142,14 +211,136 @@ impl Keyboard {
         if code == 0 {
             return; // No mapping for this ascii code
         }
+        // Simulate the corresponding series of key events
         if shift {
-            Self::push(KeyboardEvent::KeyPressed, KeyCode::LeftShift as u8);
-        } else {
-            Self::push(KeyboardEvent::KeyReleased, KeyCode::LeftShift as u8);
+            Self::push(kbd_hnd, KeyCode::LeftShift as u8);
         }
-        Self::push(KeyboardEvent::KeyPressed, code);
+        Self::push(kbd_hnd, code);
+        Self::push(kbd_hnd, code | Self::KEY_RELEASED);
+        if shift {
+            Self::push(kbd_hnd, KeyCode::LeftShift as u8 | Self::KEY_RELEASED);
+        }
     }
 
+    //
+    // VFS interface for reading from kbd:/
+    // Every user-space task that opens kbd:/ will get its own independent
+    // event queue that gets populated by the push() function above. This allows
+    // multiple tasks to read from the keyboard without interfering with each
+    // other.
+    //
+    const KBD_ROOT_HND: usize = 0;
+    // Special handle that receives all keyboard events regardless of the
+    // device in case we want to support multiple keyboard devices in the future
+    const KBD_ALL_HND:  usize = 1; 
+    const KBD_LISTENER_INIT_HND: usize = 0x100;
+    const KBD_BUFF_SIZE: usize = 128; // Max number of codes to read at a time
+
+    fn fops_handler(op: FileOperation) -> Result<usize, Error> {
+        match op {
+            FileOperation::Open { full_path, mode: _, dent } => {
+                let mpath = MountPoint::device_relative_path(full_path);
+                if mpath.eq("/") {
+                    dent.name = String::from("");
+                    dent.size = 0;
+                    dent.flags = DirectoryEntry::DEV_RX_DIR_FLAGS;
+                    return Ok(Self::KBD_ROOT_HND);
+                } else if mpath.eq("/all") {
+                    dent.name = String::from("all");
+                    dent.size = Self::KBD_BUFF_SIZE;
+                    dent.flags = DirectoryEntry::DEV_RX_FILE_FLAGS;
+                    // Insert a listener for this caller
+                    let mut kbd = KEYBOARD.lock();
+                    let listener_hnd = kbd.next_hnd;
+                    kbd.listeners.push(KeyboardListener {
+                        lhnd: listener_hnd,
+                        dhnd: Self::KBD_ALL_HND,
+                        events: Vec::new()
+                    });
+                    kbd.next_hnd += 1;
+                    return Ok(listener_hnd);
+                } else {
+                    // Look in the registered devices list for a match
+                    let mut kbd = KEYBOARD.lock();
+                    let mut found_dev = false;
+                    let mut dev_index = 0;
+                    for (i, dev_name) in kbd.devices.iter().enumerate() {
+                        if mpath.starts_with("/") && mpath.ends_with(dev_name)
+                            && mpath.len() == dev_name.len() + 1 {
+                            dent.name = dev_name.clone();
+                            dent.size = Self::KBD_BUFF_SIZE;
+                            dent.flags = DirectoryEntry::DEV_RX_FILE_FLAGS;
+                            dev_index = i;
+                            found_dev = true;
+                            break;
+                        }
+                    }
+                    if !found_dev {
+                        return Err(error!(ErrorCode::InvalidPath));
+                    }
+                    // Insert a listener for this caller
+                    let listener_hnd = kbd.next_hnd;
+                    kbd.listeners.push(KeyboardListener {
+                        lhnd: listener_hnd,
+                        dhnd: dev_index + Self::KBD_ALL_HND,
+                        events: Vec::new()
+                    });
+                    kbd.next_hnd += 1;
+                    return Ok(listener_hnd);
+                }
+            },
+            FileOperation::Enum { hnd, out } => {
+                if hnd != Self::KBD_ROOT_HND {
+                    // Only the root (kbd:/) provides a list
+                    return Err(error!(ErrorCode::InvalidOp));
+                }
+                // List the keyboard devices
+                let kbd = KEYBOARD.lock();
+                for (_i, dev_name) in kbd.devices.iter().enumerate() {
+                    out.push(
+                        DirectoryEntry {
+                        name: dev_name.clone(),
+                        size: Self::KBD_BUFF_SIZE,
+                        flags: DirectoryEntry::DEV_R_FILE_FLAGS
+                    });
+                }
+                Ok(out.len())
+            }
+            FileOperation::Close { hnd } => {
+                // Find the listener for this handle and remove it
+                let mut kbd = KEYBOARD.lock();
+                if let Some(pos) = kbd.listeners.iter().position(|l| l.lhnd == hnd) {
+                    kbd.listeners.remove(pos);
+                } else {
+                    return Err(error!(ErrorCode::InvalidHandle));
+                }
+                return Ok(0);
+            },
+            FileOperation::Read { hnd, off: _, buff} => {
+                // Find the listener for this handle
+                let mut kbd = KEYBOARD.lock();
+                if let Some(lst) = kbd.listeners.iter_mut()
+                                                    .find(|l| l.lhnd == hnd) {
+                    // Read events from the listener's event queue
+                    
+                    let mut bytes_written = 0;
+                    while bytes_written < buff.len() && !lst.events.is_empty() {
+                        buff[bytes_written] = lst.events.remove(0);
+                        bytes_written += 1;
+                    }
+                    return Ok(bytes_written);
+                } else {
+                    return Err(error!(ErrorCode::InvalidHandle));
+                }
+            },
+            FileOperation::Exec { hnd: _, func: _, buff: _ } => {
+                return Err(error!(ErrorCode::InvalidOp));
+            },
+            FileOperation::Write { hnd: _, off: _, buff: _ } => {
+                return Err(error!(ErrorCode::InvalidOp));
+            }
+        }
+    }
 }
 
 static KBD_LSHIFT:        AtomicBool = AtomicBool::new(false);
@@ -159,7 +350,129 @@ static KBD_WC_PRESS:      WaitChannel = WaitChannel::new();
 static KBD_WC_RELE:       WaitChannel = WaitChannel::new();
 static KBD_WC_ANY:        WaitChannel = WaitChannel::new();
 
-// (keycoard, shift)
+// (Keycode & 0x7F)
+#[repr(u8)] 
+pub enum KeyCode {
+    Escape          = 0x01,
+    One             = 0x02, // 1 or ! with shift
+    Two             = 0x03, // 2 or @ with shift
+    Three           = 0x04, // 3 or # with shift
+    Four            = 0x05, // 4 or $ with shift
+    Five            = 0x06, // 5 or % with shift
+    Six             = 0x07, // 6 or ^ with shift
+    Seven           = 0x08, // 7 or & with shift
+    Eight           = 0x09, // 8 or * with shift
+    Nine            = 0x0A, // 9 or ( with shift
+    Zero            = 0x0B, // 0 or ) with shift
+    MinusUnderscore = 0x0C, // - or _ with shift
+    PlusEqual       = 0x0D, // + or = with shift
+    Backspace       = 0x0E, // Backspace
+    Tab             = 0x0F, // Tab
+    Q               = 0x10, // q or Q with shift
+    W               = 0x11, // w or W with shift
+    E               = 0x12, // e or E with shift
+    R               = 0x13, // r or R with shift
+    T               = 0x14, // t or T with shift
+    Y               = 0x15, // y or Y with shift
+    U               = 0x16, // u or U with shift
+    I               = 0x17, // i or I with shift
+    O               = 0x18, // o or O with shift
+    P               = 0x19, // p or P with shift
+    LeftBracket     = 0x1A, // [ or { with shift
+    RightBracket    = 0x1B, // ] or } with shift
+    Enter           = 0x1C, // Enter or Return
+    LeftControl     = 0x1D, // Left Control
+    A               = 0x1E, // a or A with shift
+    S               = 0x1F, // s or S with shift
+    D               = 0x20, // d or D with shift
+    F               = 0x21, // f or F with shift
+    G               = 0x22, // g or G with shift
+    H               = 0x23, // h or H with shift
+    J               = 0x24, // j or J with shift
+    K               = 0x25, // k or K with shift
+    L               = 0x26, // l or L with shift
+    SemicolonColon  = 0x27, // ; or : with shift
+    ApostropheQuote = 0x28, // ' or " with shift
+    BacktickTilde   = 0x29, // ` or ~ with shift
+    LeftShift       = 0x2A, // Left Shift
+    BackslashPipe   = 0x2B, // \ or | with shift
+    Z               = 0x2C, // z or Z with shift
+    X               = 0x2D, // x or X with shift
+    C               = 0x2E, // c or C with shift
+    V               = 0x2F, // v or V with shift
+    B               = 0x30, // b or B with shift
+    N               = 0x31, // n or N with shift
+    M               = 0x32, // m or M with shift
+    CommaLeftAngle  = 0x33, // , or < with shift
+    DotRightAngle   = 0x34, // . or > with shift
+    SlashQuestion   = 0x35, // / or ? with shift
+    RightShift      = 0x36, // Right Shift
+    KeypadAsterisk  = 0x37, // Keypad *
+    LeftAlt         = 0x38, // Left Alt
+    Space           = 0x39,
+    CapsLock        = 0x3A, // Caps Lock
+    F1              = 0x3B, // F1
+    F2              = 0x3C, // F2
+    F3              = 0x3D, // F3
+    F4              = 0x3E, // F4
+    F5              = 0x3F, // F5
+    F6              = 0x40, // F6
+    F7              = 0x41, // F7
+    F8              = 0x42, // F8
+    F9              = 0x43, // F9
+    F10             = 0x44, // F10
+    NumLock         = 0x45, // Num Lock
+    ScrollLock      = 0x46, // Scroll Lock
+    Numpad7         = 0x47, // Keypad 7
+    Numpad8         = 0x48, // Keypad 8
+    Numpad9         = 0x49, // Keypad 9
+    NumpadMinus     = 0x4A, // Keypad -
+    Numpad4         = 0x4B, // Keypad 4
+    Numpad5         = 0x4C, // Keypad 5
+    Numpad6         = 0x4D, // Keypad 6
+    NumpadPlus      = 0x4E, // Keypad +
+    Numpad1         = 0x4F, // Keypad 1
+    Numpad2         = 0x50, // Keypad 2
+    Numpad3         = 0x51, // Keypad 3
+    Numpad0         = 0x52, // Keypad 0
+    NumpadDot       = 0x53, // Keypad .
+    F11             = 0x57, // F11
+    F12             = 0x58, // F12
+    ExtendedCode    = 0x60, // 0xE0 & 0x7F = 0x60, i.e., start of extended
+                            // keycodes (e.g., arrow keys) and is followed by
+                            // another keycode from ExtendedKeyCode enum
+}
+
+// Extended Keycode & 0x7F
+#[repr(u8)] 
+pub enum ExtendedKeyCode {
+    PrevTrack       = 0x10, // Previous Track
+    NextTrack       = 0x19, // Next Track
+    NumpadEnter     = 0x1C, // Keypad Enter
+    RightControl    = 0x1D, // Right Control
+    Mute            = 0x20, // Mute
+    PlayPause       = 0x22, // Play/Pause
+    Stop            = 0x24, // Stop
+    VolumeDown      = 0x2E, // Volume Down
+    VolumeUp        = 0x30, // Volume Up
+    RightAlt        = 0x38, // Right Alt
+    Home            = 0x47, // Home
+    Up              = 0x48, // Up Arrow
+    PageUp          = 0x49, // Page Up
+    Left            = 0x4B, // Left Arrow
+    Right           = 0x4D, // Right Arrow
+    End             = 0x4F, // End
+    Down            = 0x50, // Down Arrow
+    PageDown        = 0x51, // Page Down
+    Insert          = 0x52, // Insert
+    Delete          = 0x53, // Delete
+    LeftGUIButton   = 0x5B, // Left GUI (Windows) Button
+    RightGUIButton  = 0x5C, // Right GUI (Windows) Button
+    Apps            = 0x5D, // Application (Menu) Button
+}
+
+
+// (keycode & 0x7F, shift)
 pub const ASCII_TO_KEYCODE: [(u8, bool); 128] = [
     // 0..31: control -> 0
     (0, false),

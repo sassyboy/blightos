@@ -900,7 +900,7 @@ fn syscall_enum(args_ptr: usize, args_len: usize, _: usize, ret_ptr: usize) {
                     // Todo - return a well-structured data instead of a string
                     //args.count = entries.len();
                     for item in entries {
-                        serialized += format!("{}, {}, 0x{:X}\n",
+                        serialized += format!("{},{:X},{:X}\n",
                                     item.name, item.size, item.flags).as_str();
                     }
                     let len = min(args.buf_len, serialized.len());
