@@ -15,7 +15,7 @@ pub struct Theme {
     pub highlight_text: RGBA, // Text color when hovering or selected
     pub disabled_text:  RGBA, // Text color for disabled widgets
     // 
-    pub border_width: u32, // Border width in pixels
+    pub border_width:   u8, // Border width in pixels
     pub title_bar_height: u32, // Title bar height in pixels
     //
     pub regular_font: Font, // Regular font for UI text

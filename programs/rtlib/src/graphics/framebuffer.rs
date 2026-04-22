@@ -76,6 +76,26 @@ impl Framebuffer {
         }
         None
     }
+
+    pub fn get_framebuffer_info() -> Option<FrameBufferInfo> {
+        let fb_path = Path::from("framebuffer:/");
+        let fbfopen = File::from_path(&fb_path, File::MODE_RWX);
+        let Ok(fb_file) = fbfopen else {
+            return None;
+        };
+        let mut info_buffer = [0u8; size_of::<FrameBufferInfo>()];
+        let bytes_read = fb_file.exec(Self::FUNC_GET_INFO, &mut info_buffer)
+                                                                .unwrap_or(0);
+        if bytes_read == size_of::<FrameBufferInfo>() {
+            // SAFETY: We trust the kernel to provide valid framebuffer info
+            let fb_info: FrameBufferInfo = unsafe { 
+                (info_buffer.as_ptr() as *const FrameBufferInfo).read()
+            };
+            return Some(fb_info);
+        }
+        None
+    }
+
     pub fn save_frame(&mut self) -> bool {
         let mut buffer = unsafe { core::slice::from_raw_parts_mut(
                             self.base_address as *mut u8, self.buffer_size) };

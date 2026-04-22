@@ -304,14 +304,14 @@ impl BCM2835VideoCore {
         msg[2] = 0x48003;  //set phy wh
         msg[3] = 8;
         msg[4] = 8;
-        msg[5] = 1920;         //FrameBufferInfo.width
-        msg[6] = 1080;          //FrameBufferInfo.height
+        msg[5] = 1280;         //FrameBufferInfo.width
+        msg[6] = 1024;          //FrameBufferInfo.height
 
         msg[7] = 0x48004;  //set virt wh
         msg[8] = 8;
         msg[9] = 8;
-        msg[10] = 1920;        //FrameBufferInfo.virtual_width
-        msg[11] = 1080;         //FrameBufferInfo.virtual_height
+        msg[10] = 1280;        //FrameBufferInfo.virtual_width
+        msg[11] = 1024;         //FrameBufferInfo.virtual_height
 
         msg[12] = 0x48009; //set virt offset
         msg[13] = 8;
@@ -487,8 +487,6 @@ impl BCM2836IntCtl {
 }
 
 pub mod bcm_peripherals {
-    use crate::arch::*;
-    use core::sync::atomic::*;
     // TODO - Shouldn't hardcode these once DT enumeration is ported
     // RPi 3A+ and 3B+
     const BCM_PERIPHERAL_BASE:      usize = 0x3F000000;
@@ -686,7 +684,7 @@ pub mod bcm_peripherals {
         None
     }
 
-    fn pl011uart_putc(c: u8){
+    pub fn pl011uart_putc(c: u8){
 	    // Wait for UART to become ready to transmit.
 	    loop {
             if read_register(BCMRegister::Uart0FR) & 0x20 == 0 {

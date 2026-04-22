@@ -1,4 +1,4 @@
-/* For now we assume the user-space starts at 8GB virtual */
+/* For aarch64, the user-space programs are mapped from 0xFFFFFFF000000000 */
 _USERSPACE_START = 0xFFFFFFF000000000 + SIZEOF_HEADERS;
 
 ENTRY(_start)

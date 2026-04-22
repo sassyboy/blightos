@@ -15,19 +15,30 @@ include src/arch/$(ARCH)/include.mk
 RC=cargo build -Zbuild-std=core,alloc
 
 ifeq ($(findstring all,$(DEBUG)),all)
-	FEATURES+=debug_arch,debug_pmm,debug_heap,debug_ahci,debug_pci,debug_ahci,debug_kern
+	FEATURES+=debug_kern,debug_arch,debug_systimer,debug_mmu,debug_pmm,\
+			debug_heap,debug_virt,debug_sched,debug_pci,debug_ahci,debug_emmc,\
+			debug_ihda,debug_gui
 else
+	ifeq ($(findstring kern,$(DEBUG)),kern)
+		FEATURES+=debug_kern,
+	endif
 	ifeq ($(findstring arch,$(DEBUG)),arch)
 		FEATURES+=debug_arch,
 	endif
-	ifeq ($(findstring kern,$(DEBUG)),kern)
-		FEATURES+=debug_kern,
+	ifeq ($(findstring systimer,$(DEBUG)),systimer)
+		FEATURES+=debug_systimer,
+	endif
+	ifeq ($(findstring mmu,$(DEBUG)),mmu)
+		FEATURES+=debug_mmu,
 	endif
 	ifeq ($(findstring pmm,$(DEBUG)),pmm)
 		FEATURES+=debug_pmm,
 	endif
 	ifeq ($(findstring heap,$(DEBUG)),heap)
 		FEATURES+=debug_heap,
+	endif
+	ifeq ($(findstring virt,$(DEBUG)),virt)
+		FEATURES+=debug_virt,
 	endif
 	ifeq ($(findstring sched,$(DEBUG)),sched)
 		FEATURES+=debug_sched,
@@ -37,6 +48,15 @@ else
 	endif
 	ifeq ($(findstring ahci,$(DEBUG)),ahci)
 		FEATURES+=debug_ahci,
+	endif
+	ifeq ($(findstring emmc,$(DEBUG)),emmc)
+		FEATURES+=debug_emmc,
+	endif
+	ifeq ($(findstring ihda,$(DEBUG)),ihda)
+		FEATURES+=debug_ihda,
+	endif
+	ifeq ($(findstring gui,$(DEBUG)),gui)
+		FEATURES+=debug_gui,
 	endif
 endif
 
@@ -74,11 +94,12 @@ KERN_RST_SRC= \
 		src/fs/mod.rs \
 		src/fs/gpt.rs \
 		src/fs/fat/mod.rs \
-		src/drivers/mod.rs \
+		src/drivers/gui.rs \
 		src/drivers/machine.rs \
+		src/drivers/mod.rs \
 		src/drivers/pci.rs \
 		src/drivers/input/mod.rs \
-		src/drivers/input/i8046.rs \
+		src/drivers/input/i8042.rs \
 		src/drivers/input/uartkbd.rs \
 		src/drivers/storage/mod.rs \
 		src/drivers/storage/ahci.rs \

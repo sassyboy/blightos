@@ -85,8 +85,10 @@ impl MMUMapping {
                                     Self::PAGE_SIZE;
 
     // Virtual memory address range that can be mapped via calls to map_pages
-    pub const MIN_VIRTUAL_USER: u64 = 0xFFFF_FFF0_0000_0000;
-    pub const MAX_VIRTUAL:      u64 = 0xFFFF_FFFF_FFFF_0000 - 1;
+    pub const MIN_VIRTUAL_USER: u64 = 0xFFFF_FFF0_0000_0000; // The last 64 GBs
+    pub const MAX_USTACK_VIRTUAL:u64= 0xFFFF_FFFE_FFFF_FFFF;
+    pub const MIN_DPOOL_VIRTUAL: u64= 0xFFFF_FFFF_0000_0000; // dmap: last 4-GB
+    pub const MAX_VIRTUAL:      u64 = 0xFFFF_FFFF_FFFF_FFFF;
     pub const PAGE_SIZE:        usize = 0x1000;         // Only 4KB pages
     const PAGE_BASE_MASK:       u64 = 0xFFFF_FFFF_FFFF_F000;
     // Paging Structure Entry Definitions
@@ -357,7 +359,7 @@ impl MMUTrait for MMUMapping {
                 in(reg)sys_ctrl
             );
         }
-        dbg!("CPU{} SCTRL_EL1: {:X}\n", cpu_id(), sys_ctrl);
+        dbg!("CPU{} SCTRL_EL1: {:X}\n", crate::arch::cpu_id(), sys_ctrl);
     }
 
     //
@@ -536,6 +538,35 @@ impl MMUTrait for MMUMapping {
         true
     }
 
+    fn dmap_pages(&mut self, phys_addrs: &[usize]) -> Option<usize> {
+        let num_pages = phys_addrs.len();
+        // Find num_pages that aren't mapped starting from MIN_DPOOL_VIRTUAL
+        // to MAX_VIRTUAL
+        let mut vaddr_start = Self::MIN_DPOOL_VIRTUAL as usize;
+        while vaddr_start < Self::MAX_VIRTUAL as usize {
+            let mut found = true;
+            for w in 0..num_pages {
+                let vaddr = vaddr_start as usize + w * Self::PAGE_SIZE;
+                if !self.virt_to_phys_from_map(vaddr).is_none() {
+                    // Alread mapped => skip it
+                    found = false;
+                    break;
+                }
+            }
+            if found {
+                if !self.map_pages(vaddr_start, phys_addrs, true, false, 
+                                                        MemoryType::Normal){
+                    klog!("BUG - map_pages failed in usmap_pages.");
+                    return None;
+                }
+                return Some(vaddr_start);
+            }
+            vaddr_start += Self::PAGE_SIZE;
+        }
+        //
+        None
+    }
+
     ///
     /// Unmaps the given virtual address and returns the physical address of the
     /// page that was unmapped. The caller is expected to free the physical page
@@ -676,10 +707,8 @@ impl MMUTrait for MMUMapping {
         }
     }
 
-    /// Finds the physical address that is mapped to the given virtual address
-    /// by walking the paging structures of the given address space.
-    /// Returns None if the virtual address is not mapped.
-    fn virt_to_phys(&self, virt_addr: usize) -> Option<usize> {
+    /// virtual->physical address translation for self
+    fn virt_to_phys_from_map(&self, virt_addr: usize) -> Option<usize> {
         let vaddr_upper = virt_addr - Self::MIN_VIRTUAL_USER as usize;
         let l1e_i = (vaddr_upper >> 30) & 0x1FF; // Index in PDPT[0]
         let l2e_i = (vaddr_upper >> 21) & 0x1FF; // Index in PD
@@ -705,10 +734,47 @@ impl MMUTrait for MMUMapping {
                                                 
         Some((pg_entry & Self::PGENT_PHYS_ADDR_MASK) as usize)
     }
+
+    /// virtual->physical address translation for the caller's address-space
+    fn virt_to_phys(virt_addr: usize) -> Option<usize> {
+        let ttbr: u64;
+        let vaddr_base;
+        if virt_addr < Self::MIN_VIRTUAL_USER as usize {
+            unsafe { asm!("mrs {0}, TTBR0_EL1", out(reg)ttbr); }
+            vaddr_base = virt_addr;
+        } else {
+            unsafe { asm!("mrs {0}, TTBR1_EL1", out(reg)ttbr); }
+            vaddr_base = virt_addr - Self::MIN_VIRTUAL_USER as usize;
+        }
+        let l1e_i = (vaddr_base >> 30) & 0x1FF; // Index in PDPT[0]
+        let l2e_i = (vaddr_base >> 21) & 0x1FF; // Index in PD
+        let l3e_i = (vaddr_base >> 12) & 0x1FF; // Index in PT
+
+        if ttbr == 0 {
+            return None;
+        }
+        let l2_base = Self::read_table_entry(ttbr as usize, l1e_i)
+                                                & Self::PGENT_PHYS_ADDR_MASK;
+        if l2_base == 0 {
+            return None;
+        }
+        let l3_base = Self::read_table_entry(l2_base as usize, l2e_i)
+                                                & Self::PGENT_PHYS_ADDR_MASK;
+        if l3_base == 0 {
+            return None;
+        }
+        let pg_entry = Self::read_table_entry(l3_base as usize, l3e_i);
+        if pg_entry & Self::PGENT_PG_DESC == 0 {
+            return None;
+        }
+                                                
+        Some((pg_entry & Self::PGENT_PHYS_ADDR_MASK) as usize)
+    }
 }
 
 impl Drop for MMUMapping {
     fn drop(&mut self) {
+        let mut _sh_cnt = 0;
         let mut _pg_cnt = 0;
         let mut _pg_st_count = 0;
         // Free the level-3 tables
@@ -730,8 +796,16 @@ impl Drop for MMUMapping {
                     if l3e & Self::PGENT_PG_DESC == 0 {
                         continue;
                     }
-                    _pg_cnt += 1;
-                    PhysMem::free((l3e & Self::PGENT_PHYS_ADDR_MASK) as usize);
+                    // Only free private memory (non dmap)
+                    let vaddr =  ((l1e_i << 30) | (l2e_i << 21) | (l3e_i << 12))
+                                            + Self::MIN_VIRTUAL_USER as usize;
+                    if vaddr < Self::MIN_DPOOL_VIRTUAL as usize {
+                        _pg_cnt += 1;
+                        PhysMem::free((l3e & Self::PGENT_PHYS_ADDR_MASK) as usize);
+                    } else {
+                        _sh_cnt += 1;
+                    }
+                    
                 }
                 _pg_st_count += 1;
                 PhysMem::free(l3_tbl_base as usize);
@@ -742,8 +816,8 @@ impl Drop for MMUMapping {
         _pg_st_count += 1;
         PhysMem::free(self.ttbr1 as usize);
         dbg!("Released {} user frames and {} paging structure frames - \
-              Free frames: {}\n", _pg_cnt, _pg_st_count,
-              PhysMem::free_frame_count());
+              Free frames: {}\n{} shared pages unmapped but not freed.\n",
+              _pg_cnt, _pg_st_count,PhysMem::free_frame_count(), _sh_cnt);
         // Invalidate local TLB to make sure no stale entries are lef
         unsafe {
             asm!(

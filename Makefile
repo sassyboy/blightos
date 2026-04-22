@@ -6,7 +6,8 @@ KERN_BIN=$(BUILDDIR)kernel.bin
 GRUB_CFG=$(BUILDDIR)grub.cfg
 BOOT_IMG=$(BUILDDIR)boot.img
 DISK_IMG=$(BUILDDIR)disk.img
-USER_PROGS=	$(BUILDDIR)shell.box \
+USER_PROGS=	$(BUILDDIR)uinit.box \
+            $(BUILDDIR)shell.box \
 			$(BUILDDIR)test.box \
 			$(BUILDDIR)fileman.box \
 			$(BUILDDIR)tetris.box

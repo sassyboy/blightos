@@ -16,6 +16,7 @@ RTLIB_RS_SRC= \
 		../rtlib/src/graphics/framebuffer.rs \
 		../rtlib/src/graphics/png.rs \
 		../rtlib/src/gui/button.rs \
+		../rtlib/src/gui/imagebox.rs \
 		../rtlib/src/gui/label.rs \
 		../rtlib/src/gui/list.rs \
 		../rtlib/src/gui/menu.rs \

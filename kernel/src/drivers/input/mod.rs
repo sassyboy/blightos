@@ -8,15 +8,195 @@ use core::sync::atomic::AtomicU8;
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::AtomicBool;
 use alloc::string::String;
+use alloc::format;
 use crate::fs::{DirectoryEntry, FileOperation, MountPoint};
 use alloc::vec::Vec;
 use crate::sched::WaitChannel;
 use crate::util::*;
 
 #[cfg(target_arch = "x86_64")]
-pub mod i8046;
+pub mod i8042;
 #[cfg(target_arch = "aarch64")]
 pub mod uartkbd;
+
+
+//
+// Mouse Interface
+//
+pub struct Mouse {
+    cur_x:      u32,
+    cur_y:      u32,
+    max_x:      u32,
+    max_y:      u32,
+    xdiv:       i32,
+    ydiv:       i32,
+    btns_sts:   u8,
+    initialized:bool, // Set true when the first Mouse driver registers
+    events:     Vec<(u32, u32, u32, u16)>, //x, y, z, button mask
+    irq_cb:     Option<fn()> // For kernel's gui only
+}
+
+static MOUSE: Spinlock<Mouse> = Spinlock::new(Mouse::new());
+impl Mouse {
+    pub const BTN_LEFT:     u8 = 0x1;
+    pub const BTN_RIGHT:    u8 = 0x2;
+    pub const BTN_MIDDLE:   u8 = 0x4;
+    
+    pub const fn new() -> Self {
+        Self {
+            cur_x:      0,
+            cur_y:      0,
+            max_x:      1000,
+            max_y:      1000,
+            xdiv:       1,  //Normal direction: Left=Lower,Right=Higher
+            ydiv:       -1, //Reverse direction: Up=lower, Down=higher
+            btns_sts:   0,
+            initialized:false,
+            events:     Vec::new(),
+            irq_cb:     None
+        }
+    }
+
+    pub fn register_mouse() {
+        let mut mouse = MOUSE.lock();
+        if !mouse.initialized {
+            // Register the mount-point
+            let mnt_obj = MountPoint {
+                name:       String::from("mouse"),
+                fops:       Self::fops_handler
+            };
+            if !MountPoint::mount(mnt_obj) {
+                klog!("Failed to mount mouse:/");
+                return;
+            }
+            mouse.initialized = true;
+        }
+    }
+
+    pub fn reset_coordinates(cur_x: u32, cur_y: u32, max_x: u32, max_y: u32) {
+        let mut mouse = MOUSE.lock();
+        mouse.cur_x = cur_x;
+        mouse.cur_y = cur_y;
+        mouse.max_x = max_x;
+        mouse.max_y = max_y;
+    }
+
+    pub fn set_irq_callback(cb: fn()) {
+        let mut mouse = MOUSE.lock();
+        mouse.irq_cb = Some(cb);
+    }
+
+    pub fn current_position() -> (u32, u32) {
+        let mouse = MOUSE.lock();
+        let x = mouse.cur_x;
+        let y = mouse.cur_y;
+        (x, y)
+    }
+
+    pub fn push(delta_x: i16, delta_y: i16, btn_mask: u8) {
+        let mut mouse = MOUSE.lock();
+        mouse.btns_sts = btn_mask;
+        let new_x = mouse.cur_x as i32 + (delta_x as i32)/mouse.xdiv;
+        let new_y = mouse.cur_y as i32 + (delta_y as i32)/mouse.ydiv;
+        // Clip the absolute values
+        if new_x >= 0 && new_x < mouse.max_x as i32 {
+            mouse.cur_x = new_x as u32;
+        } else if new_x < 0 {
+            mouse.cur_x = 0;
+        } else {
+            mouse.cur_x = mouse.max_x;
+        }
+        if new_y >= 0 && new_y < mouse.max_y as i32{
+            mouse.cur_y = new_y as u32;
+        } else if new_y < 0 {
+            mouse.cur_y = 0;
+        } else {
+            mouse.cur_y = mouse.max_y;
+        }
+        let event = (
+            mouse.cur_x as u32,
+            mouse.cur_y as u32,
+            0,
+            mouse.btns_sts as u16);
+        mouse.events.push(event);
+        if let Some(callback) = mouse.irq_cb {
+            drop(mouse); // unlock!
+            callback();
+        }
+    }
+
+    //
+    // VFS Interface
+    //
+    const MOUSE_ROOT_HND: usize = 0;
+    // Special handle that receives all mouse events regardless of the
+    // device in case we want to support multiple mouse devices in the future
+    const MOUSE_ALL_HND:  usize = 1; 
+    const MOUSE_BUFF_SIZE:usize = 1024;
+
+    fn fops_handler(op: FileOperation) -> Result<usize, Error> {
+        match op {
+            FileOperation::Open { full_path, mode: _, dent } => {
+                let mpath = MountPoint::device_relative_path(full_path);
+                if mpath.eq("/") {
+                    dent.name = String::from("");
+                    dent.size = 0;
+                    dent.flags = DirectoryEntry::DEV_RX_DIR_FLAGS;
+                    return Ok(Self::MOUSE_ROOT_HND);
+                } else if mpath.eq("/all") {
+                    dent.name = String::from("all");
+                    dent.size = Self::MOUSE_BUFF_SIZE;
+                    dent.flags = DirectoryEntry::DEV_RX_FILE_FLAGS;
+                    return Ok(Self::MOUSE_ALL_HND);
+                } else {
+                    return Err(error!(ErrorCode::InvalidPath));
+                }
+            },
+            FileOperation::Enum { hnd, out } => {
+                if hnd != Self::MOUSE_ROOT_HND {
+                    // Only the root (kbd:/) provides a list
+                    return Err(error!(ErrorCode::InvalidOp));
+                }
+                // List the keyboard devices
+                out.push(
+                    DirectoryEntry {
+                    name: String::from("all"),
+                    size: Self::MOUSE_BUFF_SIZE,
+                    flags: DirectoryEntry::DEV_R_FILE_FLAGS
+                });
+                Ok(out.len())
+            }
+            FileOperation::Close { hnd: _ } => {
+                return Ok(0);
+            },
+            FileOperation::Read { hnd, off: _, buff} => {
+                if hnd != Self::MOUSE_ALL_HND {
+                    return Err(error!(ErrorCode::InvalidHandle));
+                }
+                let mut mouse = MOUSE.lock();
+                let mut bytes_written = 0;
+                while bytes_written < buff.len() && !mouse.events.is_empty() {
+                    let event = mouse.events.remove(0);
+                    let dat = format!("{:X},{:X},{:X},{:X}\n",
+                        event.0, event.1, event.2, event.3);
+                    if buff.len() - bytes_written >= dat.len() {
+                        for i in 0..dat.len() {
+                            buff[bytes_written] =  dat.as_bytes()[i];
+                            bytes_written += 1;
+                        }
+                    }
+                }
+                return Ok(bytes_written);
+            },
+            FileOperation::Exec { hnd: _, func: _, buff: _ } => {
+                return Err(error!(ErrorCode::InvalidOp));
+            },
+            FileOperation::Write { hnd: _, off: _, buff: _ } => {
+                return Err(error!(ErrorCode::InvalidOp));
+            }
+        }
+    }
+}
 
 //
 // Keyboard Interface
@@ -107,12 +287,6 @@ impl Keyboard {
             KeyboardEvent::KeyPressed           =>  {KBD_WC_PRESS.wait();}
             KeyboardEvent::KeyReleased          =>  {KBD_WC_RELE.wait();}
         } 
-    }
-    
-    pub fn pop_keycode() -> u8 {
-        let ret = KBD_LAST_KEYCODE.load(Relaxed);
-        KBD_LAST_KEYCODE.store(0, Relaxed);
-        return ret;
     }
 
     pub fn pop_ascii() -> u8 {

@@ -15,6 +15,12 @@ use alloc::vec::Vec;
 
 #[no_mangle]
 fn main() {
+    let args = env::args();
+    if args.len() > 0{
+        if args[0].eq("cls") {
+            stdio_clear_screen();
+        }
+    }
     println!("BlightOS Shell (Ver:{:.2}).", 1.0);
     print_system_resources();
     let Ok(bin_path) = current_dir() else {

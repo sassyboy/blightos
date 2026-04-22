@@ -279,3 +279,73 @@ impl KeyboardEvent {
         self.modifiers & Self::MODIFIER_SHIFT != 0
     }
 }
+
+
+pub struct MouseEvent {
+    pub x:          u32,
+    pub y:          u32,
+    pub z:          u32,
+    pub left_btn:   bool,
+    pub right_btn:  bool,
+    pub middle_btn: bool
+}
+pub struct Mouse {
+    mouse_file:     File,
+}
+impl Mouse {
+    pub const fn new() -> Self {
+        Self {
+            mouse_file: File::new(),
+        }
+    }
+
+    pub fn start_listening(&mut self) -> Result<(), Exception> {
+        if self.mouse_file.is_open() {
+            // Already listening
+            return Ok(());
+        }
+        let path = Path::from("mouse:/all");
+        self.mouse_file.open(&path, File::MODE_READ | File::MODE_STREAM)?;
+        Ok(())
+    }
+
+    pub fn stop_listening(&mut self) {
+        self.mouse_file.close();
+    }
+
+    pub fn fetch_events(&mut self) -> Vec<MouseEvent> {
+        let mut events = Vec::new();
+        // Read the first byte of the keycode
+        let mut buf = [0u8; 512];
+        let mut len: usize = 0;
+        if self.mouse_file.is_open() {
+            if let Ok(l) = self.mouse_file.read(&mut buf) {
+                len = l;
+            } else {
+                // Error reading from the mouse file
+                println!("E1");
+                len = 0;
+            }
+        }
+        let Ok(str_events) = str::from_utf8(&buf[0..len]) else {
+            return events;
+        };
+        for strev in str_events.split("\n") {
+            let fields: Vec<&str> = strev.split(",").collect();
+            if fields.len() != 4 {
+                continue;
+            }
+            let Ok(x) = u32::from_str_radix(fields[0], 16) else {continue};
+            let Ok(y) = u32::from_str_radix(fields[1], 16) else {continue};
+            let Ok(z) = u32::from_str_radix(fields[2], 16) else {continue};
+            let Ok(b) = u32::from_str_radix(fields[3], 16) else {continue};
+            events.push(MouseEvent {
+                x, y, z,
+                left_btn: b & 0x1 > 0,
+                right_btn: b & 0x2 > 0,
+                middle_btn: b & 0x4 > 0 
+            });
+        }
+        events
+    }
+}

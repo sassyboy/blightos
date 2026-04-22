@@ -50,12 +50,12 @@ pub trait MMUTrait {
     fn per_cpu_init();
 
     //
-    // Kernel Dynamic Mapping Methods
+    // Kernel Dynamic Mapping (kmap) Methods
     //
 
     /// Finds a virtual address range in the kmap pool, and maps the physical
     /// frames specified by `phys_base` and `frame_cnt` to that virtual address
-    /// range with the appropriate flags for the given `cache` type
+    /// range with the appropriate flags for the given `cache` type.
     /// 
     /// If successful, it returns the base virtual address of the mapped range.
     /// The resulting mapping is continuous both in virtual and physical memory.
@@ -64,8 +64,11 @@ pub trait MMUTrait {
 
     /// Unmaps the virtual address range starting at `virt_base` and covering
     /// `frame_cnt` frames in the kmap area, and makes it available for future
-    /// mapping requests. The caller is responsible for ensuring that the
-    /// given virtual address range is valid and currently mapped
+    /// mapping requests.
+    /// The caller is responsible for ensuring that the given virtual address
+    /// range is valid and currently mapped in the kmap pool.
+    /// The corresponding physical memory must be explicitly freed as it can be
+    /// shared among multiple address-spaces.
     fn kunmap(virt_base: usize, frame_cnt: usize);
 
     //
@@ -78,7 +81,9 @@ pub trait MMUTrait {
     fn init(&mut self);
 
     /// Maps a number of pages (virtual address starting from `virt_addr`) to
-    /// frames (physical address) for a user-space process.
+    /// frames (physical address) for a user-space process' private use, e.g.,
+    /// code, data, stack, heap. Since the physical frames are dedicated to
+    /// the address-space, they will be freed once the address-space is dropped.
     /// 
     /// The caller must have already reserved a number of frames from the
     /// physical memory manager and left their addresses in `phys_addrs`.
@@ -88,12 +93,28 @@ pub trait MMUTrait {
     /// unmapped. If the virtual address is already mapped, the function
     /// returns false without rolling back any partial changes to the
     /// address space.
+    /// 
     fn map_pages(&mut self, virt_addr: usize, phys_addrs: &[usize],
                      writeable: bool, exec: bool, cache: MemoryType) -> bool;
+
+    /// Maps a number of physical frames into the process' dynamic mapping pool
+    /// (dmap) that are virtually contiguous and returns the first virual
+    /// address. The dmap range is *not* inteded for process' private use.
+    /// This is useful for sharing physical memory between the kernel and
+    /// a number of user-space programs, e.g., for IPC, SHM, etc.
+    /// 
+    /// Unlike map_pages:
+    /// 1) The caller doesn't have to know what virtual memory range is
+    ///    available for mapping.
+    /// 2) The underlying physical memory will *not* be freed when the address-
+    ///    space is dropped, and must be explicitly freed when no longer needed.
+    /// 
+    fn dmap_pages(&mut self, phys_addrs: &[usize]) -> Option<usize>;
     
     /// Unmaps the page starting at `virt_addr` and makes it available for
-    /// future mapping requests. The caller is expected to free the physical
-    /// frame after unmapping.
+    /// future mapping requests.
+    /// The caller is expected to free the physical frame after unmapping if
+    /// the page wasn't private to the address-space.
     /// Returns the physical address of the unmapped page if successful, or
     /// None
     fn unmap_page(&mut self, virt_addr: usize) -> Option<usize>;
@@ -136,9 +157,13 @@ pub trait MMUTrait {
     fn flush_tlb_for_page(virt_addr: usize);
 
     /// Finds the physical address that is mapped to the given virtual address
-    /// by walking the paging structures of the given address space.
+    /// by walking the paging structures of the *caller's address-space*.
     /// Returns None if the virtual address is not mapped.
-    fn virt_to_phys(&self, virt_addr: usize) -> Option<usize>;
+    fn virt_to_phys(virt_addr: usize) -> Option<usize>;
+    /// Finds the physical address that is mapped to the given virtual address
+    /// by walking the paging structures of the address-space object.
+    /// Returns None if the virtual address is not mapped.
+    fn virt_to_phys_from_map(&self, virt_addr: usize) -> Option<usize>;
 }
 //
 // IRQ/SYSCALL Interface

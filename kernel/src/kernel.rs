@@ -242,9 +242,9 @@ fn kinit_task(_arg: usize) {
     // klog!("calling test::kself_test\n");
     // test::kself_test();
 
-    // Find the initial binary (disk%d.0:/blightos/shell.box) to load
+    // Find the initial binary (disk%d.0:/blightos/uinit.box) to load
     for d in 0..ndisks {
-        let path = format!("disk{}.0:/blightos/shell.box", d);
+        let path = format!("disk{}.0:/blightos/uinit.box", d);
         // Open & parse the ELF file if exists
         let Ok(elf) = ELFBinary::from_path(path.as_str()) else {
             continue;
@@ -266,16 +266,20 @@ fn kinit_task(_arg: usize) {
                     path.as_str(), e);
             continue;
         };
-        dbg!("  {}({}) is launching the INIT process ({}) - Free frames: {}\n",
-                        Task::name(), Task::current_tid(), pid,
-                        PhysMem::free_frame_count());
+        klog!("Physical Memory:\n\
+               Total: {} Frames, {:.3} MB\n\
+               Free : {} Frames, {:.3} MB",
+                PhysMem::total_frame_count(),
+                PhysMem::total_memory() as f64 / 0x100000 as f64,
+                PhysMem::free_frame_count(),
+                PhysMem::free_memory() as f64 / 0x100000 as f64);
         Keyboard::clear_buffer();
         let _ = AddressSpace::launch_elf(pid, elf).unwrap_or_else(|e| {
             klog!("  Failed to launch the INIT process due to {:?}\n", e);
         });
         panic!("Unreachable end of kinit_task!");
     }
-    panic!("/blightos/shell.box not found on any supported disk partition!");
+    panic!("/blightos/uinit.box not found on any supported disk partition!");
     
 }
 
@@ -312,13 +316,13 @@ pub enum SyscallRsvdFDs {
 
 pub type SyscallHandlerFn = fn(usize, usize, usize, usize);
 
-fn copy_to_user<T>(dst_ptr: usize, ret_val: T) {
+pub fn copy_to_user<T>(dst_ptr: usize, ret_val: T) {
     if dst_ptr != 0 {
         unsafe {(dst_ptr as *mut T).write(ret_val);}
     }
 }
 
-fn copy_from_user<T>(src_ptr: usize) -> Option<T> {
+pub fn copy_from_user<T>(src_ptr: usize) -> Option<T> {
     if src_ptr == 0 {
         None
     } else {
@@ -369,12 +373,13 @@ struct UserTaskLaunchInfo {
 }
 
 fn kuser_task_launcher(args: usize) {
-    let info = unsafe { &*(args as *const Box<UserTaskLaunchInfo>) };
+    let info = unsafe { Box::from_raw(args as *mut UserTaskLaunchInfo) };
     let pid = info.target_pid;
     let func = info.func_ptr;
     let farg = info.func_arg;
     dbg!("kuser_task_launcher: PID={}, func={:p}, arg={}\n",
             info.target_pid, info.func_ptr, info.func_arg);
+    drop(info);
     // Box will be dropped here
     if let Err(e) = AddressSpace::move_to_process(pid, func, farg) {
         klog!("move_to_process(PID={}) failed  due to {:?}\n", pid, e);
@@ -446,7 +451,7 @@ fn syscall_task_control(opcode: usize, args: usize, ret_ptr: usize, _: usize) {
                     target_pid: Task::current_pid()
                 });
                 let new_tid = Task::spawn_named(kuser_task_launcher, 
-                        &launch_args as *const Box<UserTaskLaunchInfo> as usize,
+                        Box::into_raw(launch_args) as usize,
                         name_str.to_string());
                 if new_tid != 0{
                     info.tid = new_tid;

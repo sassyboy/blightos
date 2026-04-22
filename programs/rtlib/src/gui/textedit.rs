@@ -62,7 +62,7 @@ impl TextEdit {
         (self.cursor_line, self.cursor_col)
     }
     
-    fn calc_num_visible_lines(&self, theme: &Theme) -> usize {
+    fn calc_num_visible_lines(&self, theme: &Theme) -> u32 {
         let char_height = theme.regular_font.char_height(b' ');
         let line_spacing = theme.regular_font.line_spacing;
         (self.pos.height - 4) / (char_height + line_spacing)
@@ -193,8 +193,8 @@ impl TextEdit {
         }
     }
     fn draw_cursor(&self, gctx: &mut GraphicalContext, theme: &Theme,
-                    cur_line: usize, char_left: usize, char_top: usize,
-                                            char_height: usize, trect: &Rect) {
+                    cur_line: usize, char_left: u32, char_top: u32,
+                                            char_height: u32, trect: &Rect) {
         if self.is_focused() && cur_line == self.cursor_line {
             let mut color = theme.accent;
             color.3 = 180; // Make the cursor semi-transparent
@@ -227,7 +227,7 @@ impl Widget for TextEdit {
     }
 
     fn render(&mut self, gctx: &mut GraphicalContext, theme: &Theme, canvas: &Rect){
-        let border_width = theme.border_width as usize;
+        let border_width = theme.border_width as u32;
         // Translate the text edit's position to be relative to gctx's coordinate
         // space based on the canvas given by the container widget (e.g. Window)
         let wrect = self.pos.translate(canvas);
@@ -238,7 +238,7 @@ impl Widget for TextEdit {
         // The area where the text will be rendered depends on whether line
         // numbers are enabled.
         let trect = if self.line_numbers {
-            let digits = self.text.len().ilog10() as usize + 1;
+            let digits = self.text.len().ilog10() as u32 + 1;
             let margin_width = theme.regular_font.char_width(b'0') * (digits+1);
             let lno_rect = Rect {
                 left: wrect.left + border_width,
@@ -283,7 +283,7 @@ impl Widget for TextEdit {
                                     theme.border.2 / 2,
                                     theme.border.3);
             }
-            gctx.draw_rect_3d(&wrect, border_width as u32, true, 
+            gctx.draw_rect_3d(&wrect, border_width as u8, true, 
                             light_edge_color, dark_edge_color, canvas);
         }
 
@@ -300,7 +300,7 @@ impl Widget for TextEdit {
         let lspace = theme.regular_font.line_spacing;
         let mut char_top = trect.top + lspace;
         let char_height = theme.regular_font.char_height(b' ');
-        self.num_visible_lines = self.calc_num_visible_lines(theme);
+        self.num_visible_lines = self.calc_num_visible_lines(theme) as usize;
         for (lno,line) in self.text.iter().enumerate() {
             // Only render lines that are within the visible area based on the
             // current scroll position
@@ -348,7 +348,7 @@ impl Widget for TextEdit {
                         char_width = theme.regular_font.char_width(*b) + cspace
                     } else {
                         char_ascii = b' ';
-                        char_width = self.tab_size as usize *
+                        char_width = self.tab_size as u32 *
                         theme.regular_font.char_width(b' ') + cspace
                     };
                     if char_left + char_width < trect.left + trect.width {

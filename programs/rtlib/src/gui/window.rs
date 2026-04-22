@@ -1,9 +1,9 @@
-use core::time::Duration;
-
+#![allow(dead_code)]
 ///
 /// Window Widget
 /// 
 
+use core::time::Duration;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use alloc::string::String;
@@ -35,6 +35,8 @@ pub struct Window {
     focused_widget: Option<usize>,
     //
     active:         bool,
+    winf:           File, // gui:/window returns maps a graphics context for us
+    gctx_base:      usize,
     // Event handling
     state:          WindowState,
     kbd:            Keyboard,
@@ -58,18 +60,63 @@ impl Window {
             pos: Rect::new(0, 0, 0, 0),
             flags: 0,
             gctx: GraphicalContext::new(),
+            gctx_base: 0,
             widgets: Vec::new(),
             focused_widget: None,
             active: true,
+            winf: File::new(),
             state: WindowState::Normal,
             kbd: Keyboard::new(),
             on_key_press: WindowEvent::None
         }
     }
-    pub fn init(&mut self, title: String, pos: Rect) {
+    pub fn init(&mut self, title: String, pos: Rect) -> Result<(), Exception> {
         self.title = title;
         self.pos = pos;
-        self.gctx.init(pos.width, pos.height);
+        self.winf.open(&Path::from("gui:/window"), 
+                        File::MODE_STREAM | File::MODE_RWX)?;
+        self.fwin_set_properties(&mut WindowProperties {
+            flags:  WindowProperties::FLG_HIDDEN,
+            left:   pos.left,
+            top:    pos.top,
+            width:  pos.width,
+            height: pos.height}
+        );
+        self.gctx.init(pos.width, pos.height, self.gctx_base)?;
+        
+        Ok(())
+    }
+
+    /// Sets the properties of the window, and updates the base address of the
+    /// graphic context (returned by the kernel)
+    fn fwin_set_properties(&mut self, props: &mut WindowProperties) {
+        const WIN_FUNC_SET: usize = 0x1;
+        let gc_base = self.winf.exec(WIN_FUNC_SET, props.as_u8_slice_mut())
+                                            .expect("BUG in WIN_FUNC_SET");
+        self.gctx_base = gc_base;
+    }
+
+    fn fwin_get_properties(&self) -> WindowProperties {
+        const WIN_FUNC_GET: usize = 0x2;
+        let mut buff = [0u8; size_of::<WindowProperties>()];
+        let _ = self.winf.exec(WIN_FUNC_GET, &mut buff)
+                                        .expect("BUG in WIN_FUNC_GET");
+        WindowProperties {
+            flags: 0,
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0
+        }
+    }
+
+    // Sends an Update command to the GUI driver which results in a redraw of
+    // our graphics context
+    fn fwin_update(&mut self) {
+        const WIN_FUNC_UPDATE: usize = 0x3;
+        let mut buff = [0u8, 1]; // TODO: can pass a rect for partial updates
+        let _ = self.winf.exec(WIN_FUNC_UPDATE, &mut buff)
+                                        .expect("BUG in WIN_FUNC_GET");
     }
 
     pub fn get_title(&self) -> &str {
@@ -77,6 +124,10 @@ impl Window {
     }
     pub fn set_title(&mut self, title: String) {
         self.title = title;
+    }
+
+    pub fn set_borderless(&mut self, borderless: bool) {
+        self.flags |= if borderless {Self::FLAGS_BORDERLESS} else {0};
     }
 
     pub fn get_flags(&self) -> u32 {
@@ -155,6 +206,10 @@ impl Window {
         self.state = WindowState::Closing;
     }
 
+    pub fn set_active(&mut self, active: bool) {
+        self.active = active;
+    }
+
     /// Prepares the window to receive input from any attached keyboard and
     /// mouse, brings the window to focus, and renders the window.
     pub fn show(&mut self, event_loop: fn(&mut Window)->bool) {
@@ -193,57 +248,66 @@ impl Window {
             width: self.pos.width,
             height: self.pos.height,
         };
-        // Render the window background and border
+        let widgets_canvas; // Depends on border, title bar, and menu bar
+        // Render the window background
         self.gctx.fill_rect(&wrect, self.theme.background, &wrect);
+
         if self.flags & Self::FLAGS_BORDERLESS == 0 {
+            // Render the window's border
             self.gctx.draw_rect(&wrect, self.theme.border_width, 
                                                     self.theme.accent, &wrect);
-        }
-        // Render the title bar``
-        let title_bar_height = 30;
-        let title_bar_rect = Rect {
-            left: 0,
-            top: 0,
-            width: self.pos.width,
-            height: title_bar_height,
-        };
-        let title_text_x = match self.title_align {
-            HorizontalAlignment::Left => 5,
-            HorizontalAlignment::Center => (self.pos.width -
-                self.theme.title_font.text_width(self.title.as_str())) / 2,
-            HorizontalAlignment::Right => self.pos.width -
-                self.theme.title_font.text_width(self.title.as_str()) - 5,
-        };
-        let title_text_y = (title_bar_height -
-                                self.theme.title_font.char_height(b' ')) / 2;
-        let title_text_color;
-        let title_bar_color;
-        if self.active {
-            title_bar_color = self.theme.accent;
-            title_text_color = self.theme.highlight_text;
-        } else {
-            title_bar_color = self.theme.highlight;
-            title_text_color = self.theme.disabled_text;
-        }
-        self.gctx.fill_rect(&title_bar_rect, title_bar_color, &wrect);
-        self.gctx.draw_text(&self.title, &self.theme.title_font,
-                        title_text_color, title_text_x, title_text_y, &wrect);
 
+            // Render the Title Bar
+            let title_bar_height = 30;
+            let title_bar_rect = Rect {
+                left: 0,
+                top: 0,
+                width: self.pos.width,
+                height: title_bar_height,
+            };
+            let title_text_x = match self.title_align {
+                HorizontalAlignment::Left => 5,
+                HorizontalAlignment::Center => (self.pos.width -
+                    self.theme.title_font.text_width(self.title.as_str())) / 2,
+                HorizontalAlignment::Right => self.pos.width -
+                    self.theme.title_font.text_width(self.title.as_str()) - 5,
+            };
+            let title_text_y = (title_bar_height -
+                                self.theme.title_font.char_height(b' ')) / 2;
+            let title_text_color;
+            let title_bar_color;
+            if self.active {
+                title_bar_color = self.theme.accent;
+                title_text_color = self.theme.highlight_text;
+            } else {
+                title_bar_color = self.theme.highlight;
+                title_text_color = self.theme.disabled_text;
+            }
+            self.gctx.fill_rect(&title_bar_rect, title_bar_color, &wrect);
+            self.gctx.draw_text(&self.title, &self.theme.title_font,
+                        title_text_color, title_text_x, title_text_y, &wrect);
+            
+            // Derive the canvas area for the widgets
+            widgets_canvas = Rect {
+                left: 0 + self.theme.border_width as u32,
+                top: title_bar_height,
+                width: self.pos.width - 2 * self.theme.border_width as u32,
+                height: self.pos.height - title_bar_height,
+            };
+        } else {
+            // Borderless window
+            widgets_canvas = wrect.clone();
+        }
+        
         // Render child widgets
-        let widgets_canvas = Rect {
-            left: 0 + self.theme.border_width as usize,
-            top: title_bar_height,
-            width: self.pos.width - 2 * self.theme.border_width as usize,
-            height: self.pos.height - title_bar_height,
-        };
         for widget in self.widgets.iter_mut() {
             if widget.is_visible() {
                 widget.render(&mut self.gctx, &self.theme, &widgets_canvas);
             }
         }
 
-        // Transfer everything to the screen via the graphics context
-        self.gctx.render_to_screen(self.pos.left, self.pos.top);
+        // Transfer everything to the screen via the gui:/window exec call
+        self.fwin_update();
     }
 
     /// The owner task of the window should call this function in a loop to
@@ -267,6 +331,10 @@ impl Window {
         }
 
         redraw_needed
+    }
+
+    pub fn flush_events(&mut self) {
+        let _ = self.kbd.fetch_events();
     }
 
     fn process_keyboard_event(&mut self, key_event: KeyboardEvent) -> bool {
@@ -333,6 +401,37 @@ impl Window {
                     break;
                 }
             }
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Debug)]
+struct WindowProperties {
+    flags:      u64,
+    left:       u32,
+    top:        u32,
+    width:      u32,
+    height:     u32,
+}
+impl WindowProperties {
+    // FLG_DESKTOP: The window cannot be minimized or hid or brought to front
+    //pub const FLG_DESKTOP:          u64 = 0x1;
+    pub const FLG_HIDDEN:           u64 = 0x2;
+    //pub const FLG_MOVEABLE:         u64 = 0x3;
+    //pub const FLG_RESIZABLE:        u64 = 0x4;
+
+    fn as_u8_slice(&self) -> &[u8] {
+        unsafe {
+            ::core::slice::from_raw_parts((self as *const Self) as *const u8,
+                                            ::core::mem::size_of::<Self>())
+        }
+    }
+
+    fn as_u8_slice_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            ::core::slice::from_raw_parts_mut((self as *mut Self) as *mut u8,
+                                            ::core::mem::size_of::<Self>())
         }
     }
 }

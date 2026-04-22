@@ -32,6 +32,8 @@ any combination of components. Available debug options are:
         - No-Execute protection for stack, heap, etc.
         - User-space stack autoscaling (Init: 4KB, Max: 16MB per task)
         - User-space heap resize
+        - Dynamic mapping pool (kmap) for the kernel
+        - Dynamic mapping pool (dmap) for user-space, e.g., for SHM, IPC, etc.
     - Simplified TLSF heap allocator
     - Unix-line Virtual File System
         - `disk#.#:/` for normal file system access using a `disk.partition:` pattern
@@ -43,13 +45,15 @@ any combination of components. Available debug options are:
     - Graphics (minimal fb support + built-in bmp font):
         - x86_64: Basic VESA Graphics
         - Aarch64: Broadcom VideoCore IV (BCM2835)
+        - GUI/Window management mediation support
     - Audio (Intel HDA):
         - Dual buffering for single stream of stereo audio @ 48KHz, 16bps
-    - Basic i8046 PS/2 Keyboard driver
+    - Basic i8042 PS/2 Mouse and Keyboard driver
     - AHCI (SATA) Bus Controller (Read-only)
     - eMMC (SDCard) Controller (Read-only)
     - FAT12/16/32 File System Driver (Read-only)
 - User-space runtime library
+    - Basic Desktop support and GUI components (Window, textedit, button, list, etc.)
     - Basic stdio,fileio and syscall wrappers
     - FF Heap allocator (explicit free-list + coalescing)
     - ZLIB decoder

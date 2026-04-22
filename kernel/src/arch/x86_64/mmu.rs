@@ -33,6 +33,18 @@ macro_rules! dbg{
 ///       Virt 4GB to 8GB ----> Kernel's dynamic mapping area (kmap) for drivers
 ///
 /// USER: Virt 8GB to 256GB---> palloc'ed frames at 4KB granularity
+///       Program Image (from 8GB virt)
+///       Program Heap
+///            |
+///            V
+///            ^
+///            |
+///        User Stack <-- User Task N's
+///            .
+///            .
+///        User Stack <-- Main Tasks (MAX_VIRTUAL_STACK)
+///           dmap    <-- The very last 4GB for User's dynamic mapping
+///            ^      <-- MAX_VIRTUAL
 ///
 /// 4-Level Mapping - Virtual Address bits
 ///     9 bits       9 bits       9 bits         9 bits         12 bits
@@ -85,9 +97,11 @@ impl MMUMapping {
     /// Minimum virtual address that can be used for non-priviledged
     /// (user-space) mappings. The kernel address space will be mapped
     /// from 0x0 to MIN_VIRTUAL_USER
-    pub const MIN_VIRTUAL_USER: u64 = 0x200000000;  // 8 GBs
-    /// Last virtual address that can be mapped.
-    pub const MAX_VIRTUAL:      u64 = (1 << 39) - 1;// 512 GBs - only pml4[0]
+    pub const MIN_VIRTUAL_USER:  u64= 0x200000000;          // @ 8GB
+    pub const MAX_USTACK_VIRTUAL:u64= 0x7F00000000 - 1;     // @ 508GB - 1
+    pub const MIN_DPOOL_VIRTUAL: u64= 0x7F00000000;         // @ 508GB usmap
+    /// Last virtual address that can be mapped (only using PML4[0])
+    pub const MAX_VIRTUAL:      u64 = 0x8000000000 - 1;     // @ 512GB - 1
     pub const PAGE_SIZE:        usize = 0x1000; // Only 4KB pages in this range
     
     pub const fn new() -> Self {
@@ -315,6 +329,7 @@ impl MMUTrait for MMUMapping {
                 pte_addr.add(pe_i).write_volatile(0);
             }
         }
+        Self::flush_tlbs();
     }
 
     //
@@ -450,6 +465,35 @@ impl MMUTrait for MMUMapping {
         }
         self.mapped_pages_count += phys_addrs.len();
         true
+    }
+
+    fn dmap_pages(&mut self, phys_addrs: &[usize]) -> Option<usize> {
+        let num_pages = phys_addrs.len();
+        // Find num_pages that aren't mapped starting from MIN_DPOOL_VIRTUAL
+        // to MAX_VIRTUAL
+        let mut vaddr_start = Self::MIN_DPOOL_VIRTUAL as usize;
+        while vaddr_start < Self::MAX_VIRTUAL as usize {
+            let mut found = true;
+            for w in 0..num_pages {
+                let vaddr = vaddr_start as usize + w * Self::PAGE_SIZE;
+                if !self.virt_to_phys_from_map(vaddr).is_none() {
+                    // Alread mapped => skip it
+                    found = false;
+                    break;
+                }
+            }
+            if found {
+                if !self.map_pages(vaddr_start, phys_addrs, true, false, 
+                                                        MemoryType::Normal){
+                    klog!("BUG - map_pages failed in usmap_pages.");
+                    return None;
+                }
+                return Some(vaddr_start);
+            }
+            vaddr_start += Self::PAGE_SIZE;
+        }
+        //
+        None
     }
 
     ///
@@ -588,15 +632,43 @@ impl MMUTrait for MMUMapping {
         }
     }
 
-    /// Finds the physical address that is mapped to the given virtual address
-    /// by walking the paging structures of the given address space.
-    /// Returns None if the virtual address is not mapped.
-    fn virt_to_phys(&self, virt_addr: usize) -> Option<usize> {
+    /// virtual->physical address translation for self
+    fn virt_to_phys_from_map(&self, virt_addr: usize) -> Option<usize> {
         let pdpt0e_i    = (virt_addr >> 30) & 0x1FF; // Index in PDPT[0]
         let pde_i       = (virt_addr >> 21) & 0x1FF; // Index in PD
         let pte_i       = (virt_addr >> 12) & 0x1FF; // Index in PT
 
         let pdpte = Self::read_table_entry(self.pdpt0_base, pdpt0e_i);
+        if pdpte & Self::PGENT_PRESENT == 0 {
+            return None;
+        }
+        let pd_base = pdpte & Self::PGENT_BASE_MASK;
+        let pde = Self::read_table_entry(pd_base as usize, pde_i);
+        if pde & Self::PGENT_PRESENT == 0 {
+            return None;
+        }
+        let pt_base = pde & Self::PGENT_BASE_MASK;
+        let pte = Self::read_table_entry(pt_base as usize, pte_i);
+        if pte & Self::PGENT_PRESENT == 0 {
+            return None;
+        }
+
+        Some((pte & Self::PGENT_BASE_MASK) as usize)
+    }
+
+    /// virtual->physical address translation for the caller's address-space
+    fn virt_to_phys(virt_addr: usize) -> Option<usize> {
+        let pml4_base: usize;
+        unsafe {
+            asm!("mov {}, cr3", out(reg)pml4_base);
+        }
+        
+        let pdpt0_base  = Self::read_table_entry(pml4_base, 0) 
+                                                    & Self::PGENT_BASE_MASK;
+        let pdpt0e_i    = (virt_addr >> 30) & 0x1FF; // Index in PDPT[0]
+        let pde_i       = (virt_addr >> 21) & 0x1FF; // Index in PD
+        let pte_i       = (virt_addr >> 12) & 0x1FF; // Index in PT
+        let pdpte = Self::read_table_entry(pdpt0_base as usize, pdpt0e_i);
         if pdpte & Self::PGENT_PRESENT == 0 {
             return None;
         }
@@ -635,10 +707,19 @@ impl Drop for MMUMapping {
                         for pte_i in 0..512 {
                             let pte = Self::read_table_entry(pt_base, pte_i);
                             if pte & Self::PGENT_PRESENT > 0 {
-                                // Release the physical frame itself too
-                                _pg_count += 1;
-                                let addr = pte & Self::PGENT_BASE_MASK;
-                                PhysMem::free(addr as usize);
+                                let vaddr = pdpt0e_i << 30 |
+                                            pde_i << 21 | pte_i << 12;
+                                // Only free the physical frames private to the
+                                // user address space!
+                                // Don't free the kernel frames or dmap frames
+                                if vaddr > Self::MIN_VIRTUAL_USER as usize && 
+                                    vaddr < Self::MIN_DPOOL_VIRTUAL as usize {
+                                    // Release the physical frame itself too
+                                    _pg_count += 1;
+                                    let addr = pte & Self::PGENT_BASE_MASK;
+                                    PhysMem::free(addr as usize);
+                                }
+                                
                             }
                         }
                         // Release the Page Table

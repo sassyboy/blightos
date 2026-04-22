@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "kernel", 
     "programs/rtlib",
+    "programs/uinit",
     "programs/shell",
     "programs/test",
     "programs/fileman",

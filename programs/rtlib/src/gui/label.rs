@@ -9,6 +9,7 @@ pub struct Label {
     text:       String,
     pos:        Rect,
     opaque_bg:  bool,
+    bg_color:   Option<RGBA>
 }
 
 impl Label {
@@ -17,6 +18,7 @@ impl Label {
             text,
             pos,
             opaque_bg,
+            bg_color: None
         }
     }
 
@@ -34,6 +36,9 @@ impl Label {
         let text_height = theme.regular_font.text_height(self.text.as_str());
         self.pos.height = text_height + 4; // Add some padding
     }
+    pub fn set_bg_color(&mut self, color: Option<RGBA>){
+        self.bg_color = color;
+    }
 }
 
 impl Widget for Label {
@@ -50,7 +55,12 @@ impl Widget for Label {
         let wrect = self.pos.translate(canvas);
         // Render the label background
         if self.opaque_bg {
-            gctx.fill_rect(&wrect, theme.background, &wrect);
+            if self.bg_color.is_none() {
+                gctx.fill_rect(&wrect, theme.background, &wrect);
+            } else {
+                gctx.fill_rect(&wrect, self.bg_color.unwrap(), &wrect);
+            }
+            
         }
         // Render the label text
         // Todo: Implement text clipping based on the canvas bounds

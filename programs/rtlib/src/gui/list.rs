@@ -22,9 +22,9 @@ pub struct ListView {
     column_widths:      Vec<u32>,
     row_height:         u32,
     // List view state
-    top_visible_row:    usize,
-    num_visible_rows:   usize,
-    selected_row:       usize,
+    top_visible_row:    u32,
+    num_visible_rows:   u32,
+    selected_row:       u32,
     // Event handling
     on_key_press:       ListViewEvent,
 }
@@ -67,8 +67,9 @@ impl ListView {
     }
 
     pub fn get_selected_item(&self) -> Option<&Vec<String>> {
-        if self.selected_row < self.items.len() && self.items.len() > 0 {
-            Some(&self.items[self.selected_row])
+        let num_items = self.items.len() as u32;
+        if self.selected_row < num_items && num_items > 0 {
+            Some(&self.items[self.selected_row as usize])
         } else {
             None
         }
@@ -91,7 +92,7 @@ impl ListView {
     }
 
     fn move_cursor_down(&mut self) {
-        if self.selected_row + 1 < self.items.len() {
+        if self.selected_row + 1 < self.items.len() as u32 {
             self.selected_row += 1;
             if self.selected_row >= self.top_visible_row + self.num_visible_rows {
                 self.top_visible_row = self.selected_row - self.num_visible_rows + 1;
@@ -153,7 +154,7 @@ impl Widget for ListView {
     }
 
     fn render(&mut self, gctx: &mut GraphicalContext, theme: &Theme, canvas: &Rect){
-        let border_width = theme.border_width as usize;
+        let border_width = theme.border_width as u32;
         // Translate the text edit's position to be relative to gctx's coordinate
         // space based on the canvas given by the container widget (e.g. Window)
         let wrect = self.pos.translate(canvas);
@@ -182,7 +183,7 @@ impl Widget for ListView {
                                     theme.border.2 / 2,
                                     theme.border.3);
             }
-            gctx.draw_rect_3d(&wrect, border_width as u32, true, 
+            gctx.draw_rect_3d(&wrect, theme.border_width, true, 
                             light_edge_color, dark_edge_color, canvas);
         }
 
@@ -193,15 +194,15 @@ impl Widget for ListView {
             let header_rect = Rect {
                 left: x,
                 top: wrect.top + border_width,
-                width: col_width as usize,
-                height: self.row_height as usize,
+                width: col_width,
+                height: self.row_height,
             };
             gctx.fill_rect(&header_rect, theme.background, canvas);
             gctx.draw_rect(&header_rect, 1, theme.border, canvas);
             gctx.draw_text(column.as_str(), &theme.regular_font,
                             theme.highlight_text, header_rect.left + 5, 
                             header_rect.top+ 3, canvas);
-            x += col_width as usize;
+            x += col_width;
         }
 
         //
@@ -209,29 +210,30 @@ impl Widget for ListView {
         //
         let lstrect = Rect {
             left: wrect.left + border_width,
-            top: wrect.top + border_width + self.row_height as usize,
+            top: wrect.top + border_width + self.row_height,
             width: wrect.width - 2 * border_width,
-            height: wrect.height - 2 * border_width - self.row_height as usize,
+            height: wrect.height - 2 * border_width - self.row_height,
         };
-        self.num_visible_rows = (lstrect.height) / (self.row_height as usize);
+        self.num_visible_rows = (lstrect.height) / (self.row_height);
         for i in 0..self.num_visible_rows {
-            let item_index = self.top_visible_row + i;
+            let item_index = (self.top_visible_row + i) as usize;
             if item_index >= self.items.len() {
                 break;
             }
             let item = &self.items[item_index];
             let mut x = lstrect.left;
-            let y = lstrect.top + i * (self.row_height as usize);
+            let y = lstrect.top + i * self.row_height;
             for (j, field) in item.iter().enumerate() {
                 let col_width = self.column_widths[j];
                 let field_rect = Rect {
                     left: x,
                     top: y,
-                    width: col_width as usize,
-                    height: self.row_height as usize,
+                    width: col_width,
+                    height: self.row_height,
                 };
                 // Highligh the selected row if focused
-                if item_index == self.selected_row && self.is_focused() {
+                if item_index == self.selected_row as usize && self.is_focused()
+                {
                     gctx.fill_rect(&field_rect, theme.accent, &lstrect);
                     gctx.draw_text(field.as_str(), &theme.regular_font,
                                 theme.highlight_text, field_rect.left + 5,
@@ -243,7 +245,7 @@ impl Widget for ListView {
 
                 }
                 
-                x += col_width as usize;
+                x += col_width;
             }
         }
     }

@@ -12,12 +12,14 @@ pub mod input;
 pub mod storage;
 pub mod audio;
 pub mod video;
+pub mod gui;
 
 use alloc::{vec, vec::*};
 use crate::arch::{MMUMapping, MMUTrait};
 use crate::mem::MemoryType;
 use crate::drivers::machine::Machine;
 use crate::drivers::video::framebuffer::FrameBuffer;
+use crate::drivers::gui::GUI;
 use crate::mem::phys::PhysMem;
 
 pub struct DriverInfo {
@@ -43,16 +45,22 @@ pub fn get_builtin_drivers() -> Vec<DriverInfo> {
     vec![
         // Common Drivers
         DriverInfo {
-            name: "Machine",
+            name:       "Machine",
             enumerate:  Machine::enumerate,
             post_enum:  Machine::post_enum,
             release:    Machine::release
         },
         DriverInfo {
-            name: "FrameBuffer",
+            name:       "FrameBuffer",
             enumerate:  FrameBuffer::enumerate,
             post_enum:  FrameBuffer::post_enum,
             release:    FrameBuffer::release
+        },
+        DriverInfo {
+            name:       "GUI Server",
+            enumerate:  GUI::enumerate,
+            post_enum:  GUI::post_enum,
+            release:    GUI::release
         },
         // X64-64 only support
         #[cfg(target_arch = "x86_64")]
@@ -65,9 +73,9 @@ pub fn get_builtin_drivers() -> Vec<DriverInfo> {
         #[cfg(target_arch = "x86_64")]
         DriverInfo {
             name: "i8046 PS/2 Controller",
-            enumerate: crate::drivers::input::i8046::I8046Keyboard::enumerate,
+            enumerate: crate::drivers::input::i8042::I8042::enumerate,
             post_enum: noop,
-            release: crate::drivers::input::i8046::I8046Keyboard::release
+            release: crate::drivers::input::i8042::I8042::release
         },
         #[cfg(target_arch = "x86_64")]
         DriverInfo {

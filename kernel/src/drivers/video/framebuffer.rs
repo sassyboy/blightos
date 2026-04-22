@@ -158,7 +158,7 @@ impl FrameBuffer {
         	}
         	if row >= self.height ||
 				col >= self.width {
-            return; // Out of bounds
+            	return; // Out of bounds
         	}
 
         	let pixel_offset = self.dma.virt_addr as usize + 
@@ -232,7 +232,7 @@ impl FrameBuffer {
                 let mpath = MountPoint::device_relative_path(full_path);
                 if mpath.eq("/") {
 					dent.name = String::from("");
-					dent.size = 0; // TODO: return the actual size
+					dent.size = 32;
 					dent.flags = DirectoryEntry::DEV_RWX_DIR_FLAGS;
                     return Ok(Self::DEV_HANDLE_DEFAULT);
                 } else {
@@ -283,13 +283,8 @@ impl FrameBuffer {
 			return Err(error!(ErrorCode::IOError));
 		}
         if hnd == Self::DEV_HANDLE_DEFAULT {
-            let out = format!(
-                "Width : {}\n\
-                 Height: {}\n\
-				 BPP   : {}\n\
-				 Pitch : {}",
-                fb.width, fb.height, fb.bpp, fb.pitch
-            );
+			let out = format!("{} x {}, {}, {}",
+                					fb.width, fb.height, fb.bpp, fb.pitch);
             let len = min(out[off..].len(), buff.len());
             let ptr = out[off..].as_ptr();
             unsafe {

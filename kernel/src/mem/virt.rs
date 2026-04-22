@@ -68,6 +68,7 @@ impl UserTask {
 // Virtual Address Space Layout:
 // Kernel (mapped in all processes):
 // 0                          to MMUMapping::MIN_VIRTUAL -1 (8 GB)
+//
 // User-space (mapped separately for each process):
 // MMUMapping::MIN_VIRTUAL GB to MMUMapping::MAX_VIRTUAL
 //
@@ -76,8 +77,9 @@ impl UserTask {
 // [Heap (grows up)] : heap_base = img_base + img_pages 
 // ...... Gap ...... : heap_base + heap_pages to stack_top
 //                   <-- stack_top, where the next (new) task's stack starts
-// [2nd task's stack]: MMUMapping::MAX_VIRTUA - MAX_USTACK_SIZE
-// [1st task's stack]: MMUMapping::MAX_VIRTUA (grows down)
+// [2nd task's stack]: MMUMapping::MAX_USTACK_VIRTUAL - MAX_USTACK_SIZE
+// [1st task's stack]: MMUMapping::MAX_USTACK_VIRTUAL (grows toward lower addrs)
+// [dynamic map pool]: MMUMapping::MIN_USPOOL_VIRTUAL to MAX_VIRTUAL
 pub struct AddressSpace {
     pid:            usize,
     name:           String, // Name of the process, e.g., shell.box
@@ -117,7 +119,7 @@ impl AddressSpace {
             ep_vaddr:       0,
             heap_pages:     0,
             heap_base:      0,
-            stack_top:      MMUMapping::MAX_VIRTUAL as usize,
+            stack_top:      MMUMapping::MAX_USTACK_VIRTUAL as usize,
             children:       Vec::new(),
             files:          Vec::new(),
         }
@@ -548,6 +550,30 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Maps a range of physical frames to the dynamic mapping pool (dmap) of
+    /// the current process, and returns the base virtual address of the new
+    /// mapping if successful.
+    pub fn dmap(phys_addrs: &[usize]) -> Result<usize, Error> {
+        let mut proc_map = PROCESSES.lock();
+        let Some(proc) = proc_map.get_mut(&Task::current_pid()) else {
+            return Err(error!(ErrorCode::InvalidPID));
+        };
+        if let Some(virt_base) = proc.vmap.dmap_pages(phys_addrs) {
+            return Ok(virt_base);
+        }
+        Err(error!(ErrorCode::OutOfMemory))
+    }
+
+    pub fn dunmap(virt_addr: usize, page_count: usize) -> Result<(), Error> {
+        let mut proc_map = PROCESSES.lock();
+        let Some(proc) = proc_map.get_mut(&Task::current_pid()) else {
+            return Err(error!(ErrorCode::InvalidPID));
+        };
+        if proc.vmap.unmap_pages(virt_addr, page_count) != page_count {
+            return Err(error!(ErrorCode::Other)); // BUG!
+        }
+        Ok(())
+    }
     //
     // Fault Handling methods
     //

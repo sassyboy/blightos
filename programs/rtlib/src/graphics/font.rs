@@ -3,8 +3,8 @@
 //
 
 pub struct Font {
-	pub kerning: usize, // Horizontal space in pixels between adjacent chars.
-	pub line_spacing: usize, // Vertical space in pixels between lines of text
+	pub kerning: u32, // Horizontal space in pixels between adjacent chars.
+	pub line_spacing: u32, // Vertical space in pixels between lines of text
 }
 impl Font {
 	pub const fn new() -> Self {
@@ -14,26 +14,26 @@ impl Font {
 		}
 	}
 
-	pub fn get_pixel(&self, c: u8, row: usize, col: usize) -> bool {
+	pub fn get_pixel(&self, c: u8, row: u32, col: u32) -> bool {
 		let fmi = (c as usize) * 40 + (row * 16 + col) as usize / 8;
 		(DEFAULT_FONT10X20[fmi] & (1 << ((row * 16 + col) % 8))) > 0
 	}
 
 	/// Measure the width of the given text string in pixels based on the font's
 	/// character dimensions.
-	pub fn text_width(&self, text: &str) -> usize {
-		text.len() * (10 + self.kerning)
+	pub fn text_width(&self, text: &str) -> u32 {
+		text.len() as u32 * (10 + self.kerning)
 	}
 	/// Measure the height of the given text string in pixels based on the
 	/// font's character dimensions.
-	pub fn text_height(&self, _text: &str) -> usize {
+	pub fn text_height(&self, _text: &str) -> u32 {
 		20 // Each character is 20 pixels tall in the default font
 	}
 
-	pub fn char_width(&self, _c: u8) -> usize {
+	pub fn char_width(&self, _c: u8) -> u32 {
 		10 // Each character is 10 pixels wide in the default font
 	}
-	pub fn char_height(&self, _c: u8) -> usize {
+	pub fn char_height(&self, _c: u8) -> u32 {
 		20 // Each character is 20 pixels tall in the default font
 	}
 }

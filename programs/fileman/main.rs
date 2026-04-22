@@ -14,6 +14,7 @@ use rtlib::env::current_dir;
 use rtlib::syscall::SyscallRsvdFDs;
 use rtlib::stdio::*;
 use rtlib::fileio::*;
+use rtlib::graphics::*;
 use rtlib::gui::*;
 use rtlib::hid::*;
 
@@ -32,9 +33,17 @@ static WMSG_ARG:Spinlock<String> = Spinlock::new(String::new());
 fn main() {
     let cur_path = current_dir().expect("Error: current path not available!");
     *CUR_DIR.lock() = String::from(cur_path);
+    let Some(screen_sz) = screen_size() else {
+        println!("Can't find the screen dimensions!");
+        return;
+    };
+
     // Draw the main window
-    let wpos = Rect { left: 50, top: 50, width: 1024, height: 310 };
-    
+    let wpos = Rect { left: (screen_sz.width - 1024) / 2,
+                        top: 50,
+                        width: 1024,
+                        height: 310 };
+
     // Label 1
     let lbl1 = Label::new(
         format!("Path: {}", CUR_DIR.lock().clone().as_str()),
@@ -144,9 +153,8 @@ fn main() {
             }
         }
     ));
-    
     let mut win_main = Window::new();
-    win_main.init(String::from("File Manager"), wpos);
+    let _ = win_main.init(String::from("File Manager"), wpos);
     win_main.add_widget(Box::new(lbl1));         // 0
     win_main.add_widget(Box::new(lst_files));    // 1
     win_main.add_widget(Box::new(lbl_status));   // 2
@@ -158,6 +166,7 @@ fn main() {
             }
         }
     ));
+    
     win_main.show(main_window_loop);
     println!("Main window exited!");
 }
@@ -319,7 +328,7 @@ fn run_text_editor(parent_win: &mut Window, path: &Path) {
     let theme = Theme::new();
     let wpos = Rect { left: 150, top: 280, width: 1025, height: 600 };
     let mut win_edit = Window::new();
-    win_edit.init(String::from("Text Editor"), wpos);
+    let _ = win_edit.init(String::from("Text Editor"), wpos);
     // Label 1
     let mut lbl1 = Label::new(
         format!("{} (Press ESC to close)", cur_path),
